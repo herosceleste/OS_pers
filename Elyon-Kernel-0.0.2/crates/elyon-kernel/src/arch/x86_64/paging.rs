@@ -22,8 +22,16 @@ static mut PDS: [PageTable; 4] = [
 
 pub fn install_identity_4g() -> u64 {
     unsafe {
-        write_bytes(addr_of_mut!(PML4).cast::<u8>(), 0, core::mem::size_of::<PageTable>());
-        write_bytes(addr_of_mut!(PDPT).cast::<u8>(), 0, core::mem::size_of::<PageTable>());
+        write_bytes(
+            addr_of_mut!(PML4).cast::<u8>(),
+            0,
+            core::mem::size_of::<PageTable>(),
+        );
+        write_bytes(
+            addr_of_mut!(PDPT).cast::<u8>(),
+            0,
+            core::mem::size_of::<PageTable>(),
+        );
         write_bytes(
             addr_of_mut!(PDS).cast::<u8>(),
             0,
