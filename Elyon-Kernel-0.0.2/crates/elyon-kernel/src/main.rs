@@ -88,11 +88,7 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         );
         cpu::halt_forever();
     }
-    kprintln!(
-        "[paging] tables owned span={:#x}..{:#x}",
-        pt_start,
-        pt_end
-    );
+    kprintln!("[paging] tables owned span={:#x}..{:#x}", pt_start, pt_end);
 
     let old_cr3 = cpu::read_cr3();
     let new_cr3 = paging::install_identity_4g();
