@@ -36,6 +36,6 @@ pub fn init() -> u16 {
         SS::set_reg(data);
         load_tss(tss);
 
-        code.0
+        code.index() << 3
     }
 }
