@@ -16,9 +16,9 @@ for cmd in xorriso mkfs.vfat mmd mcopy; do
 done
 
 rm -rf "$ROOT/build/vmware"
-mkdir -p "$ISO_DIR"
+mkdir -p "$ISO_DIR/EFI/BOOT" "$ISO_DIR/ELYON"
 
-dd if=/dev/zero of="$IMG" bs=1M count=64 status=none
+dd if=/dev/zero of="$IMG" bs=1M count=16 status=none
 mkfs.vfat -F 32 "$IMG" >/dev/null
 mmd -i "$IMG" ::/EFI
 mmd -i "$IMG" ::/EFI/BOOT
@@ -26,6 +26,8 @@ mmd -i "$IMG" ::/ELYON
 mcopy -i "$IMG" "$ROOT/build/esp/EFI/BOOT/BOOTX64.EFI" ::/EFI/BOOT/BOOTX64.EFI
 mcopy -i "$IMG" "$ROOT/build/esp/ELYON/KERNEL.ELF" ::/ELYON/KERNEL.ELF
 cp "$IMG" "$ISO_DIR/efiboot.img"
+cp "$ROOT/build/esp/EFI/BOOT/BOOTX64.EFI" "$ISO_DIR/EFI/BOOT/BOOTX64.EFI"
+cp "$ROOT/build/esp/ELYON/KERNEL.ELF" "$ISO_DIR/ELYON/KERNEL.ELF"
 
 xorriso -as mkisofs   -iso-level 3   -R   -J   -V "ELYON_002"   -e efiboot.img   -no-emul-boot   -o "$ISO"   "$ISO_DIR" >/dev/null
 
