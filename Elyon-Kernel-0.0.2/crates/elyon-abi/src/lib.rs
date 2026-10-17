@@ -7,6 +7,14 @@ pub const BOOT_INFO_VERSION: u32 = 2;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FramebufferFormat {
+    None = 0,
+    Rgb = 1,
+    Bgr = 2,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MemoryRegionKind {
     Empty = 0,
     Usable = 1,
@@ -61,6 +69,13 @@ pub struct BootInfo {
     pub boot_info_phys_start: u64,
     pub boot_info_phys_end: u64,
     pub acpi_rsdp: u64,
+    pub framebuffer_base: u64,
+    pub framebuffer_size: u64,
+    pub framebuffer_width: u32,
+    pub framebuffer_height: u32,
+    pub framebuffer_stride: u32,
+    pub framebuffer_format: FramebufferFormat,
+    pub _framebuffer_padding: [u8; 3],
     pub memory_regions: [MemoryRegion; MAX_MEMORY_REGIONS],
 }
 
@@ -84,6 +99,13 @@ impl BootInfo {
             boot_info_phys_start: 0,
             boot_info_phys_end: 0,
             acpi_rsdp: 0,
+            framebuffer_base: 0,
+            framebuffer_size: 0,
+            framebuffer_width: 0,
+            framebuffer_height: 0,
+            framebuffer_stride: 0,
+            framebuffer_format: FramebufferFormat::None,
+            _framebuffer_padding: [0; 3],
             memory_regions: [MemoryRegion::EMPTY; MAX_MEMORY_REGIONS],
         }
     }
