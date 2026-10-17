@@ -80,12 +80,7 @@ fn draw_char(info: &BootInfo, x: usize, y: usize, ch: u8, color: u32) {
             }
             for sy in 0..SCALE {
                 for sx in 0..SCALE {
-                    put_pixel(
-                        info,
-                        x + col * SCALE + sx,
-                        y + row * SCALE + sy,
-                        color,
-                    );
+                    put_pixel(info, x + col * SCALE + sx, y + row * SCALE + sy, color);
                 }
             }
         }
