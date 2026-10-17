@@ -46,7 +46,8 @@ impl MemoryRegion {
     };
 
     pub const fn end(&self) -> u64 {
-        self.start.saturating_add(self.pages.saturating_mul(PAGE_SIZE))
+        self.start
+            .saturating_add(self.pages.saturating_mul(PAGE_SIZE))
     }
 }
 
@@ -130,7 +131,10 @@ impl BootInfo {
                 break;
             }
 
-            let Some(end) = region.start.checked_add(region.pages.saturating_mul(PAGE_SIZE)) else {
+            let Some(end) = region
+                .start
+                .checked_add(region.pages.saturating_mul(PAGE_SIZE))
+            else {
                 valid = false;
                 break;
             };
