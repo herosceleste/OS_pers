@@ -35,7 +35,7 @@ pub fn init(info: &BootInfo) -> PmmStats {
         }
     }
 
-    reserve_range(0, PAGE_SIZE);
+    // Never hand out the historical x86 low-memory area by default.\n    // It may contain firmware data, trampoline space or compatibility structures.\n    reserve_range(0, 1024 * 1024);
     reserve_range(info.kernel_phys_start, info.kernel_phys_end);
     reserve_range(info.kernel_stack_start, info.kernel_stack_end);
     reserve_range(info.boot_info_phys_start, info.boot_info_phys_end);
