@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ESP="$ROOT/build/esp"
+ESP="${ELYON_ESP:-$ROOT/build/esp}"
 
 [[ -f "$ESP/EFI/BOOT/BOOTX64.EFI" && -f "$ESP/ELYON/KERNEL.ELF" ]] || "$ROOT/scripts/build.sh"
 command -v qemu-system-x86_64 >/dev/null || {
