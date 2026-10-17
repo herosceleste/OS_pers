@@ -17,6 +17,8 @@ const BUILD_ID: &str = match option_env!("ELYON_BUILD_ID") {
     None => "development",
 };
 
+const TEST_UD: bool = option_env!("ELYON_TEST_UD").is_some();
+
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text._start")]
 pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
@@ -58,6 +60,13 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
 
     idt::init(code_selector);
     kprintln!("[arch] IDT=OK exceptions=diagnostic");
+
+    if TEST_UD {
+        kprintln!("[test] injecting #UD via ud2");
+        unsafe {
+            core::arch::asm!("ud2", options(noreturn));
+        }
+    }
 
     let pmm = memory::init(info);
     kprintln!(
