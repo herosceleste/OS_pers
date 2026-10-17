@@ -51,7 +51,10 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
     kprintln!("[cpu] vendor={}", vendor.as_str());
 
     let code_selector = gdt::init();
-    kprintln!("[arch] GDT=OK TSS=OK IST(#DF)=OK selector={:#x}", code_selector);
+    kprintln!(
+        "[arch] GDT=OK TSS=OK IST(#DF)=OK selector={:#x}",
+        code_selector
+    );
 
     idt::init(code_selector);
     kprintln!("[arch] IDT=OK exceptions=diagnostic");
