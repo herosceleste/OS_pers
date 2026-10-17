@@ -4,7 +4,7 @@ use elyon_abi::{BootInfo, MemoryRegionKind, PAGE_SIZE};
 
 const MAX_PHYSICAL_MEMORY: u64 = 32 * 1024 * 1024 * 1024;
 const MAX_FRAMES: usize = (MAX_PHYSICAL_MEMORY / PAGE_SIZE) as usize;
-const BITMAP_BYTES: usize = MAX_FRAMES.div_ceil(8);
+const BITMAP_BYTES: usize = (MAX_FRAMES + 7) / 8;
 
 static mut FRAME_BITMAP: [u8; BITMAP_BYTES] = [0xFF; BITMAP_BYTES];
 static mut FREE_FRAMES: usize = 0;
