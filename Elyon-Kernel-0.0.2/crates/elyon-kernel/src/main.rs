@@ -12,7 +12,7 @@ use elyon_abi::{BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootInfo};
 
 use crate::arch::x86_64::{cpu, gdt, idt, paging};
 
-const BUILD_ID: &str = option_env!("ELYON_BUILD_ID").unwrap_or("development");
+const BUILD_ID: &str = match option_env!("ELYON_BUILD_ID") {\n    Some(value) => value,\n    None => "development",\n};
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text._start")]
