@@ -19,7 +19,7 @@ rm -rf "$ROOT/build/vmware"
 mkdir -p "$ISO_DIR/EFI/BOOT" "$ISO_DIR/ELYON"
 
 dd if=/dev/zero of="$IMG" bs=1M count=16 status=none
-mkfs.vfat -F 32 "$IMG" >/dev/null
+mkfs.vfat -F 16 -n ELYON_002 -i 454C5932 "$IMG" >/dev/null
 mmd -i "$IMG" ::/EFI
 mmd -i "$IMG" ::/EFI/BOOT
 mmd -i "$IMG" ::/ELYON
