@@ -119,10 +119,11 @@ fn main() -> Status {
 }
 
 fn read_kernel() -> alloc::vec::Vec<u8> {
-    let proto = uefi::boot::get_image_file_system(uefi::boot::image_handle()).unwrap_or_else(|_| {
-        lprintln!("[loader] boot filesystem unavailable");
-        halt()
-    });
+    let proto =
+        uefi::boot::get_image_file_system(uefi::boot::image_handle()).unwrap_or_else(|_| {
+            lprintln!("[loader] boot filesystem unavailable");
+            halt()
+        });
     let mut fs = FileSystem::new(proto);
     let bytes = fs.read(KERNEL_PATH).unwrap_or_else(|_| {
         lprintln!("[loader] {} not found", KERNEL_PATH);
@@ -291,8 +292,14 @@ impl ElfImage {
         if phentsize < 56 || phnum == 0 {
             return Err("invalid program header table");
         }
-        let table_size = phentsize.checked_mul(phnum).ok_or("program header overflow")?;
-        if phoff.checked_add(table_size).ok_or("program header overflow")? > bytes.len() {
+        let table_size = phentsize
+            .checked_mul(phnum)
+            .ok_or("program header overflow")?;
+        if phoff
+            .checked_add(table_size)
+            .ok_or("program header overflow")?
+            > bytes.len()
+        {
             return Err("program headers outside file");
         }
 
@@ -321,7 +328,9 @@ impl ElfImage {
             let load_addr = if paddr != 0 { paddr } else { vaddr };
             min_addr = min_addr.min(align_down(load_addr, PAGE_SIZE));
             max_addr = max_addr.max(align_up(
-                load_addr.checked_add(memsz).ok_or("segment address overflow")?,
+                load_addr
+                    .checked_add(memsz)
+                    .ok_or("segment address overflow")?,
                 PAGE_SIZE,
             ));
         }
@@ -371,11 +380,7 @@ impl ElfImage {
             }
 
             unsafe {
-                copy_nonoverlapping(
-                    bytes.as_ptr().add(offset),
-                    load_addr as *mut u8,
-                    filesz,
-                );
+                copy_nonoverlapping(bytes.as_ptr().add(offset), load_addr as *mut u8, filesz);
             }
         }
 
