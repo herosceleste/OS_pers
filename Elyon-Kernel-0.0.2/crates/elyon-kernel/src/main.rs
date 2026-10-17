@@ -68,8 +68,16 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
     );
 
     match (memory::allocate_frame(), memory::allocate_frame()) {
-        (Some(a), Some(b)) => {
+        (Some(a), Some(b)) if a >= 0x100000 && b >= 0x100000 => {
             kprintln!("[memory] PMM self-test frames={:#x},{:#x}", a, b);
+        }
+        (Some(a), Some(b)) => {
+            kprintln!(
+                "[memory] PMM self-test FAILED low-memory allocation={:#x},{:#x}",
+                a,
+                b
+            );
+            cpu::halt_forever();
         }
         _ => {
             kprintln!("[memory] PMM self-test FAILED");
