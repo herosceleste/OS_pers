@@ -60,6 +60,21 @@ pub fn install_identity_4g() -> u64 {
     }
 }
 
+pub fn table_span() -> (u64, u64) {
+    unsafe {
+        let pml4 = addr_of_mut!(PML4) as u64;
+        let pdpt = addr_of_mut!(PDPT) as u64;
+        let pds = addr_of_mut!(PDS) as u64;
+        let pds_end = pds + core::mem::size_of::<[PageTable; 4]>() as u64;
+
+        let start = pml4.min(pdpt).min(pds);
+        let end = (pml4 + core::mem::size_of::<PageTable>() as u64)
+            .max(pdpt + core::mem::size_of::<PageTable>() as u64)
+            .max(pds_end);
+        (start, end)
+    }
+}
+
 pub const fn identity_limit() -> u64 {
     IDENTITY_LIMIT
 }
