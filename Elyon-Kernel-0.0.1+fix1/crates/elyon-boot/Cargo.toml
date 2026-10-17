@@ -1,0 +1,13 @@
+[package]
+name = "elyon-boot"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "elyon-boot"
+path = "src/main.rs"
+
+[dependencies]
+elyon-kernel = { path = "../elyon-kernel" }
+uefi = { version = "=0.41.0", default-features = false }
