@@ -5,6 +5,7 @@ use elyon_abi::{BootInfo, MemoryRegionKind, PAGE_SIZE};
 const MAX_PHYSICAL_MEMORY: u64 = 32 * 1024 * 1024 * 1024;
 const MAX_FRAMES: usize = (MAX_PHYSICAL_MEMORY / PAGE_SIZE) as usize;
 const BITMAP_BYTES: usize = (MAX_FRAMES + 7) / 8;
+const LOW_MEMORY_RESERVE_END: u64 = 1024 * 1024;
 
 static mut FRAME_BITMAP: [u8; BITMAP_BYTES] = [0xFF; BITMAP_BYTES];
 static mut FREE_FRAMES: usize = 0;
@@ -35,7 +36,9 @@ pub fn init(info: &BootInfo) -> PmmStats {
         }
     }
 
-    // Never hand out the historical x86 low-memory area by default.\n    // It may contain firmware data, trampoline space or compatibility structures.\n    reserve_range(0, 1024 * 1024);
+    // Never hand out the historical x86 low-memory area by default.
+    // It may contain firmware data, trampoline space or compatibility structures.
+    reserve_range(0, LOW_MEMORY_RESERVE_END);
     reserve_range(info.kernel_phys_start, info.kernel_phys_end);
     reserve_range(info.kernel_stack_start, info.kernel_stack_end);
     reserve_range(info.boot_info_phys_start, info.boot_info_phys_end);
@@ -49,7 +52,8 @@ pub fn init(info: &BootInfo) -> PmmStats {
 }
 
 pub fn allocate_frame() -> Option<u64> {
-    for frame in 1..MAX_FRAMES {
+    let first_allocatable = (LOW_MEMORY_RESERVE_END / PAGE_SIZE) as usize;
+    for frame in first_allocatable..MAX_FRAMES {
         if is_free(frame) {
             mark_used(frame);
             return Some(frame as u64 * PAGE_SIZE);
