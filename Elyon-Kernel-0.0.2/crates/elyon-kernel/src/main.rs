@@ -77,6 +77,23 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         }
     }
 
+    let (pt_start, pt_end) = paging::table_span();
+    if pt_start < info.kernel_phys_start || pt_end > info.kernel_phys_end {
+        kprintln!(
+            "[paging] table ownership FAILED span={:#x}..{:#x} kernel={:#x}..{:#x}",
+            pt_start,
+            pt_end,
+            info.kernel_phys_start,
+            info.kernel_phys_end
+        );
+        cpu::halt_forever();
+    }
+    kprintln!(
+        "[paging] tables owned span={:#x}..{:#x}",
+        pt_start,
+        pt_end
+    );
+
     let old_cr3 = cpu::read_cr3();
     let new_cr3 = paging::install_identity_4g();
     kprintln!(
