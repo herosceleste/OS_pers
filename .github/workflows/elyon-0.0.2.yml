@@ -50,3 +50,7 @@ jobs:
       - name: QEMU OVMF smoke test
         working-directory: Elyon-Kernel-0.0.2
         run: ./scripts/smoke-test.sh
+
+      - name: QEMU invalid-opcode exception test
+        working-directory: Elyon-Kernel-0.0.2
+        run: bash scripts/test-ud-qemu.sh
