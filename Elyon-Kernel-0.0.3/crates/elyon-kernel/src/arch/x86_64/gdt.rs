@@ -3,7 +3,7 @@ use core::ptr::{addr_of, addr_of_mut};
 use x86_64::VirtAddr;
 use x86_64::instructions::tables::load_tss;
 use x86_64::registers::segmentation::{CS, DS, ES, SS, Segment};
-use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable};
+use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
 use x86_64::structures::tss::TaskStateSegment;
 
 use super::MAX_CPU_SLOTS;
@@ -20,6 +20,8 @@ static mut TSS_TABLE: [TaskStateSegment; MAX_CPU_SLOTS] =
     [const { TaskStateSegment::new() }; MAX_CPU_SLOTS];
 static mut GDT_TABLE: [GlobalDescriptorTable<8>; MAX_CPU_SLOTS] =
     [const { GlobalDescriptorTable::<8>::empty() }; MAX_CPU_SLOTS];
+static mut CODE_SELECTORS: [u16; MAX_CPU_SLOTS] = [0; MAX_CPU_SLOTS];
+static mut DATA_SELECTORS: [u16; MAX_CPU_SLOTS] = [0; MAX_CPU_SLOTS];
 static mut TSS_SELECTORS: [u16; MAX_CPU_SLOTS] = [0; MAX_CPU_SLOTS];
 static mut IST_STARTS: [u64; MAX_CPU_SLOTS] = [0; MAX_CPU_SLOTS];
 static mut IST_ENDS: [u64; MAX_CPU_SLOTS] = [0; MAX_CPU_SLOTS];
@@ -46,12 +48,14 @@ pub fn prepare_for_cpu(cpu_index: usize, ist_start: u64, ist_end: u64) {
         let gdt_table = addr_of_mut!(GDT_TABLE);
         (*gdt_table)[cpu_index] = GlobalDescriptorTable::<8>::empty();
 
-        let _code = (*gdt_table)[cpu_index].append(Descriptor::kernel_code_segment());
-        let _data = (*gdt_table)[cpu_index].append(Descriptor::kernel_data_segment());
+        let code = (*gdt_table)[cpu_index].append(Descriptor::kernel_code_segment());
+        let data = (*gdt_table)[cpu_index].append(Descriptor::kernel_data_segment());
         let tss_ptr = addr_of!((*tss_table)[cpu_index]);
         let tss_descriptor = Descriptor::tss_segment_unchecked(tss_ptr);
         let tss = (*gdt_table)[cpu_index].append(tss_descriptor);
 
+        CODE_SELECTORS[cpu_index] = code.index() << 3;
+        DATA_SELECTORS[cpu_index] = data.index() << 3;
         TSS_SELECTORS[cpu_index] = tss.index() << 3;
     }
 }
@@ -61,22 +65,18 @@ pub fn load_for_cpu(cpu_index: usize) -> u16 {
 
     unsafe {
         let gdt_table = addr_of_mut!(GDT_TABLE);
-        let code = (*gdt_table)[cpu_index].get(1).expect("kernel code descriptor missing");
-        let data = (*gdt_table)[cpu_index].get(2).expect("kernel data descriptor missing");
+        let code = SegmentSelector::from_raw(CODE_SELECTORS[cpu_index]);
+        let data = SegmentSelector::from_raw(DATA_SELECTORS[cpu_index]);
+        let tss = SegmentSelector::from_raw(TSS_SELECTORS[cpu_index]);
 
         (*gdt_table)[cpu_index].load_unsafe();
         CS::set_reg(code);
         DS::set_reg(data);
         ES::set_reg(data);
         SS::set_reg(data);
+        load_tss(tss);
 
-        let tss_selector = x86_64::structures::gdt::SegmentSelector::new(
-            (TSS_SELECTORS[cpu_index] >> 3) as u16,
-            x86_64::PrivilegeLevel::Ring0,
-        );
-        load_tss(tss_selector);
-
-        code.index() << 3
+        CODE_SELECTORS[cpu_index]
     }
 }
 
