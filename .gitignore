@@ -1,0 +1,6 @@
+# Local build artefacts
+Elyon-Kernel-0.0.1+fix1/build/
+Elyon-Kernel-0.0.1+fix1/target/
+Elyon-Kernel-0.0.2/build/
+Elyon-Kernel-0.0.2/target/
+Elyon-Kernel-0.0.2/target-test-*/
