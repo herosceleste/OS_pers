@@ -3,11 +3,12 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG="$ROOT/build/qemu-smoke.log"
+QEMU_TIMEOUT="${ELYON_QEMU_TIMEOUT:-15}"
 
 bash "$ROOT/scripts/build.sh"
 
 set +e
-timeout 15s env ELYON_HEADLESS=1 bash "$ROOT/scripts/run-qemu.sh" >"$LOG" 2>&1
+timeout "${QEMU_TIMEOUT}s" env ELYON_HEADLESS=1 bash "$ROOT/scripts/run-qemu.sh" >"$LOG" 2>&1
 RC=$?
 set -e
 
