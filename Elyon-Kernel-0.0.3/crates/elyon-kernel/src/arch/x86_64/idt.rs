@@ -343,7 +343,6 @@ pub fn trigger_double_fault_test() -> ! {
     cpu::halt_forever()
 }
 
-
 pub fn install_interrupt_gate(vector: u8, code_selector: u16, handler: u64) {
     let base = addr_of_mut!(IDT) as *mut IdtEntry;
     unsafe {
