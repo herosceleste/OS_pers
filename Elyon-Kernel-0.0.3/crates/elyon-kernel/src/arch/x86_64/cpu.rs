@@ -104,7 +104,6 @@ pub unsafe fn write_msr(msr: u32, value: u64) {
     }
 }
 
-
 pub unsafe fn in_u8(port: u16) -> u8 {
     let value: u8;
     unsafe {
