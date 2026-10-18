@@ -31,10 +31,16 @@ read -r OVMF_CODE OVMF_VARS_TEMPLATE < <(find_ovmf) || {
 OVMF_VARS="$ROOT/build/OVMF_VARS.fd"
 cp "$OVMF_VARS_TEMPLATE" "$OVMF_VARS"
 
+echo "[qemu] version=$(qemu-system-x86_64 --version | head -n 1)"
+echo "[qemu] OVMF_CODE=$OVMF_CODE"
+echo "[qemu] ESP=$ESP"
+
 QEMU_ARGS=(
   -machine q35,accel=tcg
   -m 1024M
   -cpu max
+  -boot order=c,menu=off
+  -nic none
   -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE"
   -drive "if=pflash,format=raw,file=$OVMF_VARS"
   -drive "format=raw,file=fat:rw:$ESP"
