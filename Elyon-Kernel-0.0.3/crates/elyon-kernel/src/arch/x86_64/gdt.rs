@@ -1,6 +1,6 @@
 use core::ptr::{addr_of, addr_of_mut};
 
-use x86_64::VirtAddr;
+use x86_64::{PrivilegeLevel, VirtAddr};
 use x86_64::instructions::tables::load_tss;
 use x86_64::registers::segmentation::{CS, DS, ES, SS, Segment};
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
@@ -64,9 +64,9 @@ pub fn load_for_cpu(cpu_index: usize) -> u16 {
 
     unsafe {
         let gdt_table = addr_of_mut!(GDT_TABLE);
-        let code = SegmentSelector::from_raw(CODE_SELECTORS[cpu_index]);
-        let data = SegmentSelector::from_raw(DATA_SELECTORS[cpu_index]);
-        let tss = SegmentSelector::from_raw(TSS_SELECTORS[cpu_index]);
+        let code = SegmentSelector::new(CODE_SELECTORS[cpu_index] >> 3, PrivilegeLevel::Ring0);
+        let data = SegmentSelector::new(DATA_SELECTORS[cpu_index] >> 3, PrivilegeLevel::Ring0);
+        let tss = SegmentSelector::new(TSS_SELECTORS[cpu_index] >> 3, PrivilegeLevel::Ring0);
 
         (*gdt_table)[cpu_index].load_unsafe();
         CS::set_reg(code);
