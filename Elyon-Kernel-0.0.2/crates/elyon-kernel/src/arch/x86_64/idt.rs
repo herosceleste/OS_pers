@@ -122,6 +122,15 @@ EXC_ERR   29
 EXC_ERR   30
 EXC_NOERR 31
 
+.global elyon_test_double_fault
+elyon_test_double_fault:
+    mov rax, 0x0000001000000000
+    mov rsp, rax
+    int3
+2:
+    hlt
+    jmp 2b
+
 .global elyon_exception_common
 elyon_exception_common:
     cli
@@ -183,6 +192,7 @@ unsafe extern "C" {
     fn elyon_exc_29();
     fn elyon_exc_30();
     fn elyon_exc_31();
+    fn elyon_test_double_fault();
 }
 
 pub fn init(code_selector: u16) {
@@ -275,6 +285,22 @@ extern "C" fn elyon_exception_dispatch(context: *const ExceptionContext) -> ! {
         kprintln!("[EXCEPTION] CR2={:#018x}", cpu::read_cr2());
     }
 
+    if context.vector == 8 {
+        let rsp: u64;
+        unsafe {
+            asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags));
+        }
+        let (ist_start, ist_end) = gdt::double_fault_stack_span();
+        let active = rsp >= ist_start && rsp < ist_end;
+        kprintln!(
+            "[EXCEPTION] #DF IST rsp={:#018x} span={:#018x}..{:#018x} active={}",
+            rsp,
+            ist_start,
+            ist_end,
+            if active { 1 } else { 0 }
+        );
+    }
+
     kprintln!("[EXCEPTION] fail-closed halt");
     cpu::halt_forever()
 }
@@ -305,4 +331,10 @@ fn exception_name(vector: u64) -> &'static str {
         30 => "#SX security",
         _ => "reserved/unknown",
     }
+}
+
+
+pub fn trigger_double_fault_test() -> ! {
+    unsafe { elyon_test_double_fault() }
+    cpu::halt_forever()
 }
