@@ -122,6 +122,10 @@ EXC_ERR   29
 EXC_ERR   30
 EXC_NOERR 31
 
+.global elyon_apic_spurious
+elyon_apic_spurious:
+    iretq
+
 .global elyon_test_double_fault
 elyon_test_double_fault:
     mov rax, 0x0000001000000000
@@ -193,6 +197,7 @@ unsafe extern "C" {
     fn elyon_exc_30();
     fn elyon_exc_31();
     fn elyon_test_double_fault();
+    fn elyon_apic_spurious();
 }
 
 pub fn init(code_selector: u16) {
@@ -336,4 +341,17 @@ fn exception_name(vector: u64) -> &'static str {
 pub fn trigger_double_fault_test() -> ! {
     unsafe { elyon_test_double_fault() }
     cpu::halt_forever()
+}
+
+
+pub fn install_interrupt_gate(vector: u8, code_selector: u16, handler: u64) {
+    let base = addr_of_mut!(IDT) as *mut IdtEntry;
+    unsafe {
+        base.add(vector as usize)
+            .write(IdtEntry::new(handler, code_selector, 0));
+    }
+}
+
+pub fn apic_spurious_handler() -> u64 {
+    elyon_apic_spurious as *const () as usize as u64
 }
