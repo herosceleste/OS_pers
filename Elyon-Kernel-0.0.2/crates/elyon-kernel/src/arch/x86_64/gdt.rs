@@ -39,3 +39,9 @@ pub fn init() -> u16 {
         code.index() << 3
     }
 }
+
+
+pub fn double_fault_stack_span() -> (u64, u64) {
+    let start = core::ptr::addr_of!(DOUBLE_FAULT_STACK) as u64;
+    (start, start + DOUBLE_FAULT_STACK_SIZE as u64)
+}
