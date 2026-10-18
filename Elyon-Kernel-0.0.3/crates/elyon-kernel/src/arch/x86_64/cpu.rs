@@ -53,3 +53,46 @@ pub fn vendor_string() -> CpuVendor {
     bytes[8..12].copy_from_slice(&leaf.ecx.to_le_bytes());
     CpuVendor { bytes }
 }
+
+
+pub struct ApicCapabilities {
+    pub apic: bool,
+    pub x2apic: bool,
+}
+
+pub fn apic_capabilities() -> ApicCapabilities {
+    let leaf = core::arch::x86_64::__cpuid(1);
+    ApicCapabilities {
+        apic: leaf.edx & (1 << 9) != 0,
+        x2apic: leaf.ecx & (1 << 21) != 0,
+    }
+}
+
+pub unsafe fn read_msr(msr: u32) -> u64 {
+    let low: u32;
+    let high: u32;
+    unsafe {
+        asm!(
+            "rdmsr",
+            in("ecx") msr,
+            out("eax") low,
+            out("edx") high,
+            options(nostack, preserves_flags)
+        );
+    }
+    ((high as u64) << 32) | low as u64
+}
+
+pub unsafe fn write_msr(msr: u32, value: u64) {
+    let low = value as u32;
+    let high = (value >> 32) as u32;
+    unsafe {
+        asm!(
+            "wrmsr",
+            in("ecx") msr,
+            in("eax") low,
+            in("edx") high,
+            options(nostack, preserves_flags)
+        );
+    }
+}
