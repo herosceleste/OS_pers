@@ -128,7 +128,6 @@ pub unsafe fn out_u8(port: u16, value: u8) {
     }
 }
 
-
 pub fn read_tr() -> u16 {
     let selector: u16;
     unsafe {
