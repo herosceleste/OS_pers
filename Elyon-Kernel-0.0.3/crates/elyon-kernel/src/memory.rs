@@ -52,13 +52,30 @@ pub fn init(info: &BootInfo) -> PmmStats {
 }
 
 pub fn allocate_frame() -> Option<u64> {
-    let first_allocatable = (LOW_MEMORY_RESERVE_END / PAGE_SIZE) as usize;
-    for frame in first_allocatable..MAX_FRAMES {
-        if is_free(frame) {
-            mark_used(frame);
-            return Some(frame as u64 * PAGE_SIZE);
-        }
+    allocate_contiguous_frames(1)
+}
+
+pub fn allocate_contiguous_frames(count: usize) -> Option<u64> {
+    if count == 0 || count > MAX_FRAMES {
+        return None;
     }
+
+    let first_allocatable = (LOW_MEMORY_RESERVE_END / PAGE_SIZE) as usize;
+    let last_start = MAX_FRAMES.checked_sub(count)?;
+
+    'candidate: for start in first_allocatable..=last_start {
+        for frame in start..start + count {
+            if !is_free(frame) {
+                continue 'candidate;
+            }
+        }
+
+        for frame in start..start + count {
+            mark_used(frame);
+        }
+        return Some(start as u64 * PAGE_SIZE);
+    }
+
     None
 }
 
