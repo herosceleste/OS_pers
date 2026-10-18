@@ -102,7 +102,6 @@ pub fn tss_address(cpu_index: usize) -> u64 {
     unsafe { addr_of!((*table)[cpu_index]) as u64 }
 }
 
-
 pub fn tss_selector_for(cpu_index: usize) -> u16 {
     assert!(cpu_index < MAX_CPU_SLOTS);
     unsafe { TSS_SELECTORS[cpu_index] }
