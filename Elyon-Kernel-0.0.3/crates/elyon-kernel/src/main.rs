@@ -11,7 +11,7 @@ use core::panic::PanicInfo;
 
 use elyon_abi::{BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootInfo};
 
-use crate::arch::x86_64::{apic, cpu, gdt, idt, paging};
+use crate::arch::x86_64::{apic, cpu, gdt, idt, ioapic, paging};
 
 const BUILD_ID: &str = match option_env!("ELYON_BUILD_ID") {
     Some(value) => value,
@@ -249,6 +249,59 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
     }
     kprintln!("[apic] EOI primitive=OK");
     kprintln!("ELYON_LAPIC_READY");
+
+    let ioapic = match ioapic::init(&topology, lapic.apic_id) {
+        Ok(summary) => summary,
+        Err(error) => {
+            kprintln!("[ioapic] FAILED reason={}", error.as_str());
+            cpu::halt_forever();
+        }
+    };
+
+    kprintln!(
+        "[ioapic] controllers={} bsp_apic_id={}",
+        ioapic.controller_count(),
+        lapic.apic_id
+    );
+
+    for controller in ioapic.controllers() {
+        kprintln!(
+            "[ioapic] madt_id={} hw_id={} version={:#x} arbitration_id={} address={:#018x} gsi={}..{} redirs={} id_match={}",
+            controller.madt_id,
+            controller.hw_id,
+            controller.version,
+            controller.arbitration_id,
+            controller.address,
+            controller.gsi_base,
+            controller.gsi_end_exclusive() - 1,
+            controller.redirection_entries,
+            if controller.id_matches() { 1 } else { 0 }
+        );
+    }
+
+    for route in ioapic.legacy_routes() {
+        kprintln!(
+            "[ioapic] route irq={} gsi={} vector={:#x} polarity={} trigger={} masked={} override={}",
+            route.irq,
+            route.gsi,
+            route.vector,
+            route.polarity_str(),
+            route.trigger_str(),
+            if route.masked { 1 } else { 0 },
+            if route.overridden { 1 } else { 0 }
+        );
+    }
+
+    kprintln!(
+        "[ioapic] legacy_routes={} overrides_applied={} shadowed={} masked={}/{} all_masked={}",
+        ioapic.legacy_route_count(),
+        ioapic.overrides_applied,
+        ioapic.shadowed_legacy_irqs,
+        ioapic.masked_entries,
+        ioapic.total_redirection_entries,
+        if ioapic.all_masked() { 1 } else { 0 }
+    );
+    kprintln!("ELYON_IOAPIC_READY");
 
     if framebuffer::draw_boot_screen(info, paging::identity_limit()) {
         kprintln!(
