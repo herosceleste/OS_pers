@@ -61,6 +61,10 @@ jobs:
         working-directory: Elyon-Kernel-0.0.3
         run: bash scripts/test-ioapic-qemu.sh
 
+      - name: Local APIC timer test
+        working-directory: Elyon-Kernel-0.0.3
+        run: bash scripts/test-timer-qemu.sh
+
       - name: QEMU invalid-opcode regression test
         working-directory: Elyon-Kernel-0.0.3
         run: bash scripts/test-ud-qemu.sh
