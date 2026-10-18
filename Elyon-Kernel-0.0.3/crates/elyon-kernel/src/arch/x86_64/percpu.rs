@@ -255,6 +255,13 @@ pub fn snapshot(index: usize) -> Option<CpuSnapshot> {
     })
 }
 
+pub fn reset_bsp_ticks() {
+    let index = BSP_INDEX.load(Ordering::Acquire);
+    if index < MAX_CPU_SLOTS {
+        CPU_SLOTS[index].ticks.store(0, Ordering::Release);
+    }
+}
+
 pub fn increment_bsp_ticks() {
     let index = BSP_INDEX.load(Ordering::Acquire);
     if index < MAX_CPU_SLOTS {
