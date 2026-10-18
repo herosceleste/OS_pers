@@ -11,7 +11,7 @@ use core::panic::PanicInfo;
 
 use elyon_abi::{BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootInfo};
 
-use crate::arch::x86_64::{cpu, gdt, idt, paging};
+use crate::arch::x86_64::{apic, cpu, gdt, idt, paging};
 
 const BUILD_ID: &str = match option_env!("ELYON_BUILD_ID") {
     Some(value) => value,
@@ -205,6 +205,50 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
     }
 
     kprintln!("ELYON_ACPI_READY");
+
+    idt::install_interrupt_gate(
+        apic::SPURIOUS_VECTOR,
+        code_selector,
+        idt::apic_spurious_handler(),
+    );
+
+    let lapic = match apic::init(&topology) {
+        Ok(state) => state,
+        Err(error) => {
+            kprintln!("[apic] FAILED reason={}", error.as_str());
+            cpu::halt_forever();
+        }
+    };
+
+    kprintln!(
+        "[apic] cpuid apic={} x2apic={}",
+        if lapic.cpuid_apic { 1 } else { 0 },
+        if lapic.cpuid_x2apic { 1 } else { 0 }
+    );
+    kprintln!(
+        "[apic] IA32_APIC_BASE={:#018x} madt_base={:#018x} mode={} bsp={}",
+        lapic.msr_base,
+        lapic.madt_base,
+        lapic.mode.as_str(),
+        if lapic.is_bsp { 1 } else { 0 }
+    );
+    kprintln!(
+        "[apic] BSP apic_id={} version={:#x} madt_match=1",
+        lapic.apic_id,
+        lapic.version
+    );
+    kprintln!(
+        "[apic] SVR vector={:#x} software_enable={}",
+        apic::SPURIOUS_VECTOR,
+        if lapic.software_enabled() { 1 } else { 0 }
+    );
+
+    if !apic::eoi() {
+        kprintln!("[apic] EOI primitive FAILED");
+        cpu::halt_forever();
+    }
+    kprintln!("[apic] EOI primitive=OK");
+    kprintln!("ELYON_LAPIC_READY");
 
     if framebuffer::draw_boot_screen(info, paging::identity_limit()) {
         kprintln!(
