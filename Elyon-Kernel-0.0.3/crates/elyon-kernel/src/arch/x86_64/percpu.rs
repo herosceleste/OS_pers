@@ -2,7 +2,7 @@ use core::ptr::addr_of;
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::acpi::{AcpiTopology, CpuDescriptor};
-use crate::arch::x86_64::{cpu, gdt, MAX_CPU_SLOTS};
+use crate::arch::x86_64::{MAX_CPU_SLOTS, cpu, gdt};
 
 const AP_KERNEL_STACK_SIZE: usize = 64 * 1024;
 const INVALID_CPU_INDEX: usize = usize::MAX;
@@ -152,7 +152,11 @@ pub fn prepare(
         return Err(PerCpuError::InvalidBspStack);
     }
 
-    let usable_count = topology.cpus().iter().filter(|entry| entry.usable()).count();
+    let usable_count = topology
+        .cpus()
+        .iter()
+        .filter(|entry| entry.usable())
+        .count();
     if usable_count == 0 {
         return Err(PerCpuError::NoUsableCpu);
     }
@@ -169,13 +173,7 @@ pub fn prepare(
         .copied()
         .ok_or(PerCpuError::BspNotFound)?;
 
-    configure_slot(
-        0,
-        bsp,
-        CpuState::Online,
-        bsp_stack_start,
-        bsp_stack_end,
-    );
+    configure_slot(0, bsp, CpuState::Online, bsp_stack_start, bsp_stack_end);
 
     let expected_tr = gdt::tss_selector_for(0);
     let bsp_tss_loaded = expected_tr != 0 && cpu::read_tr() == expected_tr;
@@ -291,7 +289,8 @@ fn configure_slot(
     slot.logical_id.store(logical_id as u32, Ordering::Release);
     slot.apic_id.store(descriptor.apic_id, Ordering::Release);
     slot.state.store(state.raw(), Ordering::Release);
-    slot.kernel_stack_start.store(stack_start, Ordering::Release);
+    slot.kernel_stack_start
+        .store(stack_start, Ordering::Release);
     slot.kernel_stack_end.store(stack_end, Ordering::Release);
     slot.gdt_address
         .store(gdt::gdt_address(logical_id), Ordering::Release);
