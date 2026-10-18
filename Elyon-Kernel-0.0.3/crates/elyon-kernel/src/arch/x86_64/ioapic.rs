@@ -77,7 +77,11 @@ impl LegacyRoute {
     }
 
     pub const fn trigger_str(self) -> &'static str {
-        if self.level_triggered { "level" } else { "edge" }
+        if self.level_triggered {
+            "level"
+        } else {
+            "edge"
+        }
     }
 }
 
@@ -123,8 +127,7 @@ impl IoApicSummary {
     }
 
     pub const fn all_masked(&self) -> bool {
-        self.total_redirection_entries != 0
-            && self.masked_entries == self.total_redirection_entries
+        self.total_redirection_entries != 0 && self.masked_entries == self.total_redirection_entries
     }
 
     fn push_controller(&mut self, controller: IoApicState) -> Result<(), IoApicError> {
@@ -178,7 +181,9 @@ impl IoApicError {
             Self::GsiRangeOverflow => "IOAPIC GSI range overflow",
             Self::GsiRangeOverlap => "overlapping IOAPIC GSI ranges",
             Self::HardwareIdMismatch => "MADT IOAPIC ID does not match hardware ID",
-            Self::DestinationApicIdTooLarge => "BSP APIC ID does not fit IOAPIC physical destination",
+            Self::DestinationApicIdTooLarge => {
+                "BSP APIC ID does not fit IOAPIC physical destination"
+            }
             Self::UnsupportedOverrideBus => "unsupported interrupt source override bus",
             Self::InvalidOverrideFlags => "reserved ACPI interrupt override flags",
             Self::DuplicateOverride => "duplicate interrupt source override",
@@ -285,8 +290,8 @@ pub fn init(topology: &AcpiTopology, bsp_apic_id: u32) -> Result<IoApicSummary, 
         used_gsis[used_count] = gsi;
         used_count += 1;
 
-        let (controller, redir_index) =
-            find_controller_for_gsi(summary.controllers(), gsi).ok_or(IoApicError::RouteOutsideIoApic)?;
+        let (controller, redir_index) = find_controller_for_gsi(summary.controllers(), gsi)
+            .ok_or(IoApicError::RouteOutsideIoApic)?;
 
         let vector = LEGACY_VECTOR_BASE.wrapping_add(irq);
         program_masked_route(
@@ -386,10 +391,7 @@ fn decode_iso_flags(iso: InterruptSourceOverride) -> Result<(bool, bool), IoApic
     Ok((active_low, level_triggered))
 }
 
-fn find_controller_for_gsi(
-    controllers: &[IoApicState],
-    gsi: u32,
-) -> Option<(&IoApicState, u32)> {
+fn find_controller_for_gsi(controllers: &[IoApicState], gsi: u32) -> Option<(&IoApicState, u32)> {
     for controller in controllers {
         if gsi >= controller.gsi_base && gsi < controller.gsi_end_exclusive() {
             return Some((controller, gsi - controller.gsi_base));
