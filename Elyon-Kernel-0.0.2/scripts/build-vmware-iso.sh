@@ -6,7 +6,7 @@ ISO="$ROOT/build/Elyon-Kernel-0.0.2-UEFI.iso"
 IMG="$ROOT/build/vmware/efiboot.img"
 ISO_DIR="$ROOT/build/vmware/iso"
 
-"$ROOT/scripts/build.sh"
+bash "$ROOT/scripts/build.sh"
 
 for cmd in xorriso mkfs.vfat mmd mcopy; do
   command -v "$cmd" >/dev/null || {
