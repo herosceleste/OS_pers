@@ -1,10 +1,10 @@
 use core::ptr::{addr_of, addr_of_mut};
 
-use x86_64::{PrivilegeLevel, VirtAddr};
 use x86_64::instructions::tables::load_tss;
 use x86_64::registers::segmentation::{CS, DS, ES, SS, Segment};
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
 use x86_64::structures::tss::TaskStateSegment;
+use x86_64::{PrivilegeLevel, VirtAddr};
 
 use super::MAX_CPU_SLOTS;
 
