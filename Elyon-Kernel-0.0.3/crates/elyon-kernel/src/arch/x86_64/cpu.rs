@@ -1,7 +1,15 @@
 use core::arch::asm;
 
 pub fn disable_interrupts() {
-    unsafe { asm!("cli", options(nomem, nostack, preserves_flags)) }
+    unsafe { asm!("cli", options(nomem, nostack)) }
+}
+
+pub fn enable_interrupts() {
+    unsafe { asm!("sti", options(nomem, nostack)) }
+}
+
+pub fn halt_once() {
+    unsafe { asm!("hlt", options(nomem, nostack)) }
 }
 
 pub fn halt_forever() -> ! {
@@ -92,6 +100,31 @@ pub unsafe fn write_msr(msr: u32, value: u64) {
             in("eax") low,
             in("edx") high,
             options(nostack, preserves_flags)
+        );
+    }
+}
+
+
+pub unsafe fn in_u8(port: u16) -> u8 {
+    let value: u8;
+    unsafe {
+        asm!(
+            "in al, dx",
+            in("dx") port,
+            out("al") value,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    value
+}
+
+pub unsafe fn out_u8(port: u16, value: u8) {
+    unsafe {
+        asm!(
+            "out dx, al",
+            in("dx") port,
+            in("al") value,
+            options(nomem, nostack, preserves_flags)
         );
     }
 }
