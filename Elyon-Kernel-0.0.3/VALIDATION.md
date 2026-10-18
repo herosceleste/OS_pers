@@ -2,7 +2,7 @@
 
 ## Statut
 
-**EN COURS — K003-01 à K003-05 sont validés.**
+**EN COURS — K003-01 à K003-06 sont validés.**
 
 Baseline de départ : fusion 0.0.2 dans `main`, commit `303feeeff93b4ed1b5b3092cc16a4d8c4489f252`.
 
@@ -23,7 +23,7 @@ Première qualification ACPI :
 | K003-03 | MADT parsée et topologie CPU/APIC journalisée | **PASS** |
 | K003-04 | Local APIC du BSP activé et APIC ID confirmé | **PASS** |
 | K003-05 | IOAPIC découvert et redirections initiales maîtrisées | **PASS** |
-| K003-06 | Timer noyau produit des interruptions répétables | À faire |
+| K003-06 | Timer noyau produit des interruptions répétables | **PASS** |
 | K003-07 | État per-CPU avec pile noyau, TSS et IST dédiées | À faire |
 | K003-08 | Au moins un AP est réellement démarré par INIT/SIPI | À faire |
 | K003-09 | Chaque AP atteint `ELYON_AP_READY` avec son APIC ID | À faire |
@@ -151,6 +151,41 @@ Aucune IRQ externe n'est encore démasquée dans ce jalon. Cette politique est v
 
 **K003-05 : PASS.**
 
+## K003-06 — Timer noyau
+
+Elyon utilise désormais le timer du Local APIC comme source d'interruptions périodiques du noyau. Sa fréquence effective est calibrée au démarrage à l'aide du canal 2 du PIT, utilisé uniquement comme référence temporelle en polling pendant une fenêtre d'environ 10 ms.
+
+La séquence de qualification est volontairement stricte :
+
+- le PIC 8259 maître et esclave est entièrement masqué avant `STI` afin d'éviter toute IRQ héritée non maîtrisée ;
+- le vecteur `0xE0` est réservé au timer LAPIC dans l'IDT ;
+- le timer LAPIC est d'abord lancé masqué avec un diviseur 16 pour mesurer son décrément pendant la fenêtre PIT ;
+- Elyon calcule ensuite le compteur initial nécessaire pour une cadence cible de 100 Hz ;
+- le LAPIC est programmé en mode périodique ;
+- le noyau active les interruptions, attend 100 interruptions réelles puis les désactive ;
+- chaque interruption incrémente un compteur atomique et envoie un EOI au Local APIC ;
+- le test échoue si le compteur EOI signale la moindre anomalie ;
+- le timer est finalement remasqué avant la poursuite du boot de qualification.
+
+La qualification a été exécutée sur le commit `019cd3cfcc61cbb84484b3be7e1786ed85964ea2`, GitHub Actions run **#66**.
+
+Preuves CI :
+
+```text
+[timer] source=PIT2 pit_count=11932 lapic_elapsed=629888 divide=16 effective_hz=62987849 initial_count=629878 target_hz=100
+[timer] vector=0xe0 legacy_pic_masked=1 qualification_target=100
+[timer] ticks=100 eoi_failures=0 periodic=1
+ELYON_TIMER_READY
+ELYON_KERNEL_READY_0_0_3
+[PASS] K003-06 timer LAPIC périodique 100 Hz, 100 ticks et EOI validés
+```
+
+Les différentes exécutions du même run ont produit une fréquence LAPIC effective proche de 63 MHz après division par 16, avec une variation normale liée à la fenêtre de calibration. Le compteur initial est dérivé de la mesure et non codé en dur.
+
+Le handler timer préserve les registres généraux, appelle un dispatch Rust minimal sans journalisation dans le chemin d'interruption, incrémente le compteur puis acquitte l'interruption via EOI avant le retour par `iretq`.
+
+**K003-06 : PASS.**
+
 ## Régressions 0.0.2
 
 La même CI a confirmé que l'introduction du parseur ACPI ne casse pas la baseline précédente :
@@ -181,4 +216,4 @@ La simple présence de structures ACPI, APIC, TSS ou d'un trampoline dans le cod
 
 ## Prochaine étape
 
-Le prochain critère est **K003-06 : mettre en place un timer noyau fiable, installer un vecteur d'interruption dédié, compter des ticks répétables, envoyer les EOI correctement et prouver au moins 100 interruptions consécutives sans exception parasite.**
+Le prochain critère est **K003-07 : introduire un véritable état per-CPU avec identifiant logique, APIC ID, pile noyau, GDT/TSS et IST double fault propres à chaque CPU, avant tout démarrage des AP.**
