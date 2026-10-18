@@ -14,8 +14,7 @@ pub const DOUBLE_FAULT_STACK_SIZE: usize = 16 * 1024;
 #[repr(C, align(16))]
 struct ExceptionStack([u8; DOUBLE_FAULT_STACK_SIZE]);
 
-static mut BSP_DOUBLE_FAULT_STACK: ExceptionStack =
-    ExceptionStack([0; DOUBLE_FAULT_STACK_SIZE]);
+static mut BSP_DOUBLE_FAULT_STACK: ExceptionStack = ExceptionStack([0; DOUBLE_FAULT_STACK_SIZE]);
 static mut TSS_TABLE: [TaskStateSegment; MAX_CPU_SLOTS] =
     [const { TaskStateSegment::new() }; MAX_CPU_SLOTS];
 static mut GDT_TABLE: [GlobalDescriptorTable<8>; MAX_CPU_SLOTS] =
