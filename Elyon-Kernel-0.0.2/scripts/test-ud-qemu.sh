@@ -7,6 +7,7 @@ KERNEL_TARGET="x86_64-unknown-none"
 TARGET_DIR="$ROOT/target-test-ud"
 ESP="$ROOT/build/tests/ud/esp"
 LOG="$ROOT/build/tests/ud/qemu.log"
+QEMU_TIMEOUT="${ELYON_QEMU_TIMEOUT:-15}"
 
 rm -rf "$TARGET_DIR" "$ROOT/build/tests/ud"
 mkdir -p "$ESP/EFI/BOOT" "$ESP/ELYON"
@@ -23,7 +24,7 @@ cp "$TARGET_DIR/$UEFI_TARGET/release/elyon-loader.efi" "$ESP/EFI/BOOT/BOOTX64.EF
 cp "$TARGET_DIR/$KERNEL_TARGET/release/elyon-kernel" "$ESP/ELYON/KERNEL.ELF"
 
 set +e
-timeout 15s env ELYON_HEADLESS=1 ELYON_ESP="$ESP" bash "$ROOT/scripts/run-qemu.sh" >"$LOG" 2>&1
+timeout "${QEMU_TIMEOUT}s" env ELYON_HEADLESS=1 ELYON_ESP="$ESP" bash "$ROOT/scripts/run-qemu.sh" >"$LOG" 2>&1
 RC=$?
 set -e
 
