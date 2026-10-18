@@ -12,7 +12,7 @@ use core::panic::PanicInfo;
 
 use elyon_abi::{BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootInfo};
 
-use crate::arch::x86_64::{apic, cpu, gdt, idt, ioapic, paging};
+use crate::arch::x86_64::{apic, cpu, gdt, idt, ioapic, paging, percpu};
 
 const BUILD_ID: &str = match option_env!("ELYON_BUILD_ID") {
     Some(value) => value,
@@ -251,6 +251,55 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
     kprintln!("[apic] EOI primitive=OK");
     kprintln!("ELYON_LAPIC_READY");
 
+    let percpu_summary = match percpu::prepare(
+        &topology,
+        lapic.apic_id,
+        info.kernel_stack_start,
+        info.kernel_stack_end,
+        info.kernel_phys_start,
+        info.kernel_phys_end,
+    ) {
+        Ok(summary) => summary,
+        Err(error) => {
+            kprintln!("[percpu] FAILED reason={}", error.as_str());
+            cpu::halt_forever();
+        }
+    };
+
+    kprintln!(
+        "[percpu] cpus={} capacity={} bsp_logical={} bsp_apic_id={} unique={} owned={} tr_loaded={}",
+        percpu_summary.cpu_count,
+        crate::arch::x86_64::MAX_CPU_SLOTS,
+        percpu_summary.bsp_index,
+        percpu_summary.bsp_apic_id,
+        if percpu_summary.resources_unique { 1 } else { 0 },
+        if percpu_summary.static_resources_owned { 1 } else { 0 },
+        if percpu_summary.bsp_tss_loaded { 1 } else { 0 }
+    );
+
+    for index in 0..percpu_summary.cpu_count {
+        let Some(slot) = percpu::snapshot(index) else {
+            kprintln!("[percpu] FAILED snapshot index={}", index);
+            cpu::halt_forever();
+        };
+
+        kprintln!(
+            "[percpu] cpu={} apic_id={} state={} stack={:#018x}..{:#018x} gdt={:#018x} tss={:#018x} ist={:#018x}..{:#018x} ticks={}",
+            slot.logical_id,
+            slot.apic_id,
+            slot.state.as_str(),
+            slot.kernel_stack_start,
+            slot.kernel_stack_end,
+            slot.gdt_address,
+            slot.tss_address,
+            slot.ist_start,
+            slot.ist_end,
+            slot.ticks
+        );
+    }
+
+    kprintln!("ELYON_PERCPU_READY");
+
     let ioapic = match ioapic::init(&topology, lapic.apic_id) {
         Ok(summary) => summary,
         Err(error) => {
@@ -342,10 +391,25 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         cpu::halt_forever();
     }
 
+    let bsp_percpu_ticks = percpu::bsp_ticks();
+    if bsp_percpu_ticks != timer_ticks {
+        kprintln!(
+            "[percpu] FAILED bsp_ticks={} timer_ticks={}",
+            bsp_percpu_ticks,
+            timer_ticks
+        );
+        cpu::halt_forever();
+    }
+
     kprintln!(
         "[timer] ticks={} eoi_failures={} periodic=1",
         timer_ticks,
         timer::eoi_failures()
+    );
+    kprintln!(
+        "[percpu] bsp_ticks={} timer_ticks={} match=1",
+        bsp_percpu_ticks,
+        timer_ticks
     );
     kprintln!("ELYON_TIMER_READY");
 
