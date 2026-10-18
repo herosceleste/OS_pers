@@ -6,6 +6,7 @@ mod arch;
 mod framebuffer;
 mod memory;
 mod serial;
+mod timer;
 
 use core::panic::PanicInfo;
 
@@ -302,6 +303,51 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         if ioapic.all_masked() { 1 } else { 0 }
     );
     kprintln!("ELYON_IOAPIC_READY");
+
+    idt::install_interrupt_gate(
+        timer::TIMER_VECTOR,
+        code_selector,
+        idt::apic_timer_handler(),
+    );
+
+    let timer_calibration = match timer::calibrate_and_start() {
+        Ok(calibration) => calibration,
+        Err(error) => {
+            kprintln!("[timer] FAILED reason={}", error.as_str());
+            cpu::halt_forever();
+        }
+    };
+
+    kprintln!(
+        "[timer] source=PIT2 pit_count={} lapic_elapsed={} divide={} effective_hz={} initial_count={} target_hz={}",
+        timer_calibration.pit_count,
+        timer_calibration.lapic_elapsed,
+        timer_calibration.divide,
+        timer_calibration.effective_lapic_hz,
+        timer_calibration.initial_count,
+        timer_calibration.target_hz
+    );
+    kprintln!(
+        "[timer] vector={:#x} legacy_pic_masked=1 qualification_target={}",
+        timer::TIMER_VECTOR,
+        timer::QUALIFICATION_TICKS
+    );
+
+    cpu::enable_interrupts();
+    let timer_ticks = timer::wait_for_ticks(timer::QUALIFICATION_TICKS);
+    cpu::disable_interrupts();
+
+    if let Err(error) = timer::stop() {
+        kprintln!("[timer] FAILED reason={}", error.as_str());
+        cpu::halt_forever();
+    }
+
+    kprintln!(
+        "[timer] ticks={} eoi_failures={} periodic=1",
+        timer_ticks,
+        timer::eoi_failures()
+    );
+    kprintln!("ELYON_TIMER_READY");
 
     if framebuffer::draw_boot_screen(info, paging::identity_limit()) {
         kprintln!(
