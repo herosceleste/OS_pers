@@ -278,11 +278,7 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         } else {
             0
         },
-        if percpu_summary.resources_owned {
-            1
-        } else {
-            0
-        },
+        if percpu_summary.resources_owned { 1 } else { 0 },
         if percpu_summary.bsp_tss_loaded { 1 } else { 0 }
     );
 
