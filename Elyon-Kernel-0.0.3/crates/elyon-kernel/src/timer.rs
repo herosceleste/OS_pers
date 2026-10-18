@@ -77,19 +77,14 @@ pub fn calibrate_and_start() -> Result<TimerCalibration, TimerError> {
         return Err(TimerError::LapicDidNotAdvance);
     }
 
-    let effective_lapic_hz =
-        elapsed as u64 * PIT_FREQUENCY_HZ / PIT_CALIBRATION_COUNT as u64;
+    let effective_lapic_hz = elapsed as u64 * PIT_FREQUENCY_HZ / PIT_CALIBRATION_COUNT as u64;
     let initial_count = effective_lapic_hz / TIMER_HZ as u64;
 
     if initial_count == 0 || initial_count > u32::MAX as u64 {
         return Err(TimerError::InvalidInitialCount);
     }
 
-    if !apic::timer_start_periodic(
-        TIMER_VECTOR,
-        initial_count as u32,
-        APIC_DIVIDE_BY_16_CONFIG,
-    ) {
+    if !apic::timer_start_periodic(TIMER_VECTOR, initial_count as u32, APIC_DIVIDE_BY_16_CONFIG) {
         return Err(TimerError::PeriodicProgrammingFailed);
     }
 
@@ -184,7 +179,6 @@ fn stop_pit_channel2() {
         cpu::out_u8(PIT_SPEAKER_CONTROL, control & !0x03);
     }
 }
-
 
 #[unsafe(no_mangle)]
 extern "C" fn elyon_timer_interrupt_dispatch() {
