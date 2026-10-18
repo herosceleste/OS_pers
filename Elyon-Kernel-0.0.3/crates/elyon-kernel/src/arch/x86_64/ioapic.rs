@@ -248,7 +248,6 @@ pub fn init(topology: &AcpiTopology, bsp_apic_id: u32) -> Result<IoApicSummary, 
 
         mask_controller(state);
         summary.total_redirection_entries += state.redirection_entries;
-        summary.masked_entries += state.redirection_entries;
         summary.push_controller(state)?;
     }
 
@@ -310,7 +309,27 @@ pub fn init(topology: &AcpiTopology, bsp_apic_id: u32) -> Result<IoApicSummary, 
         })?;
     }
 
+    summary.masked_entries = count_masked_entries(summary.controllers());
+    if !summary.all_masked() {
+        return Err(IoApicError::ReadBackMismatch);
+    }
+
     Ok(summary)
+}
+
+fn count_masked_entries(controllers: &[IoApicState]) -> u32 {
+    let mut masked = 0u32;
+
+    for controller in controllers {
+        for index in 0..controller.redirection_entries {
+            let low_reg = IOAPIC_REDIR_BASE.wrapping_add((index * 2) as u8);
+            if read_reg(controller.address, low_reg) & REDIR_MASKED != 0 {
+                masked += 1;
+            }
+        }
+    }
+
+    masked
 }
 
 fn find_override(
