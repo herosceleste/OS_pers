@@ -2,7 +2,7 @@
 
 ## Statut
 
-**EN COURS — K003-01 à K003-06 sont validés.**
+**EN COURS — K003-01 à K003-07 sont validés.**
 
 Baseline de départ : fusion 0.0.2 dans `main`, commit `303feeeff93b4ed1b5b3092cc16a4d8c4489f252`.
 
@@ -24,7 +24,7 @@ Première qualification ACPI :
 | K003-04 | Local APIC du BSP activé et APIC ID confirmé | **PASS** |
 | K003-05 | IOAPIC découvert et redirections initiales maîtrisées | **PASS** |
 | K003-06 | Timer noyau produit des interruptions répétables | **PASS** |
-| K003-07 | État per-CPU avec pile noyau, TSS et IST dédiées | À faire |
+| K003-07 | État per-CPU avec pile noyau, TSS et IST dédiées | **PASS** |
 | K003-08 | Au moins un AP est réellement démarré par INIT/SIPI | À faire |
 | K003-09 | Chaque AP atteint `ELYON_AP_READY` avec son APIC ID | À faire |
 | K003-10 | Le BSP reste stable après activation SMP | À faire |
@@ -186,6 +186,42 @@ Le handler timer préserve les registres généraux, appelle un dispatch Rust mi
 
 **K003-06 : PASS.**
 
+## K003-07 — État per-CPU
+
+Elyon dispose désormais d'un état per-CPU borné à 64 slots. Le BSP occupe le slot logique 0 et conserve la pile noyau dédiée fournie par le loader. Chaque AP découvert comme utilisable dans MADT reçoit avant tout démarrage SMP :
+
+- un identifiant logique Elyon ;
+- son APIC ID ;
+- un état explicite `prepared` ;
+- une pile noyau dédiée de 64 KiB allouée par le PMM ;
+- une IST double fault dédiée de 16 KiB allouée par le PMM ;
+- sa propre GDT ;
+- sa propre TSS ;
+- un compteur de ticks atomique.
+
+Le BSP utilise réellement la GDT/TSS/IST du slot 0. Le registre TR est relu et comparé au sélecteur TSS attendu. Les AP ne sont pas encore démarrés : leurs slots restent `prepared`, ce qui évite de confondre provisionnement et succès SMP.
+
+Une première version de l'implémentation réservait statiquement toutes les piles AP et IST dans le `.bss`. La qualification a montré que cette stratégie grossissait inutilement l'image noyau et pouvait empêcher le loader UEFI de réserver sa plage physique fixe. Elle a été remplacée par une allocation PMM contiguë, ce qui rend la propriété mémoire explicite et prépare directement le trampoline SMP.
+
+La qualification finale a été exécutée sur le commit `8a4e8e2c9776bdbdae010aebf18f631ca1dd2c0f`, GitHub Actions run **#108**, avec une VM QEMU à 4 vCPU.
+
+Preuves CI :
+
+```text
+[percpu] cpus=4 capacity=64 bsp_logical=0 bsp_apic_id=0 unique=1 owned=1 tr_loaded=1
+[percpu] cpu=0 apic_id=0 state=online stack=0x000000003e29f000..0x000000003e2af000 gdt=0x0000000000309000 tss=0x000000000030a200 ist=0x000000000030d3a0..0x00000000003113a0 ticks=0
+[percpu] cpu=1 apic_id=1 state=prepared stack=0x0000000000102000..0x0000000000112000 gdt=0x0000000000309048 tss=0x000000000030a268 ist=0x0000000000112000..0x0000000000116000 ticks=0
+[percpu] cpu=2 apic_id=2 state=prepared stack=0x0000000000116000..0x0000000000126000 gdt=0x0000000000309090 tss=0x000000000030a2d0 ist=0x0000000000126000..0x000000000012a000 ticks=0
+[percpu] cpu=3 apic_id=3 state=prepared stack=0x000000000012a000..0x000000000013a000 gdt=0x00000000003090d8 tss=0x000000000030a338 ist=0x000000000013a000..0x000000000013e000 ticks=0
+ELYON_PERCPU_READY
+[percpu] bsp_ticks=100 timer_ticks=100 match=1
+[PASS] K003-07 4 slots per-CPU uniques, BSP online/TSS chargé, 3 AP préparés et ticks BSP validés
+```
+
+Les tests vérifient également que les quatre piles noyau, GDT, TSS et IST sont distinctes. Les GDT/TSS restent possédées par l'image noyau ; les piles et IST des AP sont possédées par le PMM et restent sous la limite d'identity mapping actuelle. Le compteur de ticks per-CPU du BSP a été corrélé au timer LAPIC : 100 ticks per-CPU pour 100 interruptions timer.
+
+**K003-07 : PASS.**
+
 ## Régressions 0.0.2
 
 La même CI a confirmé que l'introduction du parseur ACPI ne casse pas la baseline précédente :
@@ -216,4 +252,4 @@ La simple présence de structures ACPI, APIC, TSS ou d'un trampoline dans le cod
 
 ## Prochaine étape
 
-Le prochain critère est **K003-07 : introduire un véritable état per-CPU avec identifiant logique, APIC ID, pile noyau, GDT/TSS et IST double fault propres à chaque CPU, avant tout démarrage des AP.**
+Le prochain critère est **K003-08 : réserver une zone trampoline sous 1 MiB, préparer le bootstrap AP et envoyer une séquence INIT/SIPI afin de faire démarrer réellement au moins un Application Processor.**
