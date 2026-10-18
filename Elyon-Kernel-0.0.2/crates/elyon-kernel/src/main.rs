@@ -18,6 +18,7 @@ const BUILD_ID: &str = match option_env!("ELYON_BUILD_ID") {
 };
 
 const TEST_UD: bool = option_env!("ELYON_TEST_UD").is_some();
+const TEST_DF: bool = option_env!("ELYON_TEST_DF").is_some();
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text._start")]
@@ -115,6 +116,11 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         new_cr3,
         paging::identity_limit() / 1024 / 1024
     );
+
+    if TEST_DF {
+        kprintln!("[test] injecting #DF via invalid stack + int3");
+        idt::trigger_double_fault_test();
+    }
 
     if info.acpi_rsdp != 0 {
         kprintln!("[acpi] RSDP={:#018x}", info.acpi_rsdp);
