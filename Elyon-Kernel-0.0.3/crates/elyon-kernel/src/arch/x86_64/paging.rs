@@ -79,7 +79,6 @@ pub const fn identity_limit() -> u64 {
     IDENTITY_LIMIT
 }
 
-
 pub fn mark_identity_mmio_uncacheable(address: u64) -> bool {
     if address >= IDENTITY_LIMIT {
         return false;
