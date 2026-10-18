@@ -395,7 +395,6 @@ pub fn apic_spurious_handler() -> u64 {
     elyon_apic_spurious as *const () as usize as u64
 }
 
-
 pub fn apic_timer_handler() -> u64 {
     elyon_apic_timer_interrupt as *const () as usize as u64
 }
