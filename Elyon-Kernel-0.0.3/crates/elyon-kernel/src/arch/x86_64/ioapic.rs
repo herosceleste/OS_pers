@@ -16,6 +16,7 @@ const REDIR_TRIGGER_LEVEL: u32 = 1 << 15;
 const REDIR_MASKED: u32 = 1 << 16;
 
 const LEGACY_IRQ_COUNT: usize = 16;
+const MAX_IOAPIC_REDIRECTIONS: u32 = 120;
 pub const LEGACY_VECTOR_BASE: u8 = 0x20;
 
 #[derive(Clone, Copy)]
@@ -88,6 +89,7 @@ pub struct IoApicSummary {
     pub total_redirection_entries: u32,
     pub masked_entries: u32,
     pub overrides_applied: usize,
+    pub shadowed_legacy_irqs: usize,
 }
 
 impl IoApicSummary {
@@ -100,6 +102,7 @@ impl IoApicSummary {
             total_redirection_entries: 0,
             masked_entries: 0,
             overrides_applied: 0,
+            shadowed_legacy_irqs: 0,
         }
     }
 
@@ -209,7 +212,7 @@ pub fn init(topology: &AcpiTopology, bsp_apic_id: u32) -> Result<IoApicSummary, 
         let arbitration_raw = read_reg(descriptor.address, IOAPIC_REG_ARBITRATION);
 
         let redirection_entries = ((version_raw >> 16) & 0xFF) + 1;
-        if redirection_entries == 0 || redirection_entries > 256 {
+        if redirection_entries == 0 || redirection_entries > MAX_IOAPIC_REDIRECTIONS {
             return Err(IoApicError::RedirectionCountInvalid);
         }
 
@@ -272,6 +275,11 @@ pub fn init(topology: &AcpiTopology, bsp_apic_id: u32) -> Result<IoApicSummary, 
             summary.overrides_applied += 1;
         }
 
+        if !overridden && gsi_reserved_by_other_override(topology.isos(), irq, gsi)? {
+            summary.shadowed_legacy_irqs += 1;
+            continue;
+        }
+
         if used_gsis[..used_count].contains(&gsi) {
             return Err(IoApicError::DuplicateRoute);
         }
@@ -322,6 +330,22 @@ fn find_override(
     }
 
     Ok(found)
+}
+
+fn gsi_reserved_by_other_override(
+    overrides: &[InterruptSourceOverride],
+    irq: u8,
+    gsi: u32,
+) -> Result<bool, IoApicError> {
+    for iso in overrides {
+        if iso.bus != 0 {
+            continue;
+        }
+        if iso.source != irq && iso.gsi == gsi {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn decode_iso_flags(iso: InterruptSourceOverride) -> Result<(bool, bool), IoApicError> {
@@ -390,8 +414,8 @@ fn program_masked_route(
     let read_low = read_reg(controller.address, low_reg);
     let read_high = read_reg(controller.address, high_reg);
 
-    let relevant_low = 0x0001_E7FFu32;
-    if read_low & relevant_low != low & relevant_low || read_high != high {
+    let relevant_low = 0x0001_AFFFu32;
+    if read_low & relevant_low != low & relevant_low || read_high & 0xFF00_0000 != high {
         return Err(IoApicError::ReadBackMismatch);
     }
 
