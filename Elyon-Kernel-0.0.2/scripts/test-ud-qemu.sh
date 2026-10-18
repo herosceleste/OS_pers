@@ -23,7 +23,7 @@ cp "$TARGET_DIR/$UEFI_TARGET/release/elyon-loader.efi" "$ESP/EFI/BOOT/BOOTX64.EF
 cp "$TARGET_DIR/$KERNEL_TARGET/release/elyon-kernel" "$ESP/ELYON/KERNEL.ELF"
 
 set +e
-timeout 15s env   ELYON_HEADLESS=1   ELYON_ESP="$ESP"   "$ROOT/scripts/run-qemu.sh" >"$LOG" 2>&1
+timeout 15s env ELYON_HEADLESS=1 ELYON_ESP="$ESP" bash "$ROOT/scripts/run-qemu.sh" >"$LOG" 2>&1
 RC=$?
 set -e
 
