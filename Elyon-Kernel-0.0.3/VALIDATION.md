@@ -2,7 +2,7 @@
 
 ## Statut
 
-**EN COURS — K003-01, K003-02 et K003-03 sont validés.**
+**EN COURS — K003-01 à K003-05 sont validés.**
 
 Baseline de départ : fusion 0.0.2 dans `main`, commit `303feeeff93b4ed1b5b3092cc16a4d8c4489f252`.
 
@@ -22,7 +22,7 @@ Première qualification ACPI :
 | K003-02 | XSDT/RSDT parcourue avec validation des tables | **PASS** |
 | K003-03 | MADT parsée et topologie CPU/APIC journalisée | **PASS** |
 | K003-04 | Local APIC du BSP activé et APIC ID confirmé | **PASS** |
-| K003-05 | IOAPIC découvert et redirections initiales maîtrisées | À faire |
+| K003-05 | IOAPIC découvert et redirections initiales maîtrisées | **PASS** |
 | K003-06 | Timer noyau produit des interruptions répétables | À faire |
 | K003-07 | État per-CPU avec pile noyau, TSS et IST dédiées | À faire |
 | K003-08 | Au moins un AP est réellement démarré par INIT/SIPI | À faire |
@@ -122,6 +122,35 @@ L'APIC ID lu directement depuis le Local APIC est `0` et correspond à un proces
 
 **K003-04 : PASS.**
 
+## K003-05 — IOAPIC
+
+Elyon prend désormais le contrôle initial de l'IOAPIC décrit par MADT. Le noyau marque sa zone MMIO comme non cacheable, lit les registres d'identité, de version et d'arbitrage, calcule le nombre réel d'entrées de redirection, vérifie la cohérence de l'identifiant matériel avec MADT et contrôle les plages GSI.
+
+Avant toute activation d'IRQ, toutes les entrées de redirection sont explicitement masquées. Elyon construit ensuite les routes IRQ héritées vers le BSP en conservant le bit de masque actif. Les `Interrupt Source Overrides` ACPI sont appliqués pour la GSI, la polarité et le mode edge/level. Lorsqu'un override réutilise une GSI qui correspondrait à une route ISA par défaut, la route par défaut conflictuelle est volontairement écartée au lieu d'écraser la route ACPI.
+
+La qualification a été exécutée sur le commit `e84a119cb43807ec0730e7fad45f3beaf9db07bc`, GitHub Actions run **#43**.
+
+Preuves CI :
+
+```text
+[ioapic] controllers=1 bsp_apic_id=0
+[ioapic] madt_id=0 hw_id=0 version=0x20 arbitration_id=0 address=0x00000000fec00000 gsi=0..23 redirs=24 id_match=1
+[ioapic] route irq=0 gsi=2 vector=0x20 polarity=high trigger=edge masked=1 override=1
+[ioapic] route irq=5 gsi=5 vector=0x25 polarity=high trigger=level masked=1 override=1
+[ioapic] route irq=9 gsi=9 vector=0x29 polarity=high trigger=level masked=1 override=1
+[ioapic] route irq=10 gsi=10 vector=0x2a polarity=high trigger=level masked=1 override=1
+[ioapic] route irq=11 gsi=11 vector=0x2b polarity=high trigger=level masked=1 override=1
+[ioapic] legacy_routes=15 overrides_applied=5 shadowed=1 masked=24/24 all_masked=1
+ELYON_IOAPIC_READY
+[PASS] K003-05 IOAPIC lu, redirections masquées et overrides MADT appliqués
+```
+
+L'IOAPIC de qualification expose 24 entrées couvrant les GSI 0 à 23. Les 24 entrées ont été relues comme masquées après programmation. Cinq overrides MADT ont été appliqués et la route ISA 2 a été écartée parce que la GSI 2 est affectée à l'IRQ 0 par ACPI.
+
+Aucune IRQ externe n'est encore démasquée dans ce jalon. Cette politique est volontaire : le noyau ne rendra une ligne active qu'après installation de son handler et de sa stratégie EOI.
+
+**K003-05 : PASS.**
+
 ## Régressions 0.0.2
 
 La même CI a confirmé que l'introduction du parseur ACPI ne casse pas la baseline précédente :
@@ -152,4 +181,4 @@ La simple présence de structures ACPI, APIC, TSS ou d'un trampoline dans le cod
 
 ## Prochaine étape
 
-Le prochain critère est **K003-05 : prendre le contrôle de l'IOAPIC, lire sa version et son nombre d'entrées de redirection, appliquer les Interrupt Source Overrides issus de MADT et garder les lignes non configurées masquées par défaut.**
+Le prochain critère est **K003-06 : mettre en place un timer noyau fiable, installer un vecteur d'interruption dédié, compter des ticks répétables, envoyer les EOI correctement et prouver au moins 100 interruptions consécutives sans exception parasite.**
