@@ -333,7 +333,6 @@ fn exception_name(vector: u64) -> &'static str {
     }
 }
 
-
 pub fn trigger_double_fault_test() -> ! {
     unsafe { elyon_test_double_fault() }
     cpu::halt_forever()
