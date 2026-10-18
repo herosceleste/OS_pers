@@ -6,6 +6,8 @@ const HUGE_PAGE_SIZE: u64 = 2 * 1024 * 1024;
 const IDENTITY_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
 const PRESENT: u64 = 1 << 0;
 const WRITABLE: u64 = 1 << 1;
+const WRITE_THROUGH: u64 = 1 << 3;
+const CACHE_DISABLE: u64 = 1 << 4;
 const HUGE: u64 = 1 << 7;
 
 #[repr(C, align(4096))]
@@ -75,4 +77,32 @@ pub fn table_span() -> (u64, u64) {
 
 pub const fn identity_limit() -> u64 {
     IDENTITY_LIMIT
+}
+
+
+pub fn mark_identity_mmio_uncacheable(address: u64) -> bool {
+    if address >= IDENTITY_LIMIT {
+        return false;
+    }
+
+    let huge_index = (address / HUGE_PAGE_SIZE) as usize;
+    let pdpt_index = huge_index / ENTRIES;
+    let pd_index = huge_index % ENTRIES;
+
+    if pdpt_index >= 4 {
+        return false;
+    }
+
+    unsafe {
+        let pds = addr_of_mut!(PDS);
+        let pd = core::ptr::addr_of_mut!((*pds)[pdpt_index]);
+        (*pd).0[pd_index] |= WRITE_THROUGH | CACHE_DISABLE;
+        asm!(
+            "invlpg [{}]",
+            in(reg) address,
+            options(nostack, preserves_flags)
+        );
+    }
+
+    true
 }
