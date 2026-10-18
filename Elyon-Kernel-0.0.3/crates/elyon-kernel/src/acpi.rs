@@ -398,11 +398,7 @@ fn read_sdt(address: u64, mapped_limit: u64) -> Result<&'static [u8], AcpiError>
     Ok(table)
 }
 
-fn parse_madt(
-    address: u64,
-    madt: &[u8],
-    topology: &mut AcpiTopology,
-) -> Result<(), AcpiError> {
+fn parse_madt(address: u64, madt: &[u8], topology: &mut AcpiTopology) -> Result<(), AcpiError> {
     if madt.len() < MADT_FIXED_LENGTH {
         return Err(AcpiError::InvalidMadtLength);
     }
@@ -523,17 +519,10 @@ fn signature(table: &[u8]) -> &[u8] {
 }
 
 fn checksum_ok(bytes: &[u8]) -> bool {
-    bytes
-        .iter()
-        .fold(0u8, |sum, byte| sum.wrapping_add(*byte))
-        == 0
+    bytes.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)) == 0
 }
 
-fn phys_slice(
-    address: u64,
-    length: usize,
-    mapped_limit: u64,
-) -> Result<&'static [u8], AcpiError> {
+fn phys_slice(address: u64, length: usize, mapped_limit: u64) -> Result<&'static [u8], AcpiError> {
     let end = address
         .checked_add(length as u64)
         .ok_or(AcpiError::AddressOutsideMappedRange)?;
