@@ -54,3 +54,7 @@ jobs:
       - name: QEMU invalid-opcode exception test
         working-directory: Elyon-Kernel-0.0.2
         run: bash scripts/test-ud-qemu.sh
+
+      - name: QEMU double-fault IST test
+        working-directory: Elyon-Kernel-0.0.2
+        run: bash scripts/test-df-qemu.sh
