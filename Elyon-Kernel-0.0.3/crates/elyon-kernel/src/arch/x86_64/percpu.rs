@@ -224,8 +224,7 @@ pub fn prepare(
     CPU_COUNT.store(logical, Ordering::Release);
     BSP_INDEX.store(0, Ordering::Release);
 
-    let resources_owned =
-        validate_ownership(logical, kernel_start, kernel_end, identity_limit);
+    let resources_owned = validate_ownership(logical, kernel_start, kernel_end, identity_limit);
     if !resources_owned {
         return Err(PerCpuError::StaticResourceOutsideKernel);
     }
