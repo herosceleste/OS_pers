@@ -54,7 +54,6 @@ pub fn vendor_string() -> CpuVendor {
     CpuVendor { bytes }
 }
 
-
 pub struct ApicCapabilities {
     pub apic: bool,
     pub x2apic: bool,
