@@ -15,12 +15,23 @@ const XAPIC_VERSION: u64 = 0x030;
 const XAPIC_TPR: u64 = 0x080;
 const XAPIC_EOI: u64 = 0x0B0;
 const XAPIC_SVR: u64 = 0x0F0;
+const XAPIC_LVT_TIMER: u64 = 0x320;
+const XAPIC_TIMER_INITIAL: u64 = 0x380;
+const XAPIC_TIMER_CURRENT: u64 = 0x390;
+const XAPIC_TIMER_DIVIDE: u64 = 0x3E0;
 
 const X2APIC_ID: u32 = 0x802;
 const X2APIC_VERSION: u32 = 0x803;
 const X2APIC_TPR: u32 = 0x808;
 const X2APIC_EOI: u32 = 0x80B;
 const X2APIC_SVR: u32 = 0x80F;
+const X2APIC_LVT_TIMER: u32 = 0x832;
+const X2APIC_TIMER_INITIAL: u32 = 0x838;
+const X2APIC_TIMER_CURRENT: u32 = 0x839;
+const X2APIC_TIMER_DIVIDE: u32 = 0x83E;
+
+const LVT_MASKED: u32 = 1 << 16;
+const LVT_TIMER_PERIODIC: u32 = 1 << 17;
 
 pub const SPURIOUS_VECTOR: u8 = 0xFF;
 
@@ -204,4 +215,98 @@ fn read_xapic(base: u64, offset: u64) -> u32 {
 
 fn write_xapic(base: u64, offset: u64, value: u32) {
     unsafe { write_volatile((base + offset) as *mut u32, value) }
+}
+
+
+pub fn timer_begin_calibration(divide_config: u32) -> bool {
+    match ACTIVE_MODE.load(Ordering::Acquire) {
+        MODE_XAPIC => {
+            let base = ACTIVE_BASE.load(Ordering::Acquire);
+            if base == 0 {
+                return false;
+            }
+            write_xapic(base, XAPIC_TIMER_DIVIDE, divide_config);
+            write_xapic(base, XAPIC_LVT_TIMER, LVT_MASKED);
+            write_xapic(base, XAPIC_TIMER_INITIAL, u32::MAX);
+            true
+        }
+        MODE_X2APIC => {
+            unsafe {
+                cpu::write_msr(X2APIC_TIMER_DIVIDE, divide_config as u64);
+                cpu::write_msr(X2APIC_LVT_TIMER, LVT_MASKED as u64);
+                cpu::write_msr(X2APIC_TIMER_INITIAL, u32::MAX as u64);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+pub fn timer_current_count() -> Option<u32> {
+    match ACTIVE_MODE.load(Ordering::Acquire) {
+        MODE_XAPIC => {
+            let base = ACTIVE_BASE.load(Ordering::Acquire);
+            if base == 0 {
+                None
+            } else {
+                Some(read_xapic(base, XAPIC_TIMER_CURRENT))
+            }
+        }
+        MODE_X2APIC => Some(unsafe { cpu::read_msr(X2APIC_TIMER_CURRENT) } as u32),
+        _ => None,
+    }
+}
+
+pub fn timer_start_periodic(vector: u8, initial_count: u32, divide_config: u32) -> bool {
+    if initial_count == 0 {
+        return false;
+    }
+
+    let lvt = vector as u32 | LVT_TIMER_PERIODIC;
+
+    match ACTIVE_MODE.load(Ordering::Acquire) {
+        MODE_XAPIC => {
+            let base = ACTIVE_BASE.load(Ordering::Acquire);
+            if base == 0 {
+                return false;
+            }
+            write_xapic(base, XAPIC_TIMER_DIVIDE, divide_config);
+            write_xapic(base, XAPIC_LVT_TIMER, lvt);
+            write_xapic(base, XAPIC_TIMER_INITIAL, initial_count);
+            true
+        }
+        MODE_X2APIC => {
+            unsafe {
+                cpu::write_msr(X2APIC_TIMER_DIVIDE, divide_config as u64);
+                cpu::write_msr(X2APIC_LVT_TIMER, lvt as u64);
+                cpu::write_msr(X2APIC_TIMER_INITIAL, initial_count as u64);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+pub fn timer_stop() -> bool {
+    match ACTIVE_MODE.load(Ordering::Acquire) {
+        MODE_XAPIC => {
+            let base = ACTIVE_BASE.load(Ordering::Acquire);
+            if base == 0 {
+                return false;
+            }
+            let lvt = read_xapic(base, XAPIC_LVT_TIMER);
+            write_xapic(base, XAPIC_LVT_TIMER, lvt | LVT_MASKED);
+            write_xapic(base, XAPIC_TIMER_INITIAL, 0);
+            true
+        }
+        MODE_X2APIC => {
+            let lvt = unsafe { cpu::read_msr(X2APIC_LVT_TIMER) } as u32;
+            unsafe {
+                cpu::write_msr(X2APIC_LVT_TIMER, (lvt | LVT_MASKED) as u64);
+                cpu::write_msr(X2APIC_TIMER_INITIAL, 0);
+            }
+            true
+        }
+        _ => false,
+    }
 }
