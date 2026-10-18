@@ -217,7 +217,6 @@ fn write_xapic(base: u64, offset: u64, value: u32) {
     unsafe { write_volatile((base + offset) as *mut u32, value) }
 }
 
-
 pub fn timer_begin_calibration(divide_config: u32) -> bool {
     match ACTIVE_MODE.load(Ordering::Acquire) {
         MODE_XAPIC => {
