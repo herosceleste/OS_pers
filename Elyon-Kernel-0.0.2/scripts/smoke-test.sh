@@ -4,10 +4,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG="$ROOT/build/qemu-smoke.log"
 
-"$ROOT/scripts/build.sh"
+bash "$ROOT/scripts/build.sh"
 
 set +e
-timeout 15s env ELYON_HEADLESS=1 "$ROOT/scripts/run-qemu.sh" >"$LOG" 2>&1
+timeout 15s env ELYON_HEADLESS=1 bash "$ROOT/scripts/run-qemu.sh" >"$LOG" 2>&1
 RC=$?
 set -e
 
