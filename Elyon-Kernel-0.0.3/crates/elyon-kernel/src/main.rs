@@ -272,8 +272,16 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         crate::arch::x86_64::MAX_CPU_SLOTS,
         percpu_summary.bsp_index,
         percpu_summary.bsp_apic_id,
-        if percpu_summary.resources_unique { 1 } else { 0 },
-        if percpu_summary.static_resources_owned { 1 } else { 0 },
+        if percpu_summary.resources_unique {
+            1
+        } else {
+            0
+        },
+        if percpu_summary.static_resources_owned {
+            1
+        } else {
+            0
+        },
         if percpu_summary.bsp_tss_loaded { 1 } else { 0 }
     );
 
