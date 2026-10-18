@@ -26,6 +26,7 @@ static EOI_FAILURES: AtomicU64 = AtomicU64::new(0);
 pub struct TimerCalibration {
     pub pit_count: u16,
     pub lapic_elapsed: u32,
+    pub effective_lapic_hz: u64,
     pub initial_count: u32,
     pub target_hz: u32,
     pub divide: u32,
@@ -76,9 +77,9 @@ pub fn calibrate_and_start() -> Result<TimerCalibration, TimerError> {
         return Err(TimerError::LapicDidNotAdvance);
     }
 
-    let numerator = elapsed as u64 * PIT_FREQUENCY_HZ;
-    let denominator = PIT_CALIBRATION_COUNT as u64 * TIMER_HZ as u64;
-    let initial_count = numerator / denominator;
+    let effective_lapic_hz =
+        elapsed as u64 * PIT_FREQUENCY_HZ / PIT_CALIBRATION_COUNT as u64;
+    let initial_count = effective_lapic_hz / TIMER_HZ as u64;
 
     if initial_count == 0 || initial_count > u32::MAX as u64 {
         return Err(TimerError::InvalidInitialCount);
@@ -95,6 +96,7 @@ pub fn calibrate_and_start() -> Result<TimerCalibration, TimerError> {
     Ok(TimerCalibration {
         pit_count: PIT_CALIBRATION_COUNT,
         lapic_elapsed: elapsed,
+        effective_lapic_hz,
         initial_count: initial_count as u32,
         target_hz: TIMER_HZ,
         divide: 16,
@@ -157,11 +159,19 @@ fn start_pit_channel2(count: u16) {
 }
 
 fn wait_for_pit_channel2() -> Result<(), TimerError> {
+    let mut saw_low = false;
+
     for _ in 0..PIT_MAX_POLLS {
         let status = unsafe { cpu::in_u8(PIT_SPEAKER_CONTROL) };
-        if status & 0x20 != 0 {
+
+        if !saw_low {
+            if status & 0x20 == 0 {
+                saw_low = true;
+            }
+        } else if status & 0x20 != 0 {
             return Ok(());
         }
+
         spin_loop();
     }
 
@@ -173,4 +183,10 @@ fn stop_pit_channel2() {
         let control = cpu::in_u8(PIT_SPEAKER_CONTROL);
         cpu::out_u8(PIT_SPEAKER_CONTROL, control & !0x03);
     }
+}
+
+
+#[unsafe(no_mangle)]
+extern "C" fn elyon_timer_interrupt_dispatch() {
+    on_interrupt();
 }
