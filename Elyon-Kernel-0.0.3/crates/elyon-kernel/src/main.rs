@@ -258,6 +258,7 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         info.kernel_stack_end,
         info.kernel_phys_start,
         info.kernel_phys_end,
+        paging::identity_limit(),
     ) {
         Ok(summary) => summary,
         Err(error) => {
@@ -277,7 +278,7 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         } else {
             0
         },
-        if percpu_summary.static_resources_owned {
+        if percpu_summary.resources_owned {
             1
         } else {
             0
