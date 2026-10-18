@@ -21,7 +21,7 @@ Première qualification ACPI :
 | K003-01 | RSDP validé par signature et checksum | **PASS** |
 | K003-02 | XSDT/RSDT parcourue avec validation des tables | **PASS** |
 | K003-03 | MADT parsée et topologie CPU/APIC journalisée | **PASS** |
-| K003-04 | Local APIC du BSP activé et APIC ID confirmé | À faire |
+| K003-04 | Local APIC du BSP activé et APIC ID confirmé | **PASS** |
 | K003-05 | IOAPIC découvert et redirections initiales maîtrisées | À faire |
 | K003-06 | Timer noyau produit des interruptions répétables | À faire |
 | K003-07 | État per-CPU avec pile noyau, TSS et IST dédiées | À faire |
@@ -98,6 +98,30 @@ Le test automatisé conclut :
 
 **K003-03 : PASS.**
 
+## K003-04 — Local APIC du BSP
+
+Le noyau détecte les capacités APIC via CPUID, lit `IA32_APIC_BASE`, conserve le mode xAPIC lorsque x2APIC n'est pas actif, vérifie que l'adresse MMIO correspond à celle annoncée par MADT, puis marque la page d'identité contenant le Local APIC comme non cacheable avant tout accès MMIO.
+
+Le vecteur de spurious interrupt `0xFF` est installé dans l'IDT, le Software Enable du Local APIC est activé dans le SVR, le TPR est abaissé à zéro et la primitive EOI est installée.
+
+La qualification a été exécutée sur le commit `916cda12807e74bd13063a02afb7900cce85f42b`, GitHub Actions run **#25**.
+
+Preuves CI :
+
+```text
+[apic] cpuid apic=1 x2apic=0
+[apic] IA32_APIC_BASE=0x00000000fee00000 madt_base=0x00000000fee00000 mode=xapic bsp=1
+[apic] BSP apic_id=0 version=0x50014 madt_match=1
+[apic] SVR vector=0xff software_enable=1
+[apic] EOI primitive=OK
+ELYON_LAPIC_READY
+[PASS] K003-04 Local APIC BSP activé, APIC ID corrélé à MADT, SVR et EOI validés
+```
+
+L'APIC ID lu directement depuis le Local APIC est `0` et correspond à un processeur utilisable découvert dans MADT. Le processeur courant est bien identifié comme BSP.
+
+**K003-04 : PASS.**
+
 ## Régressions 0.0.2
 
 La même CI a confirmé que l'introduction du parseur ACPI ne casse pas la baseline précédente :
@@ -128,4 +152,4 @@ La simple présence de structures ACPI, APIC, TSS ou d'un trampoline dans le cod
 
 ## Prochaine étape
 
-Le prochain critère est **K003-04 : activer le Local APIC du BSP, confirmer l'APIC ID courant et installer les primitives EOI / Spurious Interrupt Vector sans régression du boot nominal.**
+Le prochain critère est **K003-05 : prendre le contrôle de l'IOAPIC, lire sa version et son nombre d'entrées de redirection, appliquer les Interrupt Source Overrides issus de MADT et garder les lignes non configurées masquées par défaut.**
