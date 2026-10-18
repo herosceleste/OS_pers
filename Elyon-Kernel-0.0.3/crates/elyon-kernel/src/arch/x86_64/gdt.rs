@@ -20,6 +20,7 @@ static mut TSS_TABLE: [TaskStateSegment; MAX_CPU_SLOTS] =
     [const { TaskStateSegment::new() }; MAX_CPU_SLOTS];
 static mut GDT_TABLE: [GlobalDescriptorTable<8>; MAX_CPU_SLOTS] =
     [const { GlobalDescriptorTable::<8>::empty() }; MAX_CPU_SLOTS];
+static mut TSS_SELECTORS: [u16; MAX_CPU_SLOTS] = [0; MAX_CPU_SLOTS];
 
 pub fn init() -> u16 {
     init_for_cpu(0)
@@ -72,6 +73,7 @@ fn build_for_cpu(
         let tss_ptr = addr_of!((*tss_table)[cpu_index]);
         let tss_descriptor = Descriptor::tss_segment_unchecked(tss_ptr);
         let tss = (*gdt_table)[cpu_index].append(tss_descriptor);
+        TSS_SELECTORS[cpu_index] = tss.index() << 3;
 
         (code, data, tss)
     }
@@ -98,4 +100,10 @@ pub fn tss_address(cpu_index: usize) -> u64 {
     assert!(cpu_index < MAX_CPU_SLOTS);
     let table = addr_of!(TSS_TABLE);
     unsafe { addr_of!((*table)[cpu_index]) as u64 }
+}
+
+
+pub fn tss_selector_for(cpu_index: usize) -> u16 {
+    assert!(cpu_index < MAX_CPU_SLOTS);
+    unsafe { TSS_SELECTORS[cpu_index] }
 }
