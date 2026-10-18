@@ -1,21 +1,18 @@
-use core::ptr::addr_of;
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+use elyon_abi::PAGE_SIZE;
 
 use crate::acpi::{AcpiTopology, CpuDescriptor};
 use crate::arch::x86_64::{MAX_CPU_SLOTS, cpu, gdt};
+use crate::memory;
 
-const AP_KERNEL_STACK_SIZE: usize = 64 * 1024;
+const AP_KERNEL_STACK_FRAMES: usize = 16;
+const AP_IST_FRAMES: usize = 4;
 const INVALID_CPU_INDEX: usize = usize::MAX;
 
 const STATE_EMPTY: u8 = 0;
 const STATE_PREPARED: u8 = 1;
 const STATE_ONLINE: u8 = 2;
-
-#[repr(C, align(16))]
-struct KernelStack([u8; AP_KERNEL_STACK_SIZE]);
-
-static mut AP_KERNEL_STACKS: [KernelStack; MAX_CPU_SLOTS] =
-    [const { KernelStack([0; AP_KERNEL_STACK_SIZE]) }; MAX_CPU_SLOTS];
 
 struct CpuSlot {
     logical_id: AtomicU32,
@@ -105,7 +102,7 @@ pub struct PerCpuSummary {
     pub bsp_index: usize,
     pub bsp_apic_id: u32,
     pub resources_unique: bool,
-    pub static_resources_owned: bool,
+    pub resources_owned: bool,
     pub bsp_tss_loaded: bool,
 }
 
@@ -116,6 +113,8 @@ pub enum PerCpuError {
     BspNotFound,
     DuplicateApicId,
     InvalidBspStack,
+    AllocationFailed,
+    ResourceOutsideIdentityMap,
     StaticResourceOutsideKernel,
     ResourceOverlap,
     BspTssNotLoaded,
@@ -129,7 +128,9 @@ impl PerCpuError {
             Self::BspNotFound => "BSP APIC ID absent from usable MADT CPUs",
             Self::DuplicateApicId => "duplicate usable APIC ID in MADT",
             Self::InvalidBspStack => "invalid loader-provided BSP kernel stack",
-            Self::StaticResourceOutsideKernel => "per-CPU static resource outside kernel image",
+            Self::AllocationFailed => "PMM could not allocate per-CPU stack or IST",
+            Self::ResourceOutsideIdentityMap => "per-CPU resource outside current identity map",
+            Self::StaticResourceOutsideKernel => "per-CPU GDT/TSS outside kernel image",
             Self::ResourceOverlap => "per-CPU resources overlap",
             Self::BspTssNotLoaded => "BSP task register does not reference slot 0 TSS",
         }
@@ -143,6 +144,7 @@ pub fn prepare(
     bsp_stack_end: u64,
     kernel_start: u64,
     kernel_end: u64,
+    identity_limit: u64,
 ) -> Result<PerCpuSummary, PerCpuError> {
     for slot in &CPU_SLOTS {
         slot.clear();
@@ -173,7 +175,14 @@ pub fn prepare(
         .copied()
         .ok_or(PerCpuError::BspNotFound)?;
 
-    configure_slot(0, bsp, CpuState::Online, bsp_stack_start, bsp_stack_end);
+    configure_slot(
+        0,
+        bsp,
+        CpuState::Online,
+        bsp_stack_start,
+        bsp_stack_end,
+        gdt::double_fault_stack_span_for(0),
+    );
 
     let expected_tr = gdt::tss_selector_for(0);
     let bsp_tss_loaded = expected_tr != 0 && cpu::read_tr() == expected_tr;
@@ -187,8 +196,19 @@ pub fn prepare(
             continue;
         }
 
-        gdt::prepare_for_cpu(logical);
-        let (stack_start, stack_end) = ap_kernel_stack_span(logical);
+        let stack_start = memory::allocate_contiguous_frames(AP_KERNEL_STACK_FRAMES)
+            .ok_or(PerCpuError::AllocationFailed)?;
+        let stack_end = stack_start + AP_KERNEL_STACK_FRAMES as u64 * PAGE_SIZE;
+
+        let ist_start = memory::allocate_contiguous_frames(AP_IST_FRAMES)
+            .ok_or(PerCpuError::AllocationFailed)?;
+        let ist_end = ist_start + AP_IST_FRAMES as u64 * PAGE_SIZE;
+
+        if stack_end > identity_limit || ist_end > identity_limit {
+            return Err(PerCpuError::ResourceOutsideIdentityMap);
+        }
+
+        gdt::prepare_for_cpu(logical, ist_start, ist_end);
 
         configure_slot(
             logical,
@@ -196,6 +216,7 @@ pub fn prepare(
             CpuState::Prepared,
             stack_start,
             stack_end,
+            (ist_start, ist_end),
         );
         logical += 1;
     }
@@ -203,8 +224,9 @@ pub fn prepare(
     CPU_COUNT.store(logical, Ordering::Release);
     BSP_INDEX.store(0, Ordering::Release);
 
-    let static_resources_owned = validate_static_ownership(logical, kernel_start, kernel_end);
-    if !static_resources_owned {
+    let resources_owned =
+        validate_ownership(logical, kernel_start, kernel_end, identity_limit);
+    if !resources_owned {
         return Err(PerCpuError::StaticResourceOutsideKernel);
     }
 
@@ -218,7 +240,7 @@ pub fn prepare(
         bsp_index: 0,
         bsp_apic_id,
         resources_unique,
-        static_resources_owned,
+        resources_owned,
         bsp_tss_loaded,
     })
 }
@@ -282,9 +304,9 @@ fn configure_slot(
     state: CpuState,
     stack_start: u64,
     stack_end: u64,
+    ist_span: (u64, u64),
 ) {
     let slot = &CPU_SLOTS[logical_id];
-    let (ist_start, ist_end) = gdt::double_fault_stack_span_for(logical_id);
 
     slot.logical_id.store(logical_id as u32, Ordering::Release);
     slot.apic_id.store(descriptor.apic_id, Ordering::Release);
@@ -296,15 +318,9 @@ fn configure_slot(
         .store(gdt::gdt_address(logical_id), Ordering::Release);
     slot.tss_address
         .store(gdt::tss_address(logical_id), Ordering::Release);
-    slot.ist_start.store(ist_start, Ordering::Release);
-    slot.ist_end.store(ist_end, Ordering::Release);
+    slot.ist_start.store(ist_span.0, Ordering::Release);
+    slot.ist_end.store(ist_span.1, Ordering::Release);
     slot.ticks.store(0, Ordering::Release);
-}
-
-fn ap_kernel_stack_span(cpu_index: usize) -> (u64, u64) {
-    let stacks = addr_of!(AP_KERNEL_STACKS);
-    let start = unsafe { addr_of!((*stacks)[cpu_index]) as u64 };
-    (start, start + AP_KERNEL_STACK_SIZE as u64)
 }
 
 fn validate_unique_apic_ids(topology: &AcpiTopology) -> Result<(), PerCpuError> {
@@ -323,7 +339,12 @@ fn validate_unique_apic_ids(topology: &AcpiTopology) -> Result<(), PerCpuError> 
     Ok(())
 }
 
-fn validate_static_ownership(count: usize, kernel_start: u64, kernel_end: u64) -> bool {
+fn validate_ownership(
+    count: usize,
+    kernel_start: u64,
+    kernel_end: u64,
+    identity_limit: u64,
+) -> bool {
     if kernel_end <= kernel_start {
         return false;
     }
@@ -333,9 +354,6 @@ fn validate_static_ownership(count: usize, kernel_start: u64, kernel_end: u64) -
             return false;
         };
 
-        if !range_inside(cpu.ist_start, cpu.ist_end, kernel_start, kernel_end) {
-            return false;
-        }
         if cpu.gdt_address < kernel_start || cpu.gdt_address >= kernel_end {
             return false;
         }
@@ -343,13 +361,26 @@ fn validate_static_ownership(count: usize, kernel_start: u64, kernel_end: u64) -
             return false;
         }
 
-        if index != 0
-            && !range_inside(
-                cpu.kernel_stack_start,
-                cpu.kernel_stack_end,
-                kernel_start,
-                kernel_end,
-            )
+        if cpu.kernel_stack_start == 0
+            || cpu.kernel_stack_end <= cpu.kernel_stack_start
+            || cpu.kernel_stack_end > identity_limit
+            || cpu.ist_start == 0
+            || cpu.ist_end <= cpu.ist_start
+            || cpu.ist_end > identity_limit
+        {
+            return false;
+        }
+
+        if index == 0 {
+            if !range_inside(cpu.ist_start, cpu.ist_end, kernel_start, kernel_end) {
+                return false;
+            }
+        } else if ranges_overlap(
+            cpu.kernel_stack_start,
+            cpu.kernel_stack_end,
+            kernel_start,
+            kernel_end,
+        ) || ranges_overlap(cpu.ist_start, cpu.ist_end, kernel_start, kernel_end)
         {
             return false;
         }
@@ -375,6 +406,18 @@ fn validate_resource_uniqueness(count: usize) -> bool {
                 right.kernel_stack_start,
                 right.kernel_stack_end,
             ) || ranges_overlap(left.ist_start, left.ist_end, right.ist_start, right.ist_end)
+                || ranges_overlap(
+                    left.kernel_stack_start,
+                    left.kernel_stack_end,
+                    right.ist_start,
+                    right.ist_end,
+                )
+                || ranges_overlap(
+                    left.ist_start,
+                    left.ist_end,
+                    right.kernel_stack_start,
+                    right.kernel_stack_end,
+                )
                 || left.gdt_address == right.gdt_address
                 || left.tss_address == right.tss_address
             {
