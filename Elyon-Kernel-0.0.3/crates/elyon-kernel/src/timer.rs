@@ -1,7 +1,7 @@
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::arch::x86_64::{apic, cpu};
+use crate::arch::x86_64::{apic, cpu, percpu};
 
 const PIT_CHANNEL2_DATA: u16 = 0x42;
 const PIT_COMMAND: u16 = 0x43;
@@ -61,6 +61,7 @@ pub fn calibrate_and_start() -> Result<TimerCalibration, TimerError> {
     mask_legacy_pic();
     TICKS.store(0, Ordering::Release);
     EOI_FAILURES.store(0, Ordering::Release);
+    percpu::reset_bsp_ticks();
 
     if !apic::timer_begin_calibration(APIC_DIVIDE_BY_16_CONFIG) {
         return Err(TimerError::LapicUnavailable);
@@ -100,6 +101,7 @@ pub fn calibrate_and_start() -> Result<TimerCalibration, TimerError> {
 
 pub fn on_interrupt() {
     TICKS.fetch_add(1, Ordering::AcqRel);
+    percpu::increment_bsp_ticks();
     if !apic::eoi() {
         EOI_FAILURES.fetch_add(1, Ordering::AcqRel);
     }
