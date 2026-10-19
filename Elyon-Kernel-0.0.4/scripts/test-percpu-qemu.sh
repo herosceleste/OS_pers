@@ -55,7 +55,7 @@ grep -Eq "\[percpu\] bsp_ticks=(1[0-9][0-9]|[2-9][0-9]{2,}) timer_ticks=\1 match
   exit 1
 }
 
-grep -Fq "ELYON_KERNEL_READY_0_0_3" "$LOG" || {
+grep -Fq "ELYON_KERNEL_READY_0_0_4" "$LOG" || {
   echo "[FAIL] régression du boot nominal après per-CPU (qemu rc=$RC)" >&2
   exit 1
 }
