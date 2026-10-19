@@ -187,8 +187,8 @@ pub fn pit_delay_us(microseconds: u32) -> Result<(), TimerError> {
         return Ok(());
     }
 
-    let count = ((PIT_FREQUENCY_HZ * microseconds as u64) / 1_000_000)
-        .clamp(1, u16::MAX as u64) as u16;
+    let count =
+        ((PIT_FREQUENCY_HZ * microseconds as u64) / 1_000_000).clamp(1, u16::MAX as u64) as u16;
 
     start_pit_channel2(count);
     let result = wait_for_pit_channel2();
