@@ -416,3 +416,25 @@ fn wait_icr_idle() -> Result<(), ApicError> {
         _ => Err(ApicError::ControllerNotInitialized),
     }
 }
+
+
+pub fn current_id() -> Result<u32, ApicError> {
+    match ACTIVE_MODE.load(Ordering::Acquire) {
+        MODE_XAPIC => {
+            let base = ACTIVE_BASE.load(Ordering::Acquire);
+            if base == 0 {
+                return Err(ApicError::ControllerNotInitialized);
+            }
+            Ok(read_xapic(base, XAPIC_ID) >> 24)
+        }
+        MODE_X2APIC => Ok(unsafe { cpu::read_msr(X2APIC_ID) } as u32),
+        _ => Err(ApicError::ControllerNotInitialized),
+    }
+}
+
+pub fn send_fixed(apic_id: u32, vector: u8) -> Result<(), ApicError> {
+    if vector < 0x20 {
+        return Err(ApicError::ControllerNotInitialized);
+    }
+    send_icr(apic_id, vector as u32)
+}
