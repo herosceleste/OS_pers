@@ -124,7 +124,7 @@ L'APIC ID lu directement depuis le Local APIC est `0` et correspond à un proces
 
 ## K003-05 — IOAPIC
 
-Elyon prend désormais le contrôle initial de l'IOAPIC décrit par MADT. Le noyau marque sa zone MMIO comme non cacheable, lit les registres d'identité, de version et d'arbitrage, calcule le nombre réel d'entrées de redirection, vérifie la cohérence de l'identifiant matériel avec MADT et contrôle les plages GSI.
+Elyon prend désormais le contrôle initial de l'IOAPIC décrit par MADT. Le noyau marque sa zone MMIO comme non cacheable, lit les registres d'identité, de version et d'arbitrage, calcule le nombre réel d'entrées de redirection et contrôle les plages GSI. L'ID MADT et l'ID lu dans le registre matériel sont tous deux conservés comme diagnostics. Leur divergence n'est plus, à elle seule, une cause d'arrêt : l'adresse MMIO, l'unicité des descripteurs MADT, les plages GSI, le nombre de redirections et les read-backs restent les invariants fonctionnels bloquants.
 
 Avant toute activation d'IRQ, toutes les entrées de redirection sont explicitement masquées. Elyon construit ensuite les routes IRQ héritées vers le BSP en conservant le bit de masque actif. Les `Interrupt Source Overrides` ACPI sont appliqués pour la GSI, la polarité et le mode edge/level. Lorsqu'un override réutilise une GSI qui correspondrait à une route ISA par défaut, la route par défaut conflictuelle est volontairement écartée au lieu d'écraser la route ACPI.
 
@@ -150,6 +150,14 @@ L'IOAPIC de qualification expose 24 entrées couvrant les GSI 0 à 23. Les 24 en
 Aucune IRQ externe n'est encore démasquée dans ce jalon. Cette politique est volontaire : le noyau ne rendra une ligne active qu'après installation de son handler et de sa stratégie EOI.
 
 **K003-05 : PASS.**
+
+### Retour de validation croisée VMware sur l'ID IOAPIC
+
+La première validation VMware 4 vCPU a atteint avec succès ACPI, LAPIC, per-CPU, le démarrage INIT/SIPI des trois AP, la stabilité SMP et le changement de contexte, puis s'est arrêtée sur l'ancienne règle `MADT IOAPIC ID == hardware ID`.
+
+VMware annonce dans MADT un IOAPIC `id=4` à `0xFEC00000`, GSI base 0. Cette observation a révélé que l'égalité stricte des deux représentations d'ID était une politique trop restrictive pour la portabilité hyperviseur. Elyon conserve désormais la divergence comme `id_mismatch` diagnostique, sans masquer les contrôles réellement utilisés pour le routage.
+
+La correction a été qualifiée sous QEMU par GitHub Actions run **#209**. QEMU conserve `madt_id=0 hw_id=0 id_match=1`, `id_mismatches=0`, et K003-05/K003-12/#UD/#DF restent PASS. La validation VMware doit être rejouée avec la nouvelle ISO avant fusion.
 
 ## K003-06 — Timer noyau
 
