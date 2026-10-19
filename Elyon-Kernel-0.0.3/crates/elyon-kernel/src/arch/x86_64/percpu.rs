@@ -435,3 +435,52 @@ fn range_inside(start: u64, end: u64, owner_start: u64, owner_end: u64) -> bool 
 fn ranges_overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
     a_start < b_end && b_start < a_end
 }
+
+
+#[derive(Clone, Copy)]
+pub enum OnlineError {
+    InvalidIndex,
+    NotPrepared,
+    ApicIdMismatch,
+}
+
+impl OnlineError {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidIndex => "invalid per-CPU index",
+            Self::NotPrepared => "per-CPU slot is not prepared",
+            Self::ApicIdMismatch => "observed APIC ID does not match per-CPU slot",
+        }
+    }
+}
+
+pub fn mark_online(index: usize, observed_apic_id: u32) -> Result<(), OnlineError> {
+    if index >= cpu_count() {
+        return Err(OnlineError::InvalidIndex);
+    }
+
+    let slot = &CPU_SLOTS[index];
+    if slot.state.load(Ordering::Acquire) != STATE_PREPARED {
+        return Err(OnlineError::NotPrepared);
+    }
+    if slot.apic_id.load(Ordering::Acquire) != observed_apic_id {
+        return Err(OnlineError::ApicIdMismatch);
+    }
+
+    slot.state.store(STATE_ONLINE, Ordering::Release);
+    Ok(())
+}
+
+pub fn is_online(index: usize) -> bool {
+    index < cpu_count() && CPU_SLOTS[index].state.load(Ordering::Acquire) == STATE_ONLINE
+}
+
+pub fn online_count() -> usize {
+    (0..cpu_count()).filter(|index| is_online(*index)).count()
+}
+
+pub fn prepared_count() -> usize {
+    (0..cpu_count())
+        .filter(|index| CPU_SLOTS[*index].state.load(Ordering::Acquire) == STATE_PREPARED)
+        .count()
+}
