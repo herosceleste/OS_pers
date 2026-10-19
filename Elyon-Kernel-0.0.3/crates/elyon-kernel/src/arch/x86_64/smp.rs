@@ -1,5 +1,6 @@
 use core::arch::global_asm;
 use core::ptr::{copy_nonoverlapping, write_bytes, write_unaligned};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use elyon_abi::BootInfo;
 
@@ -13,6 +14,12 @@ const GDTR_ADDR: u64 = TRAMPOLINE_BASE + 0x0F00;
 const GDT_ADDR: u64 = TRAMPOLINE_BASE + 0x0F10;
 const SIPI_VECTOR: u8 = (TRAMPOLINE_BASE >> 12) as u8;
 const STARTUP_WAIT_MS: usize = 100;
+
+pub const STABILITY_VECTOR: u8 = 0xF1;
+pub const STABILITY_ROUNDS: u64 = 10;
+const STABILITY_ROUND_DELAY_US: u32 = 20_000;
+
+static STABILITY_IPI_ERRORS: AtomicU64 = AtomicU64::new(0);
 
 const BOOT_CR3: u64 = BOOT_DATA;
 const BOOT_STACK: u64 = BOOT_DATA + 0x08;
@@ -117,6 +124,15 @@ pub struct AllStartupSummary {
     pub sipi_vector: u8,
 }
 
+pub struct StabilitySummary {
+    pub rounds: u64,
+    pub online_count: usize,
+    pub prepared_count: usize,
+    pub ipi_errors: u64,
+    pub min_ap_heartbeat: u64,
+    pub max_ap_heartbeat: u64,
+}
+
 #[derive(Clone, Copy)]
 pub enum SmpError {
     NoPreparedAp,
@@ -126,6 +142,9 @@ pub enum SmpError {
     TimerDelay,
     Apic,
     StartupTimeout,
+    StabilityStateRegression,
+    StabilityHeartbeatMissing,
+    StabilityBootCountMismatch,
 }
 
 impl SmpError {
@@ -138,6 +157,9 @@ impl SmpError {
             Self::TimerDelay => "PIT delay failed during INIT-SIPI",
             Self::Apic => "Local APIC INIT-SIPI operation failed",
             Self::StartupTimeout => "Application Processor did not reach online state",
+            Self::StabilityStateRegression => "SMP online/prepared state regressed",
+            Self::StabilityHeartbeatMissing => "AP stability heartbeat missing",
+            Self::StabilityBootCountMismatch => "CPU boot count changed during stability window",
         }
     }
 }
@@ -196,6 +218,77 @@ pub fn start_all_prepared(info: &BootInfo) -> Result<AllStartupSummary, SmpError
         prepared_count: percpu::prepared_count(),
         trampoline_base: TRAMPOLINE_BASE,
         sipi_vector: SIPI_VECTOR,
+    })
+}
+
+pub fn qualify_stability() -> Result<StabilitySummary, SmpError> {
+    let expected_cpus = percpu::cpu_count();
+    if expected_cpus < 2 {
+        return Err(SmpError::NoPreparedAp);
+    }
+
+    STABILITY_IPI_ERRORS.store(0, Ordering::Release);
+
+    for round in 1..=STABILITY_ROUNDS {
+        if percpu::online_count() != expected_cpus || percpu::prepared_count() != 0 {
+            return Err(SmpError::StabilityStateRegression);
+        }
+
+        for index in 1..expected_cpus {
+            let snapshot = percpu::snapshot(index).ok_or(SmpError::StabilityStateRegression)?;
+            if snapshot.state != percpu::CpuState::Online {
+                return Err(SmpError::StabilityStateRegression);
+            }
+            if snapshot.boot_count != 1 {
+                return Err(SmpError::StabilityBootCountMismatch);
+            }
+
+            apic::send_fixed(snapshot.apic_id, STABILITY_VECTOR).map_err(|_| SmpError::Apic)?;
+        }
+
+        timer::pit_delay_us(STABILITY_ROUND_DELAY_US).map_err(|_| SmpError::TimerDelay)?;
+
+        for index in 1..expected_cpus {
+            let snapshot = percpu::snapshot(index).ok_or(SmpError::StabilityStateRegression)?;
+            if snapshot.state != percpu::CpuState::Online
+                || snapshot.boot_count != 1
+                || snapshot.heartbeat < round
+            {
+                return Err(SmpError::StabilityHeartbeatMissing);
+            }
+        }
+    }
+
+    let mut min_ap_heartbeat = u64::MAX;
+    let mut max_ap_heartbeat = 0u64;
+
+    for index in 1..expected_cpus {
+        let snapshot = percpu::snapshot(index).ok_or(SmpError::StabilityStateRegression)?;
+        min_ap_heartbeat = min_ap_heartbeat.min(snapshot.heartbeat);
+        max_ap_heartbeat = max_ap_heartbeat.max(snapshot.heartbeat);
+
+        kprintln!(
+            "[smp] stable cpu={} apic_id={} state={} heartbeat={} boot_count={}",
+            snapshot.logical_id,
+            snapshot.apic_id,
+            snapshot.state.as_str(),
+            snapshot.heartbeat,
+            snapshot.boot_count
+        );
+    }
+
+    let ipi_errors = STABILITY_IPI_ERRORS.load(Ordering::Acquire);
+    if ipi_errors != 0 {
+        return Err(SmpError::StabilityHeartbeatMissing);
+    }
+
+    Ok(StabilitySummary {
+        rounds: STABILITY_ROUNDS,
+        online_count: percpu::online_count(),
+        prepared_count: percpu::prepared_count(),
+        ipi_errors,
+        min_ap_heartbeat,
+        max_ap_heartbeat,
     })
 }
 
@@ -352,4 +445,22 @@ extern "sysv64" fn elyon_ap_entry(cpu_index: u64, expected_apic_id: u64) -> ! {
     kprintln!("ELYON_AP_READY cpu={} apic_id={}", index, observed_apic_id);
 
     cpu::halt_forever()
+}
+
+
+#[unsafe(no_mangle)]
+extern "C" fn elyon_smp_stability_ipi_dispatch() {
+    let Ok(apic_id) = apic::current_id() else {
+        STABILITY_IPI_ERRORS.fetch_add(1, Ordering::AcqRel);
+        let _ = apic::eoi();
+        return;
+    };
+
+    if !percpu::record_heartbeat_by_apic_id(apic_id) {
+        STABILITY_IPI_ERRORS.fetch_add(1, Ordering::AcqRel);
+    }
+
+    if !apic::eoi() {
+        STABILITY_IPI_ERRORS.fetch_add(1, Ordering::AcqRel);
+    }
 }
