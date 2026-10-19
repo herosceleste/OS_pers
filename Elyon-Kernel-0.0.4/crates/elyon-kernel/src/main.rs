@@ -430,9 +430,7 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         task_model.invalid_transitions_rejected,
         task_model.states_seen_mask
     );
-    kprintln!(
-        "[task] states=READY,RUNNING,BLOCKED,SLEEPING,DEAD affinity_enforced=1"
-    );
+    kprintln!("[task] states=READY,RUNNING,BLOCKED,SLEEPING,DEAD affinity_enforced=1");
     kprintln!("ELYON_TASK_MODEL_READY");
 
     let ioapic = match ioapic::init(&topology, lapic.apic_id) {
