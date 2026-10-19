@@ -65,6 +65,10 @@ jobs:
         working-directory: Elyon-Kernel-0.0.3
         run: bash scripts/test-smp-one-ap-qemu.sh
 
+      - name: All APs SMP startup test
+        working-directory: Elyon-Kernel-0.0.3
+        run: bash scripts/test-smp-all-aps-qemu.sh
+
       - name: IOAPIC routing test
         working-directory: Elyon-Kernel-0.0.3
         run: bash scripts/test-ioapic-qemu.sh
