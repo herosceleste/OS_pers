@@ -126,6 +126,45 @@ EXC_NOERR 31
 elyon_apic_spurious:
     iretq
 
+.global elyon_smp_stability_ipi
+elyon_smp_stability_ipi:
+    cld
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rsp
+    and rsp, -16
+    call elyon_smp_stability_ipi_dispatch
+    mov rsp, r12
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    iretq
+
 .global elyon_apic_timer_interrupt
 elyon_apic_timer_interrupt:
     cld
@@ -238,6 +277,7 @@ unsafe extern "C" {
     fn elyon_test_double_fault();
     fn elyon_apic_spurious();
     fn elyon_apic_timer_interrupt();
+    fn elyon_smp_stability_ipi();
 }
 
 pub fn init(code_selector: u16) {
@@ -402,4 +442,9 @@ pub fn apic_spurious_handler() -> u64 {
 
 pub fn apic_timer_handler() -> u64 {
     elyon_apic_timer_interrupt as *const () as usize as u64
+}
+
+
+pub fn smp_stability_ipi_handler() -> u64 {
+    elyon_smp_stability_ipi as *const () as usize as u64
 }
