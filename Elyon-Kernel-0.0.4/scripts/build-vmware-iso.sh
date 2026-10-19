@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ISO="$ROOT/build/Elyon-Kernel-0.0.3-UEFI.iso"
+ISO="$ROOT/build/Elyon-Kernel-0.0.4-UEFI.iso"
 IMG="$ROOT/build/vmware/efiboot.img"
 ISO_DIR="$ROOT/build/vmware/iso"
 
