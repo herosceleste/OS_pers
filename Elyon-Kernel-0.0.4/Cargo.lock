@@ -28,11 +28,11 @@ checksum = "413d67b29ef1021b4d60f4aa1e925ca031751e213832b4b1d588fae623c05c60"
 
 [[package]]
 name = "elyon-abi"
-version = "0.0.3"
+version = "0.0.4"
 
 [[package]]
 name = "elyon-kernel"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "elyon-abi",
  "x86_64",
@@ -40,7 +40,7 @@ dependencies = [
 
 [[package]]
 name = "elyon-loader"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "elyon-abi",
  "uefi",
