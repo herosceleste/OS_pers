@@ -2,7 +2,7 @@
 
 ## Statut
 
-**EN COURS — K003-01 à K003-08 sont validés.**
+**EN COURS — K003-01 à K003-09 sont validés.**
 
 Baseline de départ : fusion 0.0.2 dans `main`, commit `303feeeff93b4ed1b5b3092cc16a4d8c4489f252`.
 
@@ -26,7 +26,7 @@ Première qualification ACPI :
 | K003-06 | Timer noyau produit des interruptions répétables | **PASS** |
 | K003-07 | État per-CPU avec pile noyau, TSS et IST dédiées | **PASS** |
 | K003-08 | Au moins un AP est réellement démarré par INIT/SIPI | **PASS** |
-| K003-09 | Chaque AP atteint `ELYON_AP_READY` avec son APIC ID | À faire |
+| K003-09 | Chaque AP atteint `ELYON_AP_READY` avec son APIC ID | **PASS** |
 | K003-10 | Le BSP reste stable après activation SMP | À faire |
 | K003-11 | Base de changement de contexte noyau testée | À faire |
 | K003-12 | CI nominale et SMP sans régression des critères 0.0.2 | À faire |
@@ -261,6 +261,34 @@ Le même run a également validé la configuration 4 vCPU utilisée par K003-07.
 
 **K003-08 : PASS.**
 
+## K003-09 — Tous les AP atteignent Elyon
+
+Le bootstrap SMP n'est plus limité à un seul Application Processor. Le BSP parcourt désormais tous les slots per-CPU encore `prepared`, réutilise séquentiellement le trampoline bas à `0x8000` et applique pour chacun la même séquence INIT/SIPI déjà qualifiée en K003-08.
+
+Avant cette généralisation, la sortie COM1 a été sérialisée par un verrou atomique SMP. Chaque appel de journalisation désactive localement les interruptions, acquiert le verrou, écrit une ligne complète puis restaure l'état IF initial. Cette protection supprime l'entrelacement de lignes observé pendant les premières qualifications 4 vCPU.
+
+Chaque AP doit satisfaire les mêmes contrôles qu'en K003-08 : passage en mode long, pile per-CPU, GDT/TSS/IST dédiée, Local APIC secondaire activé, APIC ID matériel conforme au slot, puis transition atomique `prepared -> online`. Un marqueur `ELYON_AP_READY cpu=<n> apic_id=<id>` est émis uniquement après cette transition.
+
+La qualification finale a été exécutée sur le commit `7ec0a63dfa3c829063a562e60eb88abb483c5212`, GitHub Actions run **#146**, avec une VM QEMU à 4 vCPU.
+
+Preuves CI :
+
+```text
+ELYON_AP_READY cpu=1 apic_id=1
+ELYON_AP_READY cpu=2 apic_id=2
+ELYON_AP_READY cpu=3 apic_id=3
+[smp] all_ready started=3 online=4 prepared=0 expected=4 trampoline=0x8000 sipi_vector=0x8
+ELYON_SMP_READY
+ELYON_KERNEL_READY_0_0_3
+[PASS] K003-09 tous les AP MADT ont atteint ELYON_AP_READY et online=4 prepared=0
+```
+
+Le test ne se contente pas de compter trois marqueurs. Il extrait les trois slots initialement `prepared` depuis le journal per-CPU, récupère leurs couples `cpu/apic_id`, puis exige un marqueur `ELYON_AP_READY` correspondant pour chacun. Il vérifie ensuite exactement trois AP ready, `online=4`, `prepared=0`, l'absence de `[smp] AP FAILED` et la survie du BSP jusqu'à `ELYON_KERNEL_READY_0_0_3`.
+
+Le même run a également confirmé les régressions K003-01 à K003-08, le timer LAPIC, l'IOAPIC, ainsi que les tests fail-closed #UD et #DF/IST.
+
+**K003-09 : PASS.**
+
 ## Régressions 0.0.2
 
 La même CI a confirmé que l'introduction du parseur ACPI ne casse pas la baseline précédente :
@@ -291,4 +319,4 @@ La simple présence de structures ACPI, APIC, TSS ou d'un trampoline dans le cod
 
 ## Prochaine étape
 
-Le prochain critère est **K003-09 : généraliser la séquence INIT/SIPI à tous les AP utilisables découverts par MADT et exiger que chacun atteigne `ELYON_AP_READY cpu=<n> apic_id=<id>`, avec un état per-CPU réellement `online`.**
+Le prochain critère est **K003-10 : maintenir le BSP stable après activation SMP, conserver tous les CPU online pendant une fenêtre de qualification, vérifier qu'aucun AP ne régresse ou ne redémarre et préparer un véritable état idle SMP avant la fondation du changement de contexte.**
