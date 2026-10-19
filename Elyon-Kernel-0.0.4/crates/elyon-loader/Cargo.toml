@@ -1,0 +1,13 @@
+[package]
+name = "elyon-loader"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "elyon-loader"
+path = "src/main.rs"
+
+[dependencies]
+elyon-abi = { path = "../elyon-abi" }
+uefi = { version = "=0.41.0", default-features = false, features = ["alloc", "global_allocator"] }
