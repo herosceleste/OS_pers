@@ -45,7 +45,7 @@ grep -Fq "[EXCEPTION] fail-closed halt" "$LOG" || {
   exit 1
 }
 
-if grep -Fq "ELYON_KERNEL_READY_0_0_3" "$LOG"; then
+if grep -Fq "ELYON_KERNEL_READY_0_0_4" "$LOG"; then
   echo "[FAIL] le noyau a continué après #UD" >&2
   exit 1
 fi
