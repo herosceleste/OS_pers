@@ -132,7 +132,6 @@ fn mark_used(frame: usize) {
     }
 }
 
-
 pub fn range_is_usable(info: &BootInfo, start: u64, end: u64) -> bool {
     if start == 0 || end <= start {
         return false;
@@ -141,8 +140,6 @@ pub fn range_is_usable(info: &BootInfo, start: u64, end: u64) -> bool {
     info.memory_regions[..info.memory_region_count as usize]
         .iter()
         .any(|region| {
-            region.kind == MemoryRegionKind::Usable
-                && start >= region.start
-                && end <= region.end()
+            region.kind == MemoryRegionKind::Usable && start >= region.start && end <= region.end()
         })
 }
