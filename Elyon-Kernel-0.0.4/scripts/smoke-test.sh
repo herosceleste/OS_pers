@@ -12,11 +12,11 @@ timeout "${QEMU_TIMEOUT}s" env ELYON_HEADLESS=1 bash "$ROOT/scripts/run-qemu.sh"
 RC=$?
 set -e
 
-if grep -q "ELYON_KERNEL_READY_0_0_3" "$LOG"; then
-  echo "[PASS] Elyon Kernel 0.0.3 a atteint ELYON_KERNEL_READY_0_0_3"
+if grep -q "ELYON_KERNEL_READY_0_0_4" "$LOG"; then
+  echo "[PASS] Elyon Kernel 0.0.4 a atteint ELYON_KERNEL_READY_0_0_4"
   exit 0
 fi
 
-echo "[FAIL] marqueur ELYON_KERNEL_READY_0_0_3 absent (qemu rc=$RC)" >&2
+echo "[FAIL] marqueur ELYON_KERNEL_READY_0_0_4 absent (qemu rc=$RC)" >&2
 cat "$LOG" >&2
 exit 1
