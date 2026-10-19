@@ -305,6 +305,12 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
 
     kprintln!("ELYON_PERCPU_READY");
 
+    idt::install_interrupt_gate(
+        smp::STABILITY_VECTOR,
+        code_selector,
+        idt::smp_stability_ipi_handler(),
+    );
+
     if percpu_summary.cpu_count > 1 {
         let smp_summary = match smp::start_all_prepared(info) {
             Ok(summary) => summary,
@@ -336,6 +342,25 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         );
         kprintln!("ELYON_AP_BOOT_READY");
         kprintln!("ELYON_SMP_READY");
+
+        let stability = match smp::qualify_stability() {
+            Ok(summary) => summary,
+            Err(error) => {
+                kprintln!("[smp] STABILITY FAILED reason={}", error.as_str());
+                cpu::halt_forever();
+            }
+        };
+
+        kprintln!(
+            "[smp] stability rounds={} online={} prepared={} ipi_errors={} min_heartbeat={} max_heartbeat={}",
+            stability.rounds,
+            stability.online_count,
+            stability.prepared_count,
+            stability.ipi_errors,
+            stability.min_ap_heartbeat,
+            stability.max_ap_heartbeat
+        );
+        kprintln!("ELYON_SMP_STABLE");
     } else {
         kprintln!("[smp] no AP discovered; bootstrap skipped");
     }
