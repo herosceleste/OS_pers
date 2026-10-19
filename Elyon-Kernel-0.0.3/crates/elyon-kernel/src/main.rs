@@ -428,6 +428,13 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
             controller.redirection_entries,
             if controller.id_matches() { 1 } else { 0 }
         );
+        if !controller.id_matches() {
+            kprintln!(
+                "[ioapic] WARNING id_mismatch madt_id={} hw_id={} policy=diagnostic-only",
+                controller.madt_id,
+                controller.hw_id
+            );
+        }
     }
 
     for route in ioapic.legacy_routes() {
@@ -444,10 +451,11 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
     }
 
     kprintln!(
-        "[ioapic] legacy_routes={} overrides_applied={} shadowed={} masked={}/{} all_masked={}",
+        "[ioapic] legacy_routes={} overrides_applied={} shadowed={} id_mismatches={} masked={}/{} all_masked={}",
         ioapic.legacy_route_count(),
         ioapic.overrides_applied,
         ioapic.shadowed_legacy_irqs,
+        ioapic.id_mismatches,
         ioapic.masked_entries,
         ioapic.total_redirection_entries,
         if ioapic.all_masked() { 1 } else { 0 }
