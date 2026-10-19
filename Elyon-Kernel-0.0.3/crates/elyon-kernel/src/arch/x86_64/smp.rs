@@ -109,6 +109,14 @@ pub struct StartupSummary {
     pub prepared_count: usize,
 }
 
+pub struct AllStartupSummary {
+    pub started: usize,
+    pub online_count: usize,
+    pub prepared_count: usize,
+    pub trampoline_base: u64,
+    pub sipi_vector: u8,
+}
+
 #[derive(Clone, Copy)]
 pub enum SmpError {
     NoPreparedAp,
@@ -135,17 +143,67 @@ impl SmpError {
 }
 
 pub fn start_one_prepared(info: &BootInfo) -> Result<StartupSummary, SmpError> {
-    let mut target = None;
     for index in 1..percpu::cpu_count() {
         if let Some(snapshot) = percpu::snapshot(index) {
             if snapshot.state == percpu::CpuState::Prepared {
-                target = Some((index, snapshot));
-                break;
+                return start_target(info, index, snapshot);
             }
         }
     }
 
-    let (cpu_index, target) = target.ok_or(SmpError::NoPreparedAp)?;
+    Err(SmpError::NoPreparedAp)
+}
+
+pub fn start_all_prepared(info: &BootInfo) -> Result<AllStartupSummary, SmpError> {
+    let mut started = 0usize;
+
+    loop {
+        let mut target = None;
+        for index in 1..percpu::cpu_count() {
+            if let Some(snapshot) = percpu::snapshot(index) {
+                if snapshot.state == percpu::CpuState::Prepared {
+                    target = Some((index, snapshot));
+                    break;
+                }
+            }
+        }
+
+        let Some((cpu_index, snapshot)) = target else {
+            break;
+        };
+
+        let summary = start_target(info, cpu_index, snapshot)?;
+        started += 1;
+
+        kprintln!(
+            "[smp] trampoline={:#x} sipi_vector={:#x} cpu={} apic_id={} online={} prepared={}",
+            summary.trampoline_base,
+            summary.sipi_vector,
+            summary.cpu_index,
+            summary.apic_id,
+            summary.online_count,
+            summary.prepared_count
+        );
+    }
+
+    if started == 0 {
+        return Err(SmpError::NoPreparedAp);
+    }
+
+    Ok(AllStartupSummary {
+        started,
+        online_count: percpu::online_count(),
+        prepared_count: percpu::prepared_count(),
+        trampoline_base: TRAMPOLINE_BASE,
+        sipi_vector: SIPI_VECTOR,
+    })
+}
+
+fn start_target(
+    info: &BootInfo,
+    cpu_index: usize,
+    target: percpu::CpuSnapshot,
+) -> Result<StartupSummary, SmpError> {
     prepare_trampoline(info, cpu_index, target.apic_id, target.kernel_stack_end)?;
 
     apic::send_init(target.apic_id).map_err(|_| SmpError::Apic)?;
@@ -288,6 +346,11 @@ extern "sysv64" fn elyon_ap_entry(cpu_index: u64, expected_apic_id: u64) -> ! {
     );
     kprintln!(
         "ELYON_AP_STARTED cpu={} apic_id={}",
+        index,
+        observed_apic_id
+    );
+    kprintln!(
+        "ELYON_AP_READY cpu={} apic_id={}",
         index,
         observed_apic_id
     );
