@@ -290,6 +290,11 @@ pub fn init(code_selector: u16) {
         }
     }
 
+    load();
+}
+
+pub fn load() {
+    let base = addr_of_mut!(IDT) as *mut IdtEntry;
     let idtr = Idtr {
         limit: (core::mem::size_of::<[IdtEntry; IDT_LEN]>() - 1) as u16,
         base: base as u64,
