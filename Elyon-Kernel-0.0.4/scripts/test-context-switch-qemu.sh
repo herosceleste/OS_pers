@@ -54,7 +54,7 @@ grep -Fq "ELYON_SMP_STABLE" "$LOG" || {
   exit 1
 }
 
-grep -Fq "ELYON_KERNEL_READY_0_0_3" "$LOG" || {
+grep -Fq "ELYON_KERNEL_READY_0_0_4" "$LOG" || {
   echo "[FAIL] noyau non revenu au chemin nominal après context switch (qemu rc=$RC)" >&2
   exit 1
 }
