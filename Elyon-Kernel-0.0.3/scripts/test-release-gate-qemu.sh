@@ -52,7 +52,7 @@ require_regex "\[acpi\] root=(XSDT|RSDT) entries=[1-9][0-9]* validated=[1-9][0-9
 require_regex "\[acpi\] cpu_count=4 usable=4 ioapics=[1-9][0-9]* isos=[0-9]+ nmis=[0-9]+"   "K003-03: topologie MADT 4 CPU absente"
 
 require_fixed "[apic] EOI primitive=OK" "K003-04: EOI LAPIC absent"
-require_regex "\[ioapic\] legacy_routes=[1-9][0-9]* overrides_applied=[0-9]+ shadowed=[0-9]+ masked=([1-9][0-9]*)/\1 all_masked=1"   "K003-05: IOAPIC non entièrement masqué"
+require_regex "\[ioapic\] legacy_routes=[1-9][0-9]* overrides_applied=[0-9]+ shadowed=[0-9]+ id_mismatches=[0-9]+ masked=([1-9][0-9]*)/\1 all_masked=1"   "K003-05: IOAPIC non entièrement masqué"
 
 require_regex "\[percpu\] cpus=4 capacity=64 bsp_logical=0 bsp_apic_id=[0-9]+ unique=1 owned=1 tr_loaded=1"   "K003-07: état per-CPU final invalide"
 
