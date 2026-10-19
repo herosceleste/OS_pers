@@ -76,6 +76,10 @@ jobs:
         working-directory: Elyon-Kernel-0.0.4
         run: bash scripts/test-context-switch-qemu.sh
 
+      - name: K004-01 task model test
+        working-directory: Elyon-Kernel-0.0.4
+        run: bash scripts/test-task-model-qemu.sh
+
       - name: IOAPIC regression
         working-directory: Elyon-Kernel-0.0.4
         run: bash scripts/test-ioapic-qemu.sh
