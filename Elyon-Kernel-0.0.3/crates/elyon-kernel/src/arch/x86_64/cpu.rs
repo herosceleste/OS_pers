@@ -146,7 +146,6 @@ pub fn idle_forever() -> ! {
     }
 }
 
-
 pub fn read_rsp() -> u64 {
     let value: u64;
     unsafe {
