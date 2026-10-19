@@ -29,7 +29,7 @@ grep -Eq "\[ioapic\] route irq=[0-9]+ gsi=[0-9]+ vector=0x[0-9a-f]+ polarity=(hi
   exit 1
 }
 
-grep -Eq "\[ioapic\] legacy_routes=[1-9][0-9]* overrides_applied=[1-9][0-9]* shadowed=[0-9]+ masked=[1-9][0-9]*/[1-9][0-9]* all_masked=1" "$LOG" || {
+grep -Eq "\[ioapic\] legacy_routes=[1-9][0-9]* overrides_applied=[1-9][0-9]* shadowed=[0-9]+ id_mismatches=[0-9]+ masked=[1-9][0-9]*/[1-9][0-9]* all_masked=1" "$LOG" || {
   echo "[FAIL] masque global des redirections IOAPIC non prouvé" >&2
   exit 1
 }
