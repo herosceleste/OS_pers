@@ -2,7 +2,7 @@
 
 ## Statut
 
-**EN COURS — K003-01 à K003-09 sont validés.**
+**EN COURS — K003-01 à K003-10 sont validés.**
 
 Baseline de départ : fusion 0.0.2 dans `main`, commit `303feeeff93b4ed1b5b3092cc16a4d8c4489f252`.
 
@@ -27,7 +27,7 @@ Première qualification ACPI :
 | K003-07 | État per-CPU avec pile noyau, TSS et IST dédiées | **PASS** |
 | K003-08 | Au moins un AP est réellement démarré par INIT/SIPI | **PASS** |
 | K003-09 | Chaque AP atteint `ELYON_AP_READY` avec son APIC ID | **PASS** |
-| K003-10 | Le BSP reste stable après activation SMP | À faire |
+| K003-10 | Le BSP reste stable après activation SMP | **PASS** |
 | K003-11 | Base de changement de contexte noyau testée | À faire |
 | K003-12 | CI nominale et SMP sans régression des critères 0.0.2 | À faire |
 
@@ -289,6 +289,45 @@ Le même run a également confirmé les régressions K003-01 à K003-08, le time
 
 **K003-09 : PASS.**
 
+## K003-10 — Stabilité BSP et AP après activation SMP
+
+Après K003-09, les AP ne restent plus dans un arrêt définitif avec interruptions désactivées. Chaque AP entre dans un véritable état idle SMP basé sur `STI + HLT`, ce qui lui permet de dormir sans consommer de CPU tout en restant capable de répondre immédiatement à une interruption inter-processeur.
+
+Pour qualifier la stabilité, Elyon réserve le vecteur IPI `0xF1`. Le BSP exécute dix rounds successifs. À chaque round, il envoie un IPI fixe à chaque AP online, attend 20 ms via le PIT en polling, puis vérifie que :
+
+- le nombre de CPU online reste identique au nombre de CPU attendu ;
+- aucun slot ne revient à l'état `prepared` ;
+- chaque AP conserve `boot_count=1`, ce qui exclut un redémarrage ou une seconde initialisation silencieuse ;
+- chaque AP a incrémenté son compteur de heartbeat au moins jusqu'au numéro du round ;
+- aucun échec d'IPI ou d'EOI n'a été enregistré.
+
+Le handler IPI ne journalise rien dans le chemin d'interruption. Il lit l'APIC ID matériel du CPU courant, rattache l'interruption au slot per-CPU correspondant, incrémente atomiquement son heartbeat puis envoie l'EOI au Local APIC.
+
+La sortie COM1 reste protégée par le verrou SMP introduit avant K003-09. Le BSP peut donc continuer à journaliser pendant que plusieurs AP sont actifs sans entrelacement de lignes.
+
+La qualification finale a été exécutée sur le commit `43496566157cf8fd04478646e93c312096d94202`, GitHub Actions run **#174**, avec une VM QEMU à 4 vCPU.
+
+Preuves CI :
+
+```text
+ELYON_AP_IDLE cpu=1 apic_id=1
+ELYON_AP_IDLE cpu=2 apic_id=2
+ELYON_AP_IDLE cpu=3 apic_id=3
+[smp] stable cpu=1 apic_id=1 state=online heartbeat=10 boot_count=1
+[smp] stable cpu=2 apic_id=2 state=online heartbeat=10 boot_count=1
+[smp] stable cpu=3 apic_id=3 state=online heartbeat=10 boot_count=1
+[smp] stability rounds=10 online=4 prepared=0 ipi_errors=0 min_heartbeat=10 max_heartbeat=10
+ELYON_SMP_STABLE
+ELYON_KERNEL_READY_0_0_3
+[PASS] K003-10 BSP stable, 3 AP idle/réactifs, 10 heartbeats chacun, aucun redémarrage
+```
+
+La fenêtre de qualification représente dix réveils contrôlés par AP. Les trois AP ont chacun traité les dix IPI, sont revenus en idle après chaque interruption, n'ont jamais quitté l'état `online`, et n'ont jamais été réinitialisés.
+
+Le BSP reste fonctionnel après cette fenêtre et poursuit le boot jusqu'au marqueur nominal. Le même run confirme également les critères K003-01 à K003-09, l'IOAPIC, le timer LAPIC, ainsi que les tests fail-closed #UD et #DF/IST.
+
+**K003-10 : PASS.**
+
 ## Régressions 0.0.2
 
 La même CI a confirmé que l'introduction du parseur ACPI ne casse pas la baseline précédente :
@@ -319,4 +358,4 @@ La simple présence de structures ACPI, APIC, TSS ou d'un trampoline dans le cod
 
 ## Prochaine étape
 
-Le prochain critère est **K003-10 : maintenir le BSP stable après activation SMP, conserver tous les CPU online pendant une fenêtre de qualification, vérifier qu'aucun AP ne régresse ou ne redémarre et préparer un véritable état idle SMP avant la fondation du changement de contexte.**
+Le prochain critère est **K003-11 : introduire une base réelle de changement de contexte noyau avec un contexte sauvegardable, une pile de tâche distincte, une primitive de switch testée et un retour contrôlé vers l'idle, sans encore prétendre disposer d'un ordonnanceur généraliste.**
