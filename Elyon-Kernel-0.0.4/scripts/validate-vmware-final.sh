@@ -65,7 +65,7 @@ require_fixed "ELYON_IOAPIC_READY" "marqueur IOAPIC absent"
 require_regex "\[timer\] ticks=(1[0-9][0-9]|[2-9][0-9]{2,}) eoi_failures=0 periodic=1"   "timer LAPIC non confirmé"
 require_fixed "ELYON_TIMER_READY" "marqueur timer absent"
 
-require_fixed "ELYON_KERNEL_READY_0_0_3" "boot nominal final absent"
+require_fixed "ELYON_KERNEL_READY_0_0_4" "boot nominal final absent"
 
 if grep -Eq '\[KERNEL PANIC\]|\[EXCEPTION\]|\[[^]]+\] FAILED|ELYON_[A-Z_]+_FAILED' "$LOG"; then
   echo "[FAIL] anomalie inattendue détectée dans le log VMware" >&2
@@ -73,4 +73,4 @@ if grep -Eq '\[KERNEL PANIC\]|\[EXCEPTION\]|\[[^]]+\] FAILED|ELYON_[A-Z_]+_FAILE
   exit 1
 fi
 
-echo "[PASS] VMware 4 vCPU: Elyon 0.0.3 K003-01..12 validés sur build_id=$EXPECTED_BUILD_ID"
+echo "[PASS] VMware 4 vCPU: Elyon 0.0.4 K003-01..12 validés sur build_id=$EXPECTED_BUILD_ID"
