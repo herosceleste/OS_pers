@@ -220,12 +220,7 @@ pub fn wake(id: TaskId) -> Result<(), TaskError> {
     }
 
     slot.state
-        .compare_exchange(
-            current,
-            STATE_READY,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
+        .compare_exchange(current, STATE_READY, Ordering::AcqRel, Ordering::Acquire)
         .map_err(|_| TaskError::InvalidTransition)?;
     slot.current_cpu.store(NO_CPU, Ordering::Release);
     Ok(())
@@ -243,12 +238,7 @@ pub fn terminate(id: TaskId) -> Result<(), TaskError> {
     }
 
     slot.state
-        .compare_exchange(
-            current,
-            STATE_DEAD,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
+        .compare_exchange(current, STATE_DEAD, Ordering::AcqRel, Ordering::Acquire)
         .map_err(|_| TaskError::InvalidTransition)?;
     slot.current_cpu.store(NO_CPU, Ordering::Release);
     Ok(())
@@ -370,11 +360,7 @@ fn find_slot(id: TaskId) -> Option<&'static TaskSlot> {
     })
 }
 
-fn transition(
-    slot: &TaskSlot,
-    expected: TaskState,
-    next: TaskState,
-) -> Result<(), TaskError> {
+fn transition(slot: &TaskSlot, expected: TaskState, next: TaskState) -> Result<(), TaskError> {
     slot.state
         .compare_exchange(
             expected.raw(),
