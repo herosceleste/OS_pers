@@ -12,7 +12,7 @@ use core::panic::PanicInfo;
 
 use elyon_abi::{BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootInfo};
 
-use crate::arch::x86_64::{apic, cpu, gdt, idt, ioapic, paging, percpu};
+use crate::arch::x86_64::{apic, cpu, gdt, idt, ioapic, paging, percpu, smp};
 
 const BUILD_ID: &str = match option_env!("ELYON_BUILD_ID") {
     Some(value) => value,
@@ -304,6 +304,29 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
     }
 
     kprintln!("ELYON_PERCPU_READY");
+
+    if percpu_summary.cpu_count > 1 {
+        let smp_summary = match smp::start_one_prepared(info) {
+            Ok(summary) => summary,
+            Err(error) => {
+                kprintln!("[smp] FAILED reason={}", error.as_str());
+                cpu::halt_forever();
+            }
+        };
+
+        kprintln!(
+            "[smp] trampoline={:#x} sipi_vector={:#x} cpu={} apic_id={} online={} prepared={}",
+            smp_summary.trampoline_base,
+            smp_summary.sipi_vector,
+            smp_summary.cpu_index,
+            smp_summary.apic_id,
+            smp_summary.online_count,
+            smp_summary.prepared_count
+        );
+        kprintln!("ELYON_AP_BOOT_READY");
+    } else {
+        kprintln!("[smp] no AP discovered; bootstrap skipped");
+    }
 
     let ioapic = match ioapic::init(&topology, lapic.apic_id) {
         Ok(summary) => summary,
