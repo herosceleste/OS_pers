@@ -93,7 +93,9 @@ impl ContextError {
             Self::BspRspOutsideKernelStack => "saved BSP RSP outside loader-provided kernel stack",
             Self::TaskRspOutsideTaskStack => "saved task RSP outside dedicated task stack",
             Self::SwitchCountMismatch => "unexpected context switch count",
-            Self::SmpStateRegression => "SMP online/prepared state changed during context switch test",
+            Self::SmpStateRegression => {
+                "SMP online/prepared state changed during context switch test"
+            }
         }
     }
 }
@@ -111,8 +113,8 @@ pub fn qualify(
         return Err(ContextError::SmpStateRegression);
     }
 
-    let task_stack_start =
-        memory::allocate_contiguous_frames(TASK_STACK_FRAMES).ok_or(ContextError::AllocationFailed)?;
+    let task_stack_start = memory::allocate_contiguous_frames(TASK_STACK_FRAMES)
+        .ok_or(ContextError::AllocationFailed)?;
     let task_stack_end = task_stack_start + TASK_STACK_SIZE;
 
     if task_stack_end > identity_limit {
@@ -128,11 +130,7 @@ pub fn qualify(
     }
 
     unsafe {
-        write_bytes(
-            task_stack_start as *mut u8,
-            0,
-            TASK_STACK_SIZE as usize,
-        );
+        write_bytes(task_stack_start as *mut u8, 0, TASK_STACK_SIZE as usize);
     }
 
     TASK_PHASE.store(0, Ordering::Release);
