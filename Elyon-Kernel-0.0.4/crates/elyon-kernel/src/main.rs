@@ -29,7 +29,7 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
     serial::init();
     cpu::disable_interrupts();
 
-    kprintln!("ELYON KERNEL 0.0.3");
+    kprintln!("ELYON KERNEL 0.0.4");
     kprintln!("[kernel] build_id={}", BUILD_ID);
 
     if info_ptr.is_null() {
@@ -540,7 +540,7 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         cpu::read_cr4()
     );
 
-    kprintln!("ELYON_KERNEL_READY_0_0_3");
+    kprintln!("ELYON_KERNEL_READY_0_0_4");
     kprintln!(
         "elyon> loader/kernel split active; context-switch base active; scheduler not started"
     );
