@@ -85,6 +85,10 @@ jobs:
         working-directory: Elyon-Kernel-0.0.3
         run: bash scripts/test-timer-qemu.sh
 
+      - name: Final 0.0.3 qualification gate
+        working-directory: Elyon-Kernel-0.0.3
+        run: bash scripts/test-release-gate-qemu.sh
+
       - name: QEMU invalid-opcode regression test
         working-directory: Elyon-Kernel-0.0.3
         run: bash scripts/test-ud-qemu.sh
