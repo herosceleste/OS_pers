@@ -145,3 +145,16 @@ pub fn idle_forever() -> ! {
         unsafe { asm!("sti; hlt", options(nomem, nostack)) }
     }
 }
+
+
+pub fn read_rsp() -> u64 {
+    let value: u64;
+    unsafe {
+        asm!(
+            "mov {}, rsp",
+            out(reg) value,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    value
+}
