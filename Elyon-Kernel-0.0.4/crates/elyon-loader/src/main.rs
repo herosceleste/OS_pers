@@ -31,7 +31,7 @@ fn main() -> Status {
     uefi::helpers::init().expect("UEFI helper initialisation failed");
     serial::init();
 
-    lprintln!("ELYON LOADER 0.0.3");
+    lprintln!("ELYON LOADER 0.0.4");
     lprintln!("[loader] firmware=UEFI architecture=x86_64");
 
     let kernel_bytes = read_kernel();
@@ -339,7 +339,7 @@ impl ElfImage {
             return Err("no loadable ELF segments");
         }
         if max_addr > LOW_MEMORY_LIMIT {
-            return Err("kernel must reside below 4 GiB in 0.0.3");
+            return Err("kernel must reside below 4 GiB in 0.0.4");
         }
 
         let pages = ((max_addr - min_addr) / PAGE_SIZE) as usize;
