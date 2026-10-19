@@ -306,7 +306,7 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
     kprintln!("ELYON_PERCPU_READY");
 
     if percpu_summary.cpu_count > 1 {
-        let smp_summary = match smp::start_one_prepared(info) {
+        let smp_summary = match smp::start_all_prepared(info) {
             Ok(summary) => summary,
             Err(error) => {
                 kprintln!("[smp] FAILED reason={}", error.as_str());
@@ -314,16 +314,30 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
             }
         };
 
+        if smp_summary.online_count != percpu_summary.cpu_count
+            || smp_summary.prepared_count != 0
+        {
+            kprintln!(
+                "[smp] FAILED final_state started={} online={} prepared={} expected={}",
+                smp_summary.started,
+                smp_summary.online_count,
+                smp_summary.prepared_count,
+                percpu_summary.cpu_count
+            );
+            cpu::halt_forever();
+        }
+
         kprintln!(
-            "[smp] trampoline={:#x} sipi_vector={:#x} cpu={} apic_id={} online={} prepared={}",
-            smp_summary.trampoline_base,
-            smp_summary.sipi_vector,
-            smp_summary.cpu_index,
-            smp_summary.apic_id,
+            "[smp] all_ready started={} online={} prepared={} expected={} trampoline={:#x} sipi_vector={:#x}",
+            smp_summary.started,
             smp_summary.online_count,
-            smp_summary.prepared_count
+            smp_summary.prepared_count,
+            percpu_summary.cpu_count,
+            smp_summary.trampoline_base,
+            smp_summary.sipi_vector
         );
         kprintln!("ELYON_AP_BOOT_READY");
+        kprintln!("ELYON_SMP_READY");
     } else {
         kprintln!("[smp] no AP discovered; bootstrap skipped");
     }
