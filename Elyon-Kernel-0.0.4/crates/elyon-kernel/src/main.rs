@@ -7,6 +7,7 @@ mod context;
 mod framebuffer;
 mod memory;
 mod serial;
+mod task;
 mod timer;
 
 use core::panic::PanicInfo;
@@ -400,6 +401,39 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         percpu::prepared_count()
     );
     kprintln!("ELYON_CONTEXT_SWITCH_READY");
+
+    let task_model = match task::qualify_model() {
+        Ok(summary) => summary,
+        Err(error) => {
+            kprintln!("[task] FAILED reason={}", error.as_str());
+            cpu::halt_forever();
+        }
+    };
+
+    if task_model.states_seen_mask != task::required_states_mask() {
+        kprintln!(
+            "[task] FAILED states_seen={:#x} required={:#x}",
+            task_model.states_seen_mask,
+            task::required_states_mask()
+        );
+        cpu::halt_forever();
+    }
+
+    kprintln!(
+        "[task] ids={},{} unique={} capacity={} created={} transitions={} invalid_rejected={} states_seen={:#x}",
+        task_model.first_id,
+        task_model.second_id,
+        if task_model.unique_ids { 1 } else { 0 },
+        task::MAX_TASKS,
+        task_model.created_total,
+        task_model.successful_transitions,
+        task_model.invalid_transitions_rejected,
+        task_model.states_seen_mask
+    );
+    kprintln!(
+        "[task] states=READY,RUNNING,BLOCKED,SLEEPING,DEAD affinity_enforced=1"
+    );
+    kprintln!("ELYON_TASK_MODEL_READY");
 
     let ioapic = match ioapic::init(&topology, lapic.apic_id) {
         Ok(summary) => summary,
