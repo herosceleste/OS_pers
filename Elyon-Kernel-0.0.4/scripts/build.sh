@@ -36,6 +36,6 @@ mkdir -p "$ROOT/build"
   sha256sum     build/esp/EFI/BOOT/BOOTX64.EFI     build/esp/ELYON/KERNEL.ELF     > build/SHA256SUMS
 )
 
-echo "[OK] Elyon 0.0.3 build_id=$ELYON_BUILD_ID"
+echo "[OK] Elyon 0.0.4 build_id=$ELYON_BUILD_ID"
 file "$LOADER" "$KERNEL" 2>/dev/null || true
 cat "$ROOT/build/SHA256SUMS"
