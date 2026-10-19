@@ -25,6 +25,8 @@ struct CpuSlot {
     ist_start: AtomicU64,
     ist_end: AtomicU64,
     ticks: AtomicU64,
+    heartbeat: AtomicU64,
+    boot_count: AtomicU32,
 }
 
 impl CpuSlot {
@@ -40,6 +42,8 @@ impl CpuSlot {
             ist_start: AtomicU64::new(0),
             ist_end: AtomicU64::new(0),
             ticks: AtomicU64::new(0),
+            heartbeat: AtomicU64::new(0),
+            boot_count: AtomicU32::new(0),
         }
     }
 
@@ -54,6 +58,8 @@ impl CpuSlot {
         self.ist_start.store(0, Ordering::Release);
         self.ist_end.store(0, Ordering::Release);
         self.ticks.store(0, Ordering::Release);
+        self.heartbeat.store(0, Ordering::Release);
+        self.boot_count.store(0, Ordering::Release);
     }
 }
 
@@ -95,6 +101,8 @@ pub struct CpuSnapshot {
     pub ist_start: u64,
     pub ist_end: u64,
     pub ticks: u64,
+    pub heartbeat: u64,
+    pub boot_count: u32,
 }
 
 pub struct PerCpuSummary {
@@ -271,6 +279,8 @@ pub fn snapshot(index: usize) -> Option<CpuSnapshot> {
         ist_start: slot.ist_start.load(Ordering::Acquire),
         ist_end: slot.ist_end.load(Ordering::Acquire),
         ticks: slot.ticks.load(Ordering::Acquire),
+        heartbeat: slot.heartbeat.load(Ordering::Acquire),
+        boot_count: slot.boot_count.load(Ordering::Acquire),
     })
 }
 
@@ -320,6 +330,8 @@ fn configure_slot(
     slot.ist_start.store(ist_span.0, Ordering::Release);
     slot.ist_end.store(ist_span.1, Ordering::Release);
     slot.ticks.store(0, Ordering::Release);
+    slot.heartbeat.store(0, Ordering::Release);
+    slot.boot_count.store(0, Ordering::Release);
 }
 
 fn validate_unique_apic_ids(topology: &AcpiTopology) -> Result<(), PerCpuError> {
@@ -466,6 +478,7 @@ pub fn mark_online(index: usize, observed_apic_id: u32) -> Result<(), OnlineErro
         return Err(OnlineError::ApicIdMismatch);
     }
 
+    slot.boot_count.fetch_add(1, Ordering::AcqRel);
     slot.state.store(STATE_ONLINE, Ordering::Release);
     Ok(())
 }
@@ -482,4 +495,19 @@ pub fn prepared_count() -> usize {
     (0..cpu_count())
         .filter(|index| CPU_SLOTS[*index].state.load(Ordering::Acquire) == STATE_PREPARED)
         .count()
+}
+
+
+pub fn record_heartbeat_by_apic_id(apic_id: u32) -> bool {
+    for index in 1..cpu_count() {
+        let slot = &CPU_SLOTS[index];
+        if slot.state.load(Ordering::Acquire) == STATE_ONLINE
+            && slot.apic_id.load(Ordering::Acquire) == apic_id
+        {
+            slot.heartbeat.fetch_add(1, Ordering::AcqRel);
+            return true;
+        }
+    }
+
+    false
 }
