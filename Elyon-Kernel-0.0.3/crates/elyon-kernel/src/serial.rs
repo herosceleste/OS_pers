@@ -1,7 +1,12 @@
+use core::arch::asm;
 use core::fmt::{self, Write};
 use core::hint::spin_loop;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 const COM1: u16 = 0x3F8;
+const RFLAGS_IF: u64 = 1 << 9;
+
+static SERIAL_LOCK: AtomicBool = AtomicBool::new(false);
 
 pub fn init() {
     unsafe {
@@ -39,7 +44,35 @@ impl Write for SerialPort {
 }
 
 pub fn print(args: fmt::Arguments<'_>) {
+    let rflags = read_rflags();
+    unsafe { asm!("cli", options(nomem, nostack)) };
+
+    while SERIAL_LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        spin_loop();
+    }
+
     let _ = SerialPort.write_fmt(args);
+    SERIAL_LOCK.store(false, Ordering::Release);
+
+    if rflags & RFLAGS_IF != 0 {
+        unsafe { asm!("sti", options(nomem, nostack)) };
+    }
+}
+
+fn read_rflags() -> u64 {
+    let flags: u64;
+    unsafe {
+        asm!(
+            "pushfq",
+            "pop {}",
+            out(reg) flags,
+            options(nomem, preserves_flags)
+        );
+    }
+    flags
 }
 
 fn transmit_empty() -> bool {
