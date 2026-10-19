@@ -443,10 +443,10 @@ extern "sysv64" fn elyon_ap_entry(cpu_index: u64, expected_apic_id: u64) -> ! {
         observed_apic_id
     );
     kprintln!("ELYON_AP_READY cpu={} apic_id={}", index, observed_apic_id);
+    kprintln!("ELYON_AP_IDLE cpu={} apic_id={}", index, observed_apic_id);
 
-    cpu::halt_forever()
+    cpu::idle_forever()
 }
-
 
 #[unsafe(no_mangle)]
 extern "C" fn elyon_smp_stability_ipi_dispatch() {
