@@ -139,3 +139,11 @@ pub fn read_tr() -> u16 {
     }
     selector
 }
+
+
+pub fn idle_forever() -> ! {
+    enable_interrupts();
+    loop {
+        halt_once();
+    }
+}
