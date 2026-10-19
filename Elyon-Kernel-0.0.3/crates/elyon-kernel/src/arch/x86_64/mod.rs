@@ -7,3 +7,4 @@ pub mod idt;
 pub mod ioapic;
 pub mod paging;
 pub mod percpu;
+pub mod smp;
