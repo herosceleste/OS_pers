@@ -83,3 +83,12 @@ ELYON_KERNEL_READY_0_0_3
 ```
 
 Aucune fonctionnalité de scheduler généraliste, de préemption de tâches, de sauvegarde FPU/SIMD complète ou de politique d'ordonnancement n'est revendiquée dans Elyon 0.0.3.
+
+
+## Correctif de portabilité IOAPIC après premier boot VMware
+
+Le premier boot croisé VMware 4 vCPU a validé le chemin SMP jusqu'à `ELYON_CONTEXT_SWITCH_READY`, puis a révélé une divergence entre l'ID IOAPIC fourni par MADT et celui lu dans le registre matériel. L'ancienne implémentation arrêtait le noyau sur cette seule divergence.
+
+La politique a été corrigée : l'écart d'ID est désormais journalisé et compté comme diagnostic. Elyon continue de rester fail-closed sur les invariants fonctionnels : adresse MMIO invalide ou dupliquée, ID MADT dupliqué, plages GSI chevauchantes, nombre de redirections invalide, route hors IOAPIC ou read-back incohérent.
+
+La CI GitHub Actions **#209** valide cette correction sous QEMU, où l'ID MADT et l'ID matériel restent identiques. Une nouvelle ISO VMware doit être construite depuis la branche courante et la validation croisée 4 vCPU doit être rejouée avant toute sortie de Draft ou fusion.
