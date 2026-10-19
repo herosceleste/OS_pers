@@ -1,17 +1,16 @@
-name: Elyon Kernel 0.0.3 CI
+name: Elyon Kernel 0.0.4 CI
 
 on:
   push:
     branches:
-      - elyon-0.0.3
-      - main
+      - elyon-0.0.4
     paths:
-      - "Elyon-Kernel-0.0.3/**"
-      - ".github/workflows/elyon-0.0.3.yml"
+      - "Elyon-Kernel-0.0.4/**"
+      - ".github/workflows/elyon-0.0.4.yml"
   pull_request:
     paths:
-      - "Elyon-Kernel-0.0.3/**"
-      - ".github/workflows/elyon-0.0.3.yml"
+      - "Elyon-Kernel-0.0.4/**"
+      - ".github/workflows/elyon-0.0.4.yml"
 
 permissions:
   contents: read
@@ -19,7 +18,7 @@ permissions:
 jobs:
   build-and-boot:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -38,61 +37,61 @@ jobs:
           rustc +1.99.1 --version
 
       - name: Format check
-        working-directory: Elyon-Kernel-0.0.3
+        working-directory: Elyon-Kernel-0.0.4
         run: cargo +1.99.1 fmt --all -- --check
 
       - name: Build loader and kernel
-        working-directory: Elyon-Kernel-0.0.3
+        working-directory: Elyon-Kernel-0.0.4
         run: bash scripts/build.sh
 
       - name: QEMU OVMF smoke test
-        working-directory: Elyon-Kernel-0.0.3
+        working-directory: Elyon-Kernel-0.0.4
         run: bash scripts/smoke-test.sh
 
-      - name: ACPI RSDP XSDT MADT test
-        working-directory: Elyon-Kernel-0.0.3
+      - name: ACPI regression
+        working-directory: Elyon-Kernel-0.0.4
         run: bash scripts/test-acpi-qemu.sh
 
-      - name: Local APIC BSP test
-        working-directory: Elyon-Kernel-0.0.3
+      - name: Local APIC regression
+        working-directory: Elyon-Kernel-0.0.4
         run: bash scripts/test-lapic-qemu.sh
 
-      - name: Per-CPU state test
-        working-directory: Elyon-Kernel-0.0.3
+      - name: Per-CPU regression
+        working-directory: Elyon-Kernel-0.0.4
         run: bash scripts/test-percpu-qemu.sh
 
-      - name: Real INIT-SIPI AP startup test
-        working-directory: Elyon-Kernel-0.0.3
+      - name: INIT-SIPI one-AP regression
+        working-directory: Elyon-Kernel-0.0.4
         run: bash scripts/test-smp-one-ap-qemu.sh
 
-      - name: All APs SMP startup test
-        working-directory: Elyon-Kernel-0.0.3
+      - name: All-AP SMP regression
+        working-directory: Elyon-Kernel-0.0.4
         run: bash scripts/test-smp-all-aps-qemu.sh
 
-      - name: SMP post-start stability test
-        working-directory: Elyon-Kernel-0.0.3
+      - name: SMP stability regression
+        working-directory: Elyon-Kernel-0.0.4
         run: bash scripts/test-smp-stability-qemu.sh
 
-      - name: Kernel context-switch test
-        working-directory: Elyon-Kernel-0.0.3
+      - name: Context-switch regression
+        working-directory: Elyon-Kernel-0.0.4
         run: bash scripts/test-context-switch-qemu.sh
 
-      - name: IOAPIC routing test
-        working-directory: Elyon-Kernel-0.0.3
+      - name: IOAPIC regression
+        working-directory: Elyon-Kernel-0.0.4
         run: bash scripts/test-ioapic-qemu.sh
 
-      - name: Local APIC timer test
-        working-directory: Elyon-Kernel-0.0.3
+      - name: Local APIC timer regression
+        working-directory: Elyon-Kernel-0.0.4
         run: bash scripts/test-timer-qemu.sh
 
-      - name: Final 0.0.3 qualification gate
-        working-directory: Elyon-Kernel-0.0.3
+      - name: K003 baseline regression gate
+        working-directory: Elyon-Kernel-0.0.4
         run: bash scripts/test-release-gate-qemu.sh
 
-      - name: QEMU invalid-opcode regression test
-        working-directory: Elyon-Kernel-0.0.3
+      - name: Invalid-opcode fail-closed regression
+        working-directory: Elyon-Kernel-0.0.4
         run: bash scripts/test-ud-qemu.sh
 
-      - name: QEMU double-fault IST regression test
-        working-directory: Elyon-Kernel-0.0.3
+      - name: Double-fault IST regression
+        working-directory: Elyon-Kernel-0.0.4
         run: bash scripts/test-df-qemu.sh
