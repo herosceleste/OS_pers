@@ -47,7 +47,7 @@ if grep -Eq "\[smp\] (AP FAILED|STABILITY FAILED)" "$LOG"; then
   exit 1
 fi
 
-grep -Fq "ELYON_KERNEL_READY_0_0_3" "$LOG" || {
+grep -Fq "ELYON_KERNEL_READY_0_0_4" "$LOG" || {
   echo "[FAIL] BSP instable après la fenêtre SMP (qemu rc=$RC)" >&2
   exit 1
 }
