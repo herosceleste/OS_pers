@@ -2,7 +2,7 @@
 
 ## Statut
 
-**EN COURS — K003-01 à K003-10 sont validés.**
+**EN COURS — K003-01 à K003-11 sont validés.**
 
 Baseline de départ : fusion 0.0.2 dans `main`, commit `303feeeff93b4ed1b5b3092cc16a4d8c4489f252`.
 
@@ -28,7 +28,7 @@ Première qualification ACPI :
 | K003-08 | Au moins un AP est réellement démarré par INIT/SIPI | **PASS** |
 | K003-09 | Chaque AP atteint `ELYON_AP_READY` avec son APIC ID | **PASS** |
 | K003-10 | Le BSP reste stable après activation SMP | **PASS** |
-| K003-11 | Base de changement de contexte noyau testée | À faire |
+| K003-11 | Base de changement de contexte noyau testée | **PASS** |
 | K003-12 | CI nominale et SMP sans régression des critères 0.0.2 | À faire |
 
 ## K003-01 — RSDP
@@ -328,6 +328,45 @@ Le BSP reste fonctionnel après cette fenêtre et poursuit le boot jusqu'au marq
 
 **K003-10 : PASS.**
 
+## K003-11 — Base de changement de contexte noyau
+
+Elyon dispose désormais d'une primitive réelle de changement de contexte coopératif en mode noyau. Cette étape ne constitue pas encore un ordonnanceur généraliste : elle fournit la fondation technique permettant de sauvegarder un contexte d'exécution, basculer sur une pile de tâche indépendante, reprendre cette tâche exactement après son point de cession puis revenir au contexte du BSP.
+
+La primitive assembleur sauvegarde `RFLAGS` ainsi que les registres callee-saved de l'ABI x86-64 (`RBX`, `RBP`, `R12` à `R15`), enregistre le `RSP` courant, charge le `RSP` du contexte cible, restaure son état puis reprend l'exécution par `ret`.
+
+La tâche de qualification utilise une pile dédiée de 64 KiB allouée par le PMM. Son contexte initial est construit explicitement au sommet de cette pile avec un frame compatible avec la primitive de restauration. La pile est vérifiée sous la limite d'identity mapping et sans chevauchement avec la pile noyau du BSP.
+
+Le scénario de qualification impose deux allers-retours complets :
+
+```text
+BSP -> tâche phase 1 -> BSP -> tâche phase 2 -> BSP
+```
+
+Le second passage est essentiel : il démontre que la tâche n'est pas seulement entrée une première fois sur une nouvelle pile. Elle reprend précisément après son premier appel de cession, à partir du `RSP` sauvegardé lors du premier retour vers le BSP.
+
+La qualification finale a été exécutée sur le commit `189085d79f86cc101ade4d0c40a31a9f1fdef8ed`, GitHub Actions run **#191**, avec une VM QEMU à 4 vCPU.
+
+Preuves CI :
+
+```text
+[context] task phase=1 switches=1 rsp=0x000000000014dfb0
+[context] task phase=2 switches=3 rsp=0x000000000014dfb0
+[context] task_stack=0x000000000013e000..0x000000000014e000 size=64 KiB source=PMM
+[context] saved bsp_rsp=0x000000003e29dbb0 task_rsp_first=0x000000000014df70 task_rsp_final=0x000000000014df70
+[context] result phases=2 switches=4 online_before=4 online_after=4 prepared=0
+ELYON_CONTEXT_SWITCH_READY
+ELYON_KERNEL_READY_0_0_3
+[PASS] K003-11 contexte BSP sauvegardé, tâche sur pile dédiée reprise deux fois, 4 switches et retour nominal
+```
+
+Le `RSP` sauvegardé du BSP est contrôlé comme appartenant à la pile noyau fournie par le loader. Les `RSP` sauvegardés de la tâche sont contrôlés comme appartenant à sa pile PMM dédiée. La stabilité SMP est également préservée : quatre CPU sont online avant et après la qualification, et aucun slot ne revient à `prepared`.
+
+Le même run a confirmé les critères K003-01 à K003-10, l'IOAPIC, le timer LAPIC, ainsi que les tests fail-closed #UD et #DF/IST.
+
+Ce jalon sauvegarde l'état entier nécessaire au changement coopératif de tâches noyau pour le chemin testé. La sauvegarde FPU/SIMD étendue, la préemption par timer, les priorités et les politiques d'ordonnancement restent explicitement hors du périmètre K003-11.
+
+**K003-11 : PASS.**
+
 ## Régressions 0.0.2
 
 La même CI a confirmé que l'introduction du parseur ACPI ne casse pas la baseline précédente :
@@ -358,4 +397,4 @@ La simple présence de structures ACPI, APIC, TSS ou d'un trampoline dans le cod
 
 ## Prochaine étape
 
-Le prochain critère est **K003-11 : introduire une base réelle de changement de contexte noyau avec un contexte sauvegardable, une pile de tâche distincte, une primitive de switch testée et un retour contrôlé vers l'idle, sans encore prétendre disposer d'un ordonnanceur généraliste.**
+Le prochain et dernier critère du jalon est **K003-12 : exécuter la qualification finale 0.0.3, vérifier l'ensemble des critères K003-01 à K003-11 et les régressions 0.0.2, puis figer les preuves avant de proposer la fusion de la PR #2.**
