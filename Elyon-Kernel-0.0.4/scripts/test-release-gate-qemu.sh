@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LOG="$ROOT/build/qemu-release-0.0.3.log"
-EVIDENCE="$ROOT/build/qualification-0.0.3.txt"
+LOG="$ROOT/build/qemu-release-0.0.4.log"
+EVIDENCE="$ROOT/build/qualification-0.0.4.txt"
 QEMU_TIMEOUT="${ELYON_QEMU_TIMEOUT:-40}"
 
 bash "$ROOT/scripts/build.sh"
@@ -45,7 +45,7 @@ require_fixed "ELYON_SMP_STABLE" "K003-10: SMP stable absent"
 require_fixed "ELYON_CONTEXT_SWITCH_READY" "K003-11: context switch ready absent"
 require_fixed "ELYON_IOAPIC_READY" "K003-05: IOAPIC ready absent"
 require_fixed "ELYON_TIMER_READY" "K003-06: timer ready absent"
-require_fixed "ELYON_KERNEL_READY_0_0_3" "boot nominal final absent"
+require_fixed "ELYON_KERNEL_READY_0_0_4" "boot nominal final absent"
 
 require_regex "\[acpi\] RSDP=OK revision=[0-9]+ root=(XSDT|RSDT) address=0x[0-9a-f]+"   "K003-01: RSDP validé absent"
 require_regex "\[acpi\] root=(XSDT|RSDT) entries=[1-9][0-9]* validated=[1-9][0-9]*"   "K003-02: racine ACPI validée absente"
@@ -82,7 +82,7 @@ if grep -Eq '\[KERNEL PANIC\]|\[EXCEPTION\]|\[[^]]+\] FAILED|ELYON_[A-Z_]+_FAILE
 fi
 
 {
-  echo "ELYON KERNEL 0.0.3 - QUALIFICATION FINALE"
+  echo "ELYON KERNEL 0.0.4 - K003 REGRESSION BASELINE"
   echo "build_id=$BUILD_ID"
   echo "rust=$RUST_VERSION"
   echo "qemu_cpus=4"
@@ -92,7 +92,7 @@ fi
   cat "$ROOT/build/SHA256SUMS"
   echo
   echo "Markers:"
-  grep -E '^ELYON_(ACPI_READY|LAPIC_READY|PERCPU_READY|AP_READY|AP_BOOT_READY|SMP_READY|SMP_STABLE|CONTEXT_SWITCH_READY|IOAPIC_READY|TIMER_READY|KERNEL_READY_0_0_3)' "$LOG" || true
+  grep -E '^ELYON_(ACPI_READY|LAPIC_READY|PERCPU_READY|AP_READY|AP_BOOT_READY|SMP_READY|SMP_STABLE|CONTEXT_SWITCH_READY|IOAPIC_READY|TIMER_READY|KERNEL_READY_0_0_4)' "$LOG" || true
   echo
   echo "Final summaries:"
   grep -E '^\[smp\] all_ready|^\[smp\] stability|^\[context\] result|^\[ioapic\] legacy_routes=|^\[timer\] ticks=' "$LOG" || true
@@ -100,4 +100,4 @@ fi
 
 cat "$EVIDENCE"
 
-echo "[PASS] K003-12 qualification finale 0.0.3: K003-01..11 cohérents sur 4 vCPU, boot nominal sans anomalie"
+echo "[PASS] Elyon 0.0.4 baseline: régressions K003-01..12 cohérentes sur 4 vCPU, boot nominal sans anomalie"
