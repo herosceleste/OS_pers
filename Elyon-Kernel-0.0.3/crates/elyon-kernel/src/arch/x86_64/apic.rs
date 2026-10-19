@@ -417,7 +417,6 @@ fn wait_icr_idle() -> Result<(), ApicError> {
     }
 }
 
-
 pub fn current_id() -> Result<u32, ApicError> {
     match ACTIVE_MODE.load(Ordering::Acquire) {
         MODE_XAPIC => {
