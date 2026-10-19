@@ -2,7 +2,7 @@
 
 ## Statut
 
-**EN COURS — K003-01 à K003-07 sont validés.**
+**EN COURS — K003-01 à K003-08 sont validés.**
 
 Baseline de départ : fusion 0.0.2 dans `main`, commit `303feeeff93b4ed1b5b3092cc16a4d8c4489f252`.
 
@@ -25,7 +25,7 @@ Première qualification ACPI :
 | K003-05 | IOAPIC découvert et redirections initiales maîtrisées | **PASS** |
 | K003-06 | Timer noyau produit des interruptions répétables | **PASS** |
 | K003-07 | État per-CPU avec pile noyau, TSS et IST dédiées | **PASS** |
-| K003-08 | Au moins un AP est réellement démarré par INIT/SIPI | À faire |
+| K003-08 | Au moins un AP est réellement démarré par INIT/SIPI | **PASS** |
 | K003-09 | Chaque AP atteint `ELYON_AP_READY` avec son APIC ID | À faire |
 | K003-10 | Le BSP reste stable après activation SMP | À faire |
 | K003-11 | Base de changement de contexte noyau testée | À faire |
@@ -222,6 +222,45 @@ Les tests vérifient également que les quatre piles noyau, GDT, TSS et IST sont
 
 **K003-07 : PASS.**
 
+## K003-08 — Démarrage réel d’un AP par INIT/SIPI
+
+Elyon peut désormais démarrer réellement un Application Processor x86 par la séquence architecturale `INIT + SIPI`.
+
+Le BSP copie un trampoline minimal dans une page basse fixe à `0x8000`. Cette page est d'abord vérifiée comme mémoire UEFI utilisable avant toute écriture. Le trampoline :
+
+- démarre dans le mode réel imposé par SIPI ;
+- charge une GDT temporaire basse ;
+- entre en mode protégé 32 bits ;
+- active PAE ;
+- charge le CR3 d'Elyon ;
+- active `EFER.LME` puis la pagination ;
+- effectue le saut vers le code 64 bits ;
+- charge la pile noyau du slot per-CPU cible ;
+- appelle le point d'entrée Rust de l'AP.
+
+Le BSP envoie un INIT, attend 10 ms via le canal 2 du PIT en polling, envoie un premier SIPI puis un second si nécessaire. Le vecteur SIPI utilisé est `0x08`, correspondant à la page physique `0x8000`.
+
+Une fois en Rust, l'AP charge sa propre GDT, sa propre TSS et donc sa propre IST double fault, recharge l'IDT commune, réactive son Local APIC, lit son APIC ID matériel et vérifie qu'il correspond au slot préparé. Le slot ne passe de `prepared` à `online` qu'après ces vérifications.
+
+La qualification finale a été exécutée sur le commit `27bc6746c9b16efaf588d0d634edb6065b68bf2a`, GitHub Actions run **#132**, avec une VM QEMU à 2 vCPU pour isoler la preuve K003-08.
+
+Preuves CI :
+
+```text
+[smp] AP online cpu=1 apic_id=1 selector=0x8 tr=0x18
+ELYON_AP_STARTED cpu=1 apic_id=1
+[smp] trampoline=0x8000 sipi_vector=0x8 cpu=1 apic_id=1 online=2 prepared=0
+ELYON_AP_BOOT_READY
+ELYON_KERNEL_READY_0_0_3
+[PASS] K003-08 un AP a réellement démarré par INIT/SIPI et atteint Elyon en mode long
+```
+
+Le sélecteur de code de l'AP est `0x08` et son registre `TR` vaut `0x18`, ce qui confirme que la GDT/TSS per-CPU a été chargée avant le passage du slot à `online`.
+
+Le même run a également validé la configuration 4 vCPU utilisée par K003-07. Dans ce scénario, Elyon démarre volontairement un seul AP à ce stade ; les autres restent `prepared`. Leur démarrage généralisé appartient à K003-09.
+
+**K003-08 : PASS.**
+
 ## Régressions 0.0.2
 
 La même CI a confirmé que l'introduction du parseur ACPI ne casse pas la baseline précédente :
@@ -252,4 +291,4 @@ La simple présence de structures ACPI, APIC, TSS ou d'un trampoline dans le cod
 
 ## Prochaine étape
 
-Le prochain critère est **K003-08 : réserver une zone trampoline sous 1 MiB, préparer le bootstrap AP et envoyer une séquence INIT/SIPI afin de faire démarrer réellement au moins un Application Processor.**
+Le prochain critère est **K003-09 : généraliser la séquence INIT/SIPI à tous les AP utilisables découverts par MADT et exiger que chacun atteigne `ELYON_AP_READY cpu=<n> apic_id=<id>`, avec un état per-CPU réellement `online`.**
