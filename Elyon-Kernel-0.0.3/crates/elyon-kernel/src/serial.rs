@@ -69,7 +69,7 @@ fn read_rflags() -> u64 {
             "pushfq",
             "pop {}",
             out(reg) flags,
-            options(nomem, preserves_flags)
+            options(preserves_flags)
         );
     }
     flags
