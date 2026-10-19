@@ -324,7 +324,6 @@ pub fn timer_stop() -> bool {
     }
 }
 
-
 pub fn init_secondary() -> Result<u32, ApicError> {
     let caps = cpu::apic_capabilities();
     if !caps.apic {
@@ -351,15 +350,13 @@ pub fn init_secondary() -> Result<u32, ApicError> {
             write_xapic(base, XAPIC_SVR, svr);
             Ok(read_xapic(base, XAPIC_ID) >> 24)
         }
-        MODE_X2APIC => {
-            unsafe {
-                cpu::write_msr(X2APIC_TPR, 0);
-                let current_svr = cpu::read_msr(X2APIC_SVR) as u32;
-                let svr = (current_svr & !0xFF) | SPURIOUS_VECTOR as u32 | (1 << 8);
-                cpu::write_msr(X2APIC_SVR, svr as u64);
-                Ok(cpu::read_msr(X2APIC_ID) as u32)
-            }
-        }
+        MODE_X2APIC => unsafe {
+            cpu::write_msr(X2APIC_TPR, 0);
+            let current_svr = cpu::read_msr(X2APIC_SVR) as u32;
+            let svr = (current_svr & !0xFF) | SPURIOUS_VECTOR as u32 | (1 << 8);
+            cpu::write_msr(X2APIC_SVR, svr as u64);
+            Ok(cpu::read_msr(X2APIC_ID) as u32)
+        },
         _ => Err(ApicError::ControllerNotInitialized),
     }
 }
