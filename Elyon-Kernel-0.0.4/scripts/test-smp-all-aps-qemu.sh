@@ -59,7 +59,7 @@ if grep -Fq "[smp] AP FAILED" "$LOG"; then
   exit 1
 fi
 
-grep -Fq "ELYON_KERNEL_READY_0_0_3" "$LOG" || {
+grep -Fq "ELYON_KERNEL_READY_0_0_4" "$LOG" || {
   echo "[FAIL] BSP instable après mise online de tous les AP (qemu rc=$RC)" >&2
   exit 1
 }
