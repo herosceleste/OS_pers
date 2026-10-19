@@ -533,7 +533,9 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
     );
 
     kprintln!("ELYON_KERNEL_READY_0_0_3");
-    kprintln!("elyon> loader/kernel split active; context-switch base active; scheduler not started");
+    kprintln!(
+        "elyon> loader/kernel split active; context-switch base active; scheduler not started"
+    );
     cpu::halt_forever()
 }
 
