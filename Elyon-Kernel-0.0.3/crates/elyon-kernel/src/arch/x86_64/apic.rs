@@ -15,6 +15,8 @@ const XAPIC_VERSION: u64 = 0x030;
 const XAPIC_TPR: u64 = 0x080;
 const XAPIC_EOI: u64 = 0x0B0;
 const XAPIC_SVR: u64 = 0x0F0;
+const XAPIC_ICR_LOW: u64 = 0x300;
+const XAPIC_ICR_HIGH: u64 = 0x310;
 const XAPIC_LVT_TIMER: u64 = 0x320;
 const XAPIC_TIMER_INITIAL: u64 = 0x380;
 const XAPIC_TIMER_CURRENT: u64 = 0x390;
@@ -25,6 +27,7 @@ const X2APIC_VERSION: u32 = 0x803;
 const X2APIC_TPR: u32 = 0x808;
 const X2APIC_EOI: u32 = 0x80B;
 const X2APIC_SVR: u32 = 0x80F;
+const X2APIC_ICR: u32 = 0x830;
 const X2APIC_LVT_TIMER: u32 = 0x832;
 const X2APIC_TIMER_INITIAL: u32 = 0x838;
 const X2APIC_TIMER_CURRENT: u32 = 0x839;
@@ -32,6 +35,13 @@ const X2APIC_TIMER_DIVIDE: u32 = 0x83E;
 
 const LVT_MASKED: u32 = 1 << 16;
 const LVT_TIMER_PERIODIC: u32 = 1 << 17;
+
+const ICR_DELIVERY_STATUS: u32 = 1 << 12;
+const ICR_LEVEL_ASSERT: u32 = 1 << 14;
+const ICR_TRIGGER_LEVEL: u32 = 1 << 15;
+const ICR_DELIVERY_INIT: u32 = 0b101 << 8;
+const ICR_DELIVERY_STARTUP: u32 = 0b110 << 8;
+const ICR_WAIT_SPINS: usize = 10_000_000;
 
 pub const SPURIOUS_VECTOR: u8 = 0xFF;
 
@@ -83,6 +93,8 @@ pub enum ApicError {
     BaseMismatch,
     MmioOutsideIdentityMap,
     BspNotInMadt,
+    ControllerNotInitialized,
+    IcrBusyTimeout,
 }
 
 impl ApicError {
@@ -94,6 +106,8 @@ impl ApicError {
             Self::BaseMismatch => "IA32_APIC_BASE does not match MADT Local APIC address",
             Self::MmioOutsideIdentityMap => "Local APIC MMIO outside current identity map",
             Self::BspNotInMadt => "current BSP APIC ID absent from usable MADT CPUs",
+            Self::ControllerNotInitialized => "Local APIC controller not initialized",
+            Self::IcrBusyTimeout => "Local APIC ICR delivery-status timeout",
         }
     }
 }
@@ -307,5 +321,101 @@ pub fn timer_stop() -> bool {
             true
         }
         _ => false,
+    }
+}
+
+
+pub fn init_secondary() -> Result<u32, ApicError> {
+    let caps = cpu::apic_capabilities();
+    if !caps.apic {
+        return Err(ApicError::ApicUnsupported);
+    }
+
+    let mode = ACTIVE_MODE.load(Ordering::Acquire);
+    let base = ACTIVE_BASE.load(Ordering::Acquire);
+    if mode == MODE_NONE || base == 0 {
+        return Err(ApicError::ControllerNotInitialized);
+    }
+
+    let mut apic_base = unsafe { cpu::read_msr(IA32_APIC_BASE) };
+    if apic_base & APIC_BASE_ENABLE == 0 {
+        apic_base |= APIC_BASE_ENABLE;
+        unsafe { cpu::write_msr(IA32_APIC_BASE, apic_base) };
+    }
+
+    match mode {
+        MODE_XAPIC => {
+            write_xapic(base, XAPIC_TPR, 0);
+            let current_svr = read_xapic(base, XAPIC_SVR);
+            let svr = (current_svr & !0xFF) | SPURIOUS_VECTOR as u32 | (1 << 8);
+            write_xapic(base, XAPIC_SVR, svr);
+            Ok(read_xapic(base, XAPIC_ID) >> 24)
+        }
+        MODE_X2APIC => {
+            unsafe {
+                cpu::write_msr(X2APIC_TPR, 0);
+                let current_svr = cpu::read_msr(X2APIC_SVR) as u32;
+                let svr = (current_svr & !0xFF) | SPURIOUS_VECTOR as u32 | (1 << 8);
+                cpu::write_msr(X2APIC_SVR, svr as u64);
+                Ok(cpu::read_msr(X2APIC_ID) as u32)
+            }
+        }
+        _ => Err(ApicError::ControllerNotInitialized),
+    }
+}
+
+pub fn send_init(apic_id: u32) -> Result<(), ApicError> {
+    send_icr(
+        apic_id,
+        ICR_DELIVERY_INIT | ICR_LEVEL_ASSERT | ICR_TRIGGER_LEVEL,
+    )
+}
+
+pub fn send_startup(apic_id: u32, vector: u8) -> Result<(), ApicError> {
+    send_icr(apic_id, ICR_DELIVERY_STARTUP | vector as u32)
+}
+
+fn send_icr(apic_id: u32, low: u32) -> Result<(), ApicError> {
+    wait_icr_idle()?;
+
+    match ACTIVE_MODE.load(Ordering::Acquire) {
+        MODE_XAPIC => {
+            if apic_id > u8::MAX as u32 {
+                return Err(ApicError::ControllerNotInitialized);
+            }
+            let base = ACTIVE_BASE.load(Ordering::Acquire);
+            if base == 0 {
+                return Err(ApicError::ControllerNotInitialized);
+            }
+            write_xapic(base, XAPIC_ICR_HIGH, apic_id << 24);
+            write_xapic(base, XAPIC_ICR_LOW, low);
+        }
+        MODE_X2APIC => unsafe {
+            cpu::write_msr(X2APIC_ICR, ((apic_id as u64) << 32) | low as u64);
+        },
+        _ => return Err(ApicError::ControllerNotInitialized),
+    }
+
+    wait_icr_idle()
+}
+
+fn wait_icr_idle() -> Result<(), ApicError> {
+    match ACTIVE_MODE.load(Ordering::Acquire) {
+        MODE_XAPIC => {
+            let base = ACTIVE_BASE.load(Ordering::Acquire);
+            if base == 0 {
+                return Err(ApicError::ControllerNotInitialized);
+            }
+
+            for _ in 0..ICR_WAIT_SPINS {
+                if read_xapic(base, XAPIC_ICR_LOW) & ICR_DELIVERY_STATUS == 0 {
+                    return Ok(());
+                }
+                core::hint::spin_loop();
+            }
+            Err(ApicError::IcrBusyTimeout)
+        }
+        MODE_X2APIC => Ok(()),
+        _ => Err(ApicError::ControllerNotInitialized),
     }
 }
