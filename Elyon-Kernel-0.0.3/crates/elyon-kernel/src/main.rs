@@ -314,9 +314,7 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
             }
         };
 
-        if smp_summary.online_count != percpu_summary.cpu_count
-            || smp_summary.prepared_count != 0
-        {
+        if smp_summary.online_count != percpu_summary.cpu_count || smp_summary.prepared_count != 0 {
             kprintln!(
                 "[smp] FAILED final_state started={} online={} prepared={} expected={}",
                 smp_summary.started,
