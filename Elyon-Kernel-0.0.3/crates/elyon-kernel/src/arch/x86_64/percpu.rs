@@ -500,7 +500,6 @@ pub fn prepared_count() -> usize {
         .count()
 }
 
-
 pub fn record_heartbeat_by_apic_id(apic_id: u32) -> bool {
     for index in 1..cpu_count() {
         let slot = &CPU_SLOTS[index];
