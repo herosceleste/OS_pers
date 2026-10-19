@@ -34,7 +34,7 @@ grep -Fq "ELYON_TIMER_READY" "$LOG" || {
   exit 1
 }
 
-grep -Fq "ELYON_KERNEL_READY_0_0_3" "$LOG" || {
+grep -Fq "ELYON_KERNEL_READY_0_0_4" "$LOG" || {
   echo "[FAIL] régression du boot nominal après timer (qemu rc=$RC)" >&2
   exit 1
 }
