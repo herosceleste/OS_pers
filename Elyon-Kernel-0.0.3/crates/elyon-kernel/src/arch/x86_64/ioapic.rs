@@ -94,6 +94,7 @@ pub struct IoApicSummary {
     pub masked_entries: u32,
     pub overrides_applied: usize,
     pub shadowed_legacy_irqs: usize,
+    pub id_mismatches: usize,
 }
 
 impl IoApicSummary {
@@ -107,6 +108,7 @@ impl IoApicSummary {
             masked_entries: 0,
             overrides_applied: 0,
             shadowed_legacy_irqs: 0,
+            id_mismatches: 0,
         }
     }
 
@@ -159,7 +161,8 @@ pub enum IoApicError {
     RedirectionCountInvalid,
     GsiRangeOverflow,
     GsiRangeOverlap,
-    HardwareIdMismatch,
+    DuplicateMadtId,
+    DuplicateControllerAddress,
     DestinationApicIdTooLarge,
     UnsupportedOverrideBus,
     InvalidOverrideFlags,
@@ -180,7 +183,8 @@ impl IoApicError {
             Self::RedirectionCountInvalid => "invalid IOAPIC redirection entry count",
             Self::GsiRangeOverflow => "IOAPIC GSI range overflow",
             Self::GsiRangeOverlap => "overlapping IOAPIC GSI ranges",
-            Self::HardwareIdMismatch => "MADT IOAPIC ID does not match hardware ID",
+            Self::DuplicateMadtId => "duplicate MADT IOAPIC ID",
+            Self::DuplicateControllerAddress => "duplicate IOAPIC MMIO address",
             Self::DestinationApicIdTooLarge => {
                 "BSP APIC ID does not fit IOAPIC physical destination"
             }
@@ -237,10 +241,16 @@ pub fn init(topology: &AcpiTopology, bsp_apic_id: u32) -> Result<IoApicSummary, 
         };
 
         if !state.id_matches() {
-            return Err(IoApicError::HardwareIdMismatch);
+            summary.id_mismatches += 1;
         }
 
         for existing in summary.controllers() {
+            if existing.madt_id == state.madt_id {
+                return Err(IoApicError::DuplicateMadtId);
+            }
+            if existing.address == state.address {
+                return Err(IoApicError::DuplicateControllerAddress);
+            }
             if ranges_overlap(
                 state.gsi_base,
                 state.gsi_end_exclusive(),
