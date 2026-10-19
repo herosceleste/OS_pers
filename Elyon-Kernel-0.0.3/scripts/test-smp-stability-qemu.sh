@@ -20,7 +20,7 @@ for cpu in 1 2 3; do
     exit 1
   }
 
-  grep -Eq "^\[smp\] stable cpu=$cpu apic_id=$cpu state=online heartbeat=(1[0-9]|[2-9][0-9]+) boot_count=1$" "$LOG" || {
+  grep -Fq "[smp] stable cpu=$cpu apic_id=$cpu state=online heartbeat=10 boot_count=1" "$LOG" || {
     echo "[FAIL] AP cpu=$cpu n'a pas conservé un état online stable avec heartbeat et boot_count=1" >&2
     exit 1
   }
