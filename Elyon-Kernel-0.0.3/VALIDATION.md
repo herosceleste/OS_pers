@@ -2,7 +2,7 @@
 
 ## Statut
 
-**EN COURS — K003-01 à K003-11 sont validés.**
+**QUALIFICATION AUTOMATISÉE TERMINÉE — K003-01 à K003-12 sont validés. Validation croisée VMware finale à exécuter avant fusion.**
 
 Baseline de départ : fusion 0.0.2 dans `main`, commit `303feeeff93b4ed1b5b3092cc16a4d8c4489f252`.
 
@@ -29,7 +29,7 @@ Première qualification ACPI :
 | K003-09 | Chaque AP atteint `ELYON_AP_READY` avec son APIC ID | **PASS** |
 | K003-10 | Le BSP reste stable après activation SMP | **PASS** |
 | K003-11 | Base de changement de contexte noyau testée | **PASS** |
-| K003-12 | CI nominale et SMP sans régression des critères 0.0.2 | À faire |
+| K003-12 | CI nominale et SMP sans régression des critères 0.0.2 | **PASS** |
 
 ## K003-01 — RSDP
 
@@ -367,6 +367,79 @@ Ce jalon sauvegarde l'état entier nécessaire au changement coopératif de tâc
 
 **K003-11 : PASS.**
 
+## K003-12 — Qualification finale 0.0.3
+
+K003-12 ajoute un gate final indépendant des tests unitaires de jalon. Une VM QEMU/OVMF à 4 vCPU exécute un boot nominal complet et doit démontrer dans une même exécution la cohérence de K003-01 à K003-11.
+
+Le gate exige notamment :
+
+- RSDP/XSDT/MADT valides et quatre CPU utilisables ;
+- Local APIC opérationnel ;
+- quatre slots per-CPU cohérents ;
+- trois AP réellement démarrés et chacun arrivé à `ELYON_AP_READY` ;
+- `online=4`, `prepared=0` ;
+- dix heartbeats par AP sans erreur IPI/EOI ;
+- IOAPIC intégralement masqué avant activation de handlers externes ;
+- timer LAPIC périodique avec au moins 100 ticks et zéro échec EOI ;
+- deux reprises de la tâche de test et quatre changements de contexte ;
+- arrivée finale à `ELYON_KERNEL_READY_0_0_3` ;
+- absence de panic, exception ou marqueur `FAILED` pendant le boot nominal.
+
+La qualification fonctionnelle finale a été exécutée sur le commit de gate `0bebda3e98aa2b9fa4230e15cbfb986b1ef604c7`, GitHub Actions run **#196**. Le checkout `pull_request` de GitHub a construit le merge commit de qualification `68c424e8b7dc`.
+
+Preuves du gate final :
+
+```text
+ELYON_ACPI_READY
+ELYON_LAPIC_READY
+ELYON_PERCPU_READY
+ELYON_AP_READY cpu=1 apic_id=1
+ELYON_AP_READY cpu=2 apic_id=2
+ELYON_AP_READY cpu=3 apic_id=3
+ELYON_AP_BOOT_READY
+ELYON_SMP_READY
+ELYON_SMP_STABLE
+ELYON_CONTEXT_SWITCH_READY
+ELYON_IOAPIC_READY
+ELYON_TIMER_READY
+ELYON_KERNEL_READY_0_0_3
+
+[smp] all_ready started=3 online=4 prepared=0 expected=4 trampoline=0x8000 sipi_vector=0x8
+[smp] stability rounds=10 online=4 prepared=0 ipi_errors=0 min_heartbeat=10 max_heartbeat=10
+[context] result phases=2 switches=4 online_before=4 online_after=4 prepared=0
+[ioapic] legacy_routes=15 overrides_applied=5 shadowed=1 masked=24/24 all_masked=1
+[timer] ticks=100 eoi_failures=0 periodic=1
+
+[PASS] K003-12 qualification finale 0.0.3: K003-01..11 cohérents sur 4 vCPU, boot nominal sans anomalie
+```
+
+Les régressions fail-closed ont ensuite été rejouées sur la même CI :
+
+```text
+[PASS] #UD diagnostiqué puis arrêté en fail-closed (qemu rc=124)
+[PASS] #DF pris en charge sur l'IST dédiée puis arrêt fail-closed (qemu rc=124)
+```
+
+Toolchain et empreintes des artefacts produits pendant cette qualification :
+
+```text
+rustc 1.99.1 (58cf8f9c3 2026-10-13)
+
+BOOTX64.EFI
+e0f408309828358c4a16d578e1b97f3d08ff093d3ffbc6a6b4388fa5fd83dc8f
+
+KERNEL.ELF
+e8718a012f3a196c46bca4226700a1535fbb221ea9d72c319e3afa7088b73b1e
+```
+
+Ces empreintes identifient les artefacts de la qualification CI #196. Elles ne constituent pas, à elles seules, une preuve de reproductibilité bit à bit sur une autre machine ou un autre environnement.
+
+**K003-12 : PASS.**
+
+### État de fusion
+
+La qualification automatisée 0.0.3 est complète. La PR #2 reste volontairement en Draft jusqu'à une validation croisée finale sous VMware Workstation Pro avec 4 vCPU. Cette vérification doit confirmer au minimum `ELYON_AP_READY` pour les trois AP, `ELYON_SMP_STABLE`, `ELYON_CONTEXT_SWITCH_READY`, `ELYON_TIMER_READY` et `ELYON_KERNEL_READY_0_0_3`.
+
 ## Régressions 0.0.2
 
 La même CI a confirmé que l'introduction du parseur ACPI ne casse pas la baseline précédente :
@@ -397,4 +470,4 @@ La simple présence de structures ACPI, APIC, TSS ou d'un trampoline dans le cod
 
 ## Prochaine étape
 
-Le prochain et dernier critère du jalon est **K003-12 : exécuter la qualification finale 0.0.3, vérifier l'ensemble des critères K003-01 à K003-11 et les régressions 0.0.2, puis figer les preuves avant de proposer la fusion de la PR #2.**
+Tous les critères **K003-01 à K003-12** sont validés en CI. La prochaine action avant fusion est la **validation croisée VMware Workstation Pro en 4 vCPU** sur la branche `elyon-0.0.3`.
