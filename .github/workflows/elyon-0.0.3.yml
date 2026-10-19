@@ -61,6 +61,10 @@ jobs:
         working-directory: Elyon-Kernel-0.0.3
         run: bash scripts/test-percpu-qemu.sh
 
+      - name: Real INIT-SIPI AP startup test
+        working-directory: Elyon-Kernel-0.0.3
+        run: bash scripts/test-smp-one-ap-qemu.sh
+
       - name: IOAPIC routing test
         working-directory: Elyon-Kernel-0.0.3
         run: bash scripts/test-ioapic-qemu.sh
