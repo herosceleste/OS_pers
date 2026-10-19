@@ -3,6 +3,7 @@
 
 mod acpi;
 mod arch;
+mod context;
 mod framebuffer;
 mod memory;
 mod serial;
@@ -365,6 +366,41 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         kprintln!("[smp] no AP discovered; bootstrap skipped");
     }
 
+    let context_qualification = match context::qualify(
+        info.kernel_stack_start,
+        info.kernel_stack_end,
+        paging::identity_limit(),
+        percpu::online_count(),
+    ) {
+        Ok(summary) => summary,
+        Err(error) => {
+            kprintln!("[context] FAILED reason={}", error.as_str());
+            cpu::halt_forever();
+        }
+    };
+
+    kprintln!(
+        "[context] task_stack={:#018x}..{:#018x} size={} KiB source=PMM",
+        context_qualification.task_stack_start,
+        context_qualification.task_stack_end,
+        (context_qualification.task_stack_end - context_qualification.task_stack_start) / 1024
+    );
+    kprintln!(
+        "[context] saved bsp_rsp={:#018x} task_rsp_first={:#018x} task_rsp_final={:#018x}",
+        context_qualification.first_bsp_saved_rsp,
+        context_qualification.first_task_saved_rsp,
+        context_qualification.final_task_saved_rsp
+    );
+    kprintln!(
+        "[context] result phases={} switches={} online_before={} online_after={} prepared={}",
+        context_qualification.phases,
+        context_qualification.switches,
+        context_qualification.online_before,
+        context_qualification.online_after,
+        percpu::prepared_count()
+    );
+    kprintln!("ELYON_CONTEXT_SWITCH_READY");
+
     let ioapic = match ioapic::init(&topology, lapic.apic_id) {
         Ok(summary) => summary,
         Err(error) => {
@@ -497,7 +533,7 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
     );
 
     kprintln!("ELYON_KERNEL_READY_0_0_3");
-    kprintln!("elyon> loader/kernel split active; scheduler not started");
+    kprintln!("elyon> loader/kernel split active; context-switch base active; scheduler not started");
     cpu::halt_forever()
 }
 
