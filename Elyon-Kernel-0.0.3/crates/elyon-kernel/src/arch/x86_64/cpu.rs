@@ -140,7 +140,6 @@ pub fn read_tr() -> u16 {
     selector
 }
 
-
 pub fn idle_forever() -> ! {
     loop {
         unsafe { asm!("sti; hlt", options(nomem, nostack)) }
