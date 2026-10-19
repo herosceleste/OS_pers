@@ -59,7 +59,7 @@ require_fixed "ELYON_SMP_STABLE" "marqueur SMP stable absent"
 require_fixed "[context] result phases=2 switches=4 online_before=4 online_after=4 prepared=0"   "changement de contexte K003-11 non confirmé"
 require_fixed "ELYON_CONTEXT_SWITCH_READY" "marqueur context-switch absent"
 
-require_regex "\[ioapic\] legacy_routes=[1-9][0-9]* overrides_applied=[0-9]+ shadowed=[0-9]+ masked=([1-9][0-9]*)/\1 all_masked=1"   "IOAPIC final non maîtrisé"
+require_regex "\[ioapic\] legacy_routes=[1-9][0-9]* overrides_applied=[0-9]+ shadowed=[0-9]+ id_mismatches=[0-9]+ masked=([1-9][0-9]*)/\1 all_masked=1"   "IOAPIC final non maîtrisé"
 require_fixed "ELYON_IOAPIC_READY" "marqueur IOAPIC absent"
 
 require_regex "\[timer\] ticks=(1[0-9][0-9]|[2-9][0-9]{2,}) eoi_failures=0 periodic=1"   "timer LAPIC non confirmé"
