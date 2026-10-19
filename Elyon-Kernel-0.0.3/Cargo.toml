@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/elyon-abi",
+    "crates/elyon-loader",
+    "crates/elyon-kernel",
+]
+
+[workspace.package]
+version = "0.0.3"
+edition = "2024"
+authors = ["Serge AMAN"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+opt-level = "z"
+strip = "debuginfo"
