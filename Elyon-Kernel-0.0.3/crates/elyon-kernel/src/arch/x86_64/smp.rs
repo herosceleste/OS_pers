@@ -200,11 +200,7 @@ fn prepare_trampoline(
 
     unsafe {
         write_bytes(TRAMPOLINE_BASE as *mut u8, 0, 0x1000);
-        copy_nonoverlapping(
-            start as *const u8,
-            TRAMPOLINE_BASE as *mut u8,
-            length,
-        );
+        copy_nonoverlapping(start as *const u8, TRAMPOLINE_BASE as *mut u8, length);
 
         write_unaligned(BOOT_CR3 as *mut u64, cr3);
         write_unaligned(BOOT_STACK as *mut u64, stack_top);
@@ -290,7 +286,11 @@ extern "sysv64" fn elyon_ap_entry(cpu_index: u64, expected_apic_id: u64) -> ! {
         code_selector,
         observed_tr
     );
-    kprintln!("ELYON_AP_STARTED cpu={} apic_id={}", index, observed_apic_id);
+    kprintln!(
+        "ELYON_AP_STARTED cpu={} apic_id={}",
+        index,
+        observed_apic_id
+    );
 
     cpu::halt_forever()
 }
