@@ -331,7 +331,10 @@ fn configure_slot(
     slot.ist_end.store(ist_span.1, Ordering::Release);
     slot.ticks.store(0, Ordering::Release);
     slot.heartbeat.store(0, Ordering::Release);
-    slot.boot_count.store(0, Ordering::Release);
+    slot.boot_count.store(
+        if state == CpuState::Online { 1 } else { 0 },
+        Ordering::Release,
+    );
 }
 
 fn validate_unique_apic_ids(topology: &AcpiTopology) -> Result<(), PerCpuError> {
