@@ -32,7 +32,7 @@ jobs:
 
       - name: Install pinned Rust toolchain
         run: |
-          rustup toolchain install 1.99.1 --profile minimal --component rustfmt
+          rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
           rustup target add x86_64-unknown-uefi --toolchain 1.99.1
           rustup target add x86_64-unknown-none --toolchain 1.99.1
           rustc +1.99.1 --version
@@ -40,6 +40,28 @@ jobs:
       - name: Format check
         working-directory: Elyon-Kernel-0.0.3
         run: cargo +1.99.1 fmt --all -- --check
+
+      - name: Host unit tests (elyon-core, elyon-abi)
+        working-directory: Elyon-Kernel-0.0.3
+        run: cargo +1.99.1 test --locked -p elyon-core -p elyon-abi
+
+      - name: Clippy (deny warnings)
+        working-directory: Elyon-Kernel-0.0.3
+        run: |
+          cargo +1.99.1 clippy --locked -p elyon-core -p elyon-abi --all-targets -- -D warnings
+          cargo +1.99.1 clippy --locked -p elyon-kernel --target x86_64-unknown-none -- -D warnings
+          cargo +1.99.1 clippy --locked -p elyon-loader --target x86_64-unknown-uefi -- -D warnings
+
+      - name: Undocumented unsafe report (non-blocking)
+        working-directory: Elyon-Kernel-0.0.3
+        continue-on-error: true
+        run: |
+          for spec in "elyon-kernel x86_64-unknown-none" "elyon-loader x86_64-unknown-uefi"; do
+            set -- $spec
+            count=$(cargo +1.99.1 clippy --locked -p "$1" --target "$2" -- -W clippy::undocumented_unsafe_blocks 2>&1 \
+              | grep -c "unsafe block missing a safety comment" || true)
+            echo "::notice title=undocumented unsafe::$1 $count"
+          done
 
       - name: Build loader and kernel
         working-directory: Elyon-Kernel-0.0.3

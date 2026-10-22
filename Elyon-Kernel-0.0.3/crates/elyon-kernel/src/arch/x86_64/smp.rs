@@ -164,29 +164,17 @@ impl SmpError {
     }
 }
 
-pub fn start_one_prepared(info: &BootInfo) -> Result<StartupSummary, SmpError> {
-    for index in 1..percpu::cpu_count() {
-        if let Some(snapshot) = percpu::snapshot(index) {
-            if snapshot.state == percpu::CpuState::Prepared {
-                return start_target(info, index, snapshot);
-            }
-        }
-    }
-
-    Err(SmpError::NoPreparedAp)
-}
-
 pub fn start_all_prepared(info: &BootInfo) -> Result<AllStartupSummary, SmpError> {
     let mut started = 0usize;
 
     loop {
         let mut target = None;
         for index in 1..percpu::cpu_count() {
-            if let Some(snapshot) = percpu::snapshot(index) {
-                if snapshot.state == percpu::CpuState::Prepared {
-                    target = Some((index, snapshot));
-                    break;
-                }
+            if let Some(snapshot) = percpu::snapshot(index)
+                && snapshot.state == percpu::CpuState::Prepared
+            {
+                target = Some((index, snapshot));
+                break;
             }
         }
 

@@ -174,7 +174,7 @@ pub fn validate_mmio_window(
     if address == 0 {
         return Err(IoApicError::InvalidAddress);
     }
-    if address % MMIO_ALIGNMENT != 0 {
+    if !address.is_multiple_of(MMIO_ALIGNMENT) {
         return Err(IoApicError::MmioMisaligned);
     }
 

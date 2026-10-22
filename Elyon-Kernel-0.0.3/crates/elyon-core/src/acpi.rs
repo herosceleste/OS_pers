@@ -326,7 +326,7 @@ pub fn parse<M: PhysMemory + ?Sized>(
 
     let entry_size = rsdp.root_kind.entry_size();
     let payload_length = root.len() - SDT_HEADER_LENGTH;
-    if payload_length % entry_size != 0 {
+    if !payload_length.is_multiple_of(entry_size) {
         return Err(AcpiError::InvalidRootPayload);
     }
 
