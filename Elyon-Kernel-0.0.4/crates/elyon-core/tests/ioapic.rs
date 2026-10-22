@@ -96,8 +96,7 @@ fn vmware_id_divergence_is_diagnostic_only() {
 
 #[test]
 fn too_many_redirections_are_rejected() {
-    let result =
-        ioapic::decode_controller(&descriptor(0, 0xFEC0_0000, 0), 0, 0x00FF_0020, 0);
+    let result = ioapic::decode_controller(&descriptor(0, 0xFEC0_0000, 0), 0, 0x00FF_0020, 0);
     assert_eq!(result.err(), Some(IoApicError::RedirectionCountInvalid));
 }
 
@@ -179,8 +178,7 @@ fn identity_routes_without_overrides() {
 
 #[test]
 fn qemu_overrides_match_ci_summary() {
-    let plan =
-        ioapic::plan_legacy_routes(&qemu_isos(), &[controller(0, 0xFEC0_0000, 0)]).unwrap();
+    let plan = ioapic::plan_legacy_routes(&qemu_isos(), &[controller(0, 0xFEC0_0000, 0)]).unwrap();
     // Valeurs du gate CI : legacy_routes=15 overrides_applied=5 shadowed=1.
     assert_eq!(plan.routes().len(), 15);
     assert_eq!(plan.overrides_applied, 5);
@@ -288,16 +286,25 @@ fn level_low_route_is_encoded_with_destination() {
 #[test]
 fn read_back_ignores_read_only_status_bits() {
     let expected = (0x21 | REDIR_MASKED, 0);
-    let read = (expected.0 | REDIR_DELIVERY_STATUS | REDIR_REMOTE_IRR, 0x0000_00AB);
+    let read = (
+        expected.0 | REDIR_DELIVERY_STATUS | REDIR_REMOTE_IRR,
+        0x0000_00AB,
+    );
     assert!(ioapic::read_back_matches(expected, read));
 }
 
 #[test]
 fn read_back_detects_wrong_vector_or_destination() {
     let expected = (0x21 | REDIR_MASKED, 1 << 24);
-    assert!(!ioapic::read_back_matches(expected, (0x22 | REDIR_MASKED, 1 << 24)));
+    assert!(!ioapic::read_back_matches(
+        expected,
+        (0x22 | REDIR_MASKED, 1 << 24)
+    ));
     assert!(!ioapic::read_back_matches(expected, (0x21, 1 << 24)));
-    assert!(!ioapic::read_back_matches(expected, (0x21 | REDIR_MASKED, 2 << 24)));
+    assert!(!ioapic::read_back_matches(
+        expected,
+        (0x21 | REDIR_MASKED, 2 << 24)
+    ));
 }
 
 // --- Fenêtre MMIO (H4) ---------------------------------------------------------------------
