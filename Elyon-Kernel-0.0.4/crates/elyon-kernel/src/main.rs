@@ -24,9 +24,16 @@ const BUILD_ID: &str = match option_env!("ELYON_BUILD_ID") {
 const TEST_UD: bool = option_env!("ELYON_TEST_UD").is_some();
 const TEST_DF: bool = option_env!("ELYON_TEST_DF").is_some();
 
+/// Point d'entrée du noyau, atteint par saut depuis le loader UEFI.
+///
+/// # Safety
+///
+/// `info_ptr` doit être nul ou pointer vers un `BootInfo` initialisé, aligné,
+/// mappé en identité et non modifié pendant la vie du noyau ; les UEFI Boot
+/// Services doivent être terminés et les interruptions masquées.
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text._start")]
-pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
+pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
     serial::init();
     cpu::disable_interrupts();
 
