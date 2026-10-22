@@ -8,6 +8,7 @@
 
 pub mod acpi;
 pub mod ioapic;
+pub mod pit;
 
 #[cfg(test)]
 mod tests {

@@ -484,8 +484,9 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
     };
 
     kprintln!(
-        "[timer] source=PIT2 pit_count={} lapic_elapsed={} divide={} effective_hz={} initial_count={} target_hz={}",
-        timer_calibration.pit_count,
+        "[timer] source={} pit_count={} lapic_elapsed={} divide={} effective_hz={} initial_count={} target_hz={}",
+        timer_calibration.source.as_str(),
+        timer_calibration.pit_ticks,
         timer_calibration.lapic_elapsed,
         timer_calibration.divide,
         timer_calibration.effective_lapic_hz,
@@ -498,9 +499,27 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         timer::QUALIFICATION_TICKS
     );
 
+    if let Some(pit_failure) = timer_calibration.pit_failure {
+        kprintln!(
+            "[timer] WARN pit_calibration_failed reason={} fallback=CPUID40000010",
+            pit_failure.as_str()
+        );
+    }
+
     cpu::enable_interrupts();
     let timer_ticks = timer::wait_for_ticks(timer::QUALIFICATION_TICKS);
     cpu::disable_interrupts();
+    let timer_ticks = match timer_ticks {
+        Ok(ticks) => ticks,
+        Err(error) => {
+            kprintln!(
+                "[timer] FAILED reason={} ticks={}",
+                error.as_str(),
+                timer::ticks()
+            );
+            cpu::halt_forever();
+        }
+    };
 
     if let Err(error) = timer::stop() {
         kprintln!("[timer] FAILED reason={}", error.as_str());

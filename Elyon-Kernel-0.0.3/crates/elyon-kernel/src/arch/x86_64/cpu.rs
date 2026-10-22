@@ -8,10 +8,6 @@ pub fn enable_interrupts() {
     unsafe { asm!("sti", options(nomem, nostack)) }
 }
 
-pub fn halt_once() {
-    unsafe { asm!("hlt", options(nomem, nostack)) }
-}
-
 pub fn halt_forever() -> ! {
     disable_interrupts();
     loop {
@@ -73,6 +69,20 @@ pub fn apic_capabilities() -> ApicCapabilities {
         apic: leaf.edx & (1 << 9) != 0,
         x2apic: leaf.ecx & (1 << 21) != 0,
     }
+}
+
+/// Renvoie (feuille hyperviseur maximale, EBX de 0x40000010), ou (0, 0) hors
+/// hyperviseur : sans le bit CPUID.1:ECX[31], la plage 0x4000_xxxx n'a pas de
+/// sens et peut refléter la dernière feuille standard.
+pub fn hypervisor_timing_leaf() -> (u32, u32) {
+    if core::arch::x86_64::__cpuid(1).ecx & (1 << 31) == 0 {
+        return (0, 0);
+    }
+    let max_leaf = core::arch::x86_64::__cpuid(0x4000_0000).eax;
+    if max_leaf < 0x4000_0010 {
+        return (max_leaf, 0);
+    }
+    (max_leaf, core::arch::x86_64::__cpuid(0x4000_0010).ebx)
 }
 
 pub unsafe fn read_msr(msr: u32) -> u64 {
