@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 
-use elyon_core::pit::{self, CalibrationError, PitError, PitPort, PIT_FREQUENCY_HZ};
+use elyon_core::pit::{self, CalibrationError, PIT_FREQUENCY_HZ, PitError, PitPort};
 
 /// PIT simulé : rejoue une séquence d'états OUT2 et de valeurs latchées.
 struct FakePit {
