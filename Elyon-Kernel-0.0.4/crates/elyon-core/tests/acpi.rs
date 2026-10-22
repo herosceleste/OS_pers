@@ -535,3 +535,68 @@ fn too_many_cpus_exceed_capacity() {
         AcpiError::CapacityExceeded
     );
 }
+
+// --- Résilience (stabilisation 0.0.3) -------------------------------------------
+
+#[test]
+fn non_essential_table_with_bad_checksum_is_skipped() {
+    let mut facp = sdt(b"FACP", &[0u8; 8]);
+    facp[9] = facp[9].wrapping_add(1);
+    let memory = FakeMemory::new()
+        .place(RSDP_ADDR, rsdp_v2(0, ROOT_ADDR))
+        .place(ROOT_ADDR, xsdt(&[FACP_ADDR, MADT_ADDR]))
+        .place(FACP_ADDR, facp)
+        .place(MADT_ADDR, qemu_madt());
+    let topology = acpi::parse(&memory, RSDP_ADDR).unwrap();
+    assert_eq!(topology.validated_table_count, 1);
+    assert_eq!(topology.skipped_table_count, 1);
+    assert_eq!(topology.cpu_count(), 4);
+}
+
+#[test]
+fn x2apic_entry_duplicating_xapic_entry_is_ignored() {
+    let table = madt(
+        0xFEE0_0000,
+        1,
+        &[lapic(0, 0, 1), lapic(1, 1, 1), x2apic(1, 1, 1)],
+    );
+    let topology = acpi::parse(&machine_with_madt(table), RSDP_ADDR).unwrap();
+    assert_eq!(topology.cpu_count(), 2);
+    assert!(topology.cpus().iter().all(|cpu| !cpu.x2apic));
+}
+
+#[test]
+fn xapic_entry_duplicating_x2apic_entry_is_ignored() {
+    let table = madt(0xFEE0_0000, 1, &[x2apic(0, 1, 0), lapic(0, 0, 1)]);
+    let topology = acpi::parse(&machine_with_madt(table), RSDP_ADDR).unwrap();
+    assert_eq!(topology.cpu_count(), 1);
+    assert!(topology.cpus()[0].x2apic);
+}
+
+#[test]
+fn duplicate_within_same_entry_type_is_kept_for_downstream_rejection() {
+    let table = madt(0xFEE0_0000, 1, &[lapic(0, 1, 1), lapic(1, 1, 1)]);
+    let topology = acpi::parse(&machine_with_madt(table), RSDP_ADDR).unwrap();
+    assert_eq!(topology.cpu_count(), 2);
+}
+
+#[test]
+fn xapic_broadcast_id_is_ignored() {
+    let table = madt(0xFEE0_0000, 1, &[lapic(0, 0, 1), lapic(1, 0xFF, 1)]);
+    let topology = acpi::parse(&machine_with_madt(table), RSDP_ADDR).unwrap();
+    assert_eq!(topology.cpu_count(), 1);
+}
+
+#[test]
+fn online_capable_only_cpu_is_reported_but_not_usable() {
+    let table = madt(
+        0xFEE0_0000,
+        1,
+        &[lapic(0, 0, 1), lapic(1, 1, 2), lapic(2, 2, 0)],
+    );
+    let topology = acpi::parse(&machine_with_madt(table), RSDP_ADDR).unwrap();
+    assert_eq!(topology.cpu_count(), 3);
+    assert_eq!(topology.usable_cpu_count(), 1);
+    assert!(topology.cpus()[1].online_capable());
+    assert!(!topology.cpus()[1].usable());
+}
