@@ -384,7 +384,10 @@ fn qemu_madt_topology() {
 
     assert_eq!(topology.iso_count(), 5);
     let first = topology.isos()[0];
-    assert_eq!((first.bus, first.source, first.gsi, first.flags), (0, 0, 2, 0));
+    assert_eq!(
+        (first.bus, first.source, first.gsi, first.flags),
+        (0, 0, 2, 0)
+    );
 
     assert_eq!(topology.nmi_count(), 1);
 }
@@ -498,13 +501,23 @@ fn nmi_entries_of_all_types_are_parsed() {
     let table = madt(
         0xFEE0_0000,
         1,
-        &[nmi_source(0xD, 9), lapic_nmi(1, 5, 1), x2apic_nmi(5, 0x100, 0)],
+        &[
+            nmi_source(0xD, 9),
+            lapic_nmi(1, 5, 1),
+            x2apic_nmi(5, 0x100, 0),
+        ],
     );
     let topology = acpi::parse(&machine_with_madt(table), RSDP_ADDR).unwrap();
     let nmis = topology.nmis();
     assert_eq!(nmis.len(), 3);
-    assert_eq!((nmis[0].entry_type, nmis[0].gsi, nmis[0].flags), (3, 9, 0xD));
-    assert_eq!((nmis[1].entry_type, nmis[1].acpi_uid, nmis[1].lint), (4, 1, 1));
+    assert_eq!(
+        (nmis[0].entry_type, nmis[0].gsi, nmis[0].flags),
+        (3, 9, 0xD)
+    );
+    assert_eq!(
+        (nmis[1].entry_type, nmis[1].acpi_uid, nmis[1].lint),
+        (4, 1, 1)
+    );
     assert_eq!(
         (nmis[2].entry_type, nmis[2].acpi_uid, nmis[2].lint),
         (10, 0x100, 0)
