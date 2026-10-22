@@ -71,16 +71,17 @@ impl IoApicSummary {
     }
 }
 
-pub fn init(
+/// Étape 1, avant le démarrage des AP : valide et mappe chaque IOAPIC, puis
+/// masque toutes ses entrées. Aucune IRQ externe ne peut ensuite atteindre un
+/// CPU dont IF=1, et le passage UC des pages MMIO a lieu tant que seul le BSP
+/// tourne (pas de TLB shootdown nécessaire).
+pub fn discover_and_mask(
     topology: &AcpiTopology,
-    bsp_apic_id: u32,
     info: &BootInfo,
 ) -> Result<IoApicSummary, IoApicError> {
     if topology.io_apics().is_empty() {
         return Err(IoApicError::NoController);
     }
-    let destination =
-        u8::try_from(bsp_apic_id).map_err(|_| IoApicError::DestinationApicIdTooLarge)?;
 
     let regions = &info.memory_regions[..info.memory_region_count as usize];
     let protected = [
@@ -119,6 +120,23 @@ pub fn init(
         summary.push_controller(state)?;
     }
 
+    summary.masked_entries = count_masked_entries(summary.controllers());
+    if !summary.all_masked() {
+        return Err(IoApicError::ReadBackMismatch);
+    }
+
+    Ok(summary)
+}
+
+/// Étape 2 : programme, toujours masquées, les routes legacy vers le BSP.
+pub fn route_legacy(
+    summary: &mut IoApicSummary,
+    topology: &AcpiTopology,
+    bsp_apic_id: u32,
+) -> Result<(), IoApicError> {
+    let destination =
+        u8::try_from(bsp_apic_id).map_err(|_| IoApicError::DestinationApicIdTooLarge)?;
+
     let legacy = plan::plan_legacy_routes(topology.isos(), summary.controllers())?;
     summary.overrides_applied = legacy.overrides_applied;
     summary.shadowed_legacy_irqs = legacy.shadowed_legacy_irqs;
@@ -134,7 +152,7 @@ pub fn init(
         return Err(IoApicError::ReadBackMismatch);
     }
 
-    Ok(summary)
+    Ok(())
 }
 
 fn count_masked_entries(controllers: &[IoApicState]) -> u32 {

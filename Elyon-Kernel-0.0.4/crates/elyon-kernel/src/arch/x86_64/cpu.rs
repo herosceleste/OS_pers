@@ -1,11 +1,16 @@
 use core::arch::asm;
 
+// `cli`/`sti` délimitent des sections critiques : sans `nomem`, le compilateur
+// les traite comme des accès mémoire et n'y déplace pas les lectures/écritures.
+
 pub fn disable_interrupts() {
-    unsafe { asm!("cli", options(nomem, nostack)) }
+    // SAFETY: masque les interruptions du CPU courant ; aucun invariant mémoire.
+    unsafe { asm!("cli", options(nostack)) }
 }
 
 pub fn enable_interrupts() {
-    unsafe { asm!("sti", options(nomem, nostack)) }
+    // SAFETY: appelé seulement une fois l'IDT et les sources d'IRQ configurées.
+    unsafe { asm!("sti", options(nostack)) }
 }
 
 pub fn halt_forever() -> ! {
