@@ -1,0 +1,15 @@
+//! Logique pure d'Elyon, sans accès matériel : testable sur l'hôte avec `cargo test`.
+//!
+//! Le noyau fournit les accès physiques, MMIO et ports ; cette crate ne fait
+//! que décoder, valider et planifier.
+
+#![cfg_attr(not(test), no_std)]
+#![forbid(unsafe_code)]
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn crate_builds_on_host() {
+        assert_eq!(core::mem::size_of::<u8>(), 1);
+    }
+}
