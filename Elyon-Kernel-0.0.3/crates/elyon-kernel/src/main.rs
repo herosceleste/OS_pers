@@ -408,7 +408,7 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
     );
     kprintln!("ELYON_CONTEXT_SWITCH_READY");
 
-    let ioapic = match ioapic::init(&topology, lapic.apic_id) {
+    let ioapic = match ioapic::init(&topology, lapic.apic_id, info) {
         Ok(summary) => summary,
         Err(error) => {
             kprintln!("[ioapic] FAILED reason={}", error.as_str());

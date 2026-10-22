@@ -1,9 +1,7 @@
 use core::slice;
 
 use elyon_core::acpi::PhysMemory;
-pub use elyon_core::acpi::{
-    AcpiError, AcpiTopology, CpuDescriptor, InterruptSourceOverride, MAX_IO_APICS,
-};
+pub use elyon_core::acpi::{AcpiError, AcpiTopology, CpuDescriptor, MAX_IO_APICS};
 
 /// Mémoire physique accessible via la carte identité courante d'Elyon.
 struct IdentityMapped {
