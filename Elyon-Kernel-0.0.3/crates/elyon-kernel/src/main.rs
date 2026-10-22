@@ -313,6 +313,22 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
 
     kprintln!("ELYON_PERCPU_READY");
 
+    // Les AP exécutent `sti` dès leur entrée : toute source d'IRQ externe doit
+    // être masquée avant le premier INIT/SIPI (ARCHITECTURE §10).
+    timer::mask_legacy_pic();
+    let mut ioapic = match ioapic::discover_and_mask(&topology, info) {
+        Ok(summary) => summary,
+        Err(error) => {
+            kprintln!("[ioapic] FAILED reason={}", error.as_str());
+            cpu::halt_forever();
+        }
+    };
+    kprintln!(
+        "[irq] pre_smp legacy_pic_masked=1 ioapic_masked={}/{}",
+        ioapic.masked_entries,
+        ioapic.total_redirection_entries
+    );
+
     idt::install_interrupt_gate(
         smp::STABILITY_VECTOR,
         code_selector,
@@ -408,13 +424,10 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
     );
     kprintln!("ELYON_CONTEXT_SWITCH_READY");
 
-    let ioapic = match ioapic::init(&topology, lapic.apic_id, info) {
-        Ok(summary) => summary,
-        Err(error) => {
-            kprintln!("[ioapic] FAILED reason={}", error.as_str());
-            cpu::halt_forever();
-        }
-    };
+    if let Err(error) = ioapic::route_legacy(&mut ioapic, &topology, lapic.apic_id) {
+        kprintln!("[ioapic] FAILED reason={}", error.as_str());
+        cpu::halt_forever();
+    }
 
     kprintln!(
         "[ioapic] controllers={} bsp_apic_id={}",

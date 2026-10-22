@@ -45,7 +45,9 @@ impl Write for SerialPort {
 
 pub fn print(args: fmt::Arguments<'_>) {
     let rflags = read_rflags();
-    unsafe { asm!("cli", options(nomem, nostack)) };
+    // SAFETY: masque les IRQ locales pendant la détention du verrou série. Sans
+    // `nomem`, le `cli` sert aussi de barrière compilateur pour la section.
+    unsafe { asm!("cli", options(nostack)) };
 
     while SERIAL_LOCK
         .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -58,7 +60,8 @@ pub fn print(args: fmt::Arguments<'_>) {
     SERIAL_LOCK.store(false, Ordering::Release);
 
     if rflags & RFLAGS_IF != 0 {
-        unsafe { asm!("sti", options(nomem, nostack)) };
+        // SAFETY: rétablit IF uniquement s'il était actif à l'entrée.
+        unsafe { asm!("sti", options(nostack)) };
     }
 }
 

@@ -1,6 +1,6 @@
 use core::arch::global_asm;
 use core::ptr::{copy_nonoverlapping, write_bytes, write_unaligned};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering, fence};
 
 use elyon_abi::BootInfo;
 
@@ -298,6 +298,10 @@ fn start_target(
     target: percpu::CpuSnapshot,
 ) -> Result<StartupSummary, SmpError> {
     prepare_trampoline(info, cpu_index, target.apic_id, target.kernel_stack_end)?;
+
+    // Le trampoline et ses paramètres sont écrits par des accès non volatiles :
+    // ils doivent être globalement visibles avant que l'ICR ne réveille l'AP.
+    fence(Ordering::SeqCst);
 
     apic::send_init(target.apic_id).map_err(|_| SmpError::Apic)?;
     timer::pit_delay_us(10_000).map_err(|_| SmpError::TimerDelay)?;
