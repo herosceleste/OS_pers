@@ -144,11 +144,18 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         topology.root_address
     );
     kprintln!(
-        "[acpi] root={} entries={} validated={}",
+        "[acpi] root={} entries={} validated={} skipped={}",
         topology.root_kind.as_str(),
         topology.root_entries,
-        topology.validated_table_count
+        topology.validated_table_count,
+        topology.skipped_table_count
     );
+    if topology.skipped_table_count != 0 {
+        kprintln!(
+            "[acpi] WARN skipped={} non-essential table(s) with invalid checksum",
+            topology.skipped_table_count
+        );
+    }
     kprintln!(
         "[acpi] MADT=OK address={:#018x} lapic={:#018x} flags={:#x}",
         topology.madt_address,

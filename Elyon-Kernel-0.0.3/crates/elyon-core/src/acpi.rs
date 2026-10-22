@@ -15,6 +15,8 @@ pub const MAX_IO_APICS: usize = 16;
 pub const MAX_ISO_ENTRIES: usize = 64;
 pub const MAX_NMI_ENTRIES: usize = 64;
 
+const XAPIC_BROADCAST_ID: u32 = 0xFF;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RootKind {
     Rsdt,
@@ -68,8 +70,10 @@ impl CpuDescriptor {
         self.flags & 2 != 0
     }
 
+    /// Démarrable au boot : seul le bit Enabled compte. Un CPU seulement
+    /// Online Capable est hot-pluggable et ne répondra pas à INIT/SIPI.
     pub const fn usable(self) -> bool {
-        self.flags & 3 != 0
+        self.enabled()
     }
 }
 
@@ -204,6 +208,20 @@ impl AcpiTopology {
     }
 
     fn push_cpu(&mut self, cpu: CpuDescriptor) -> Result<(), AcpiError> {
+        // 0xFF est l'ID de broadcast xAPIC : jamais un CPU réel.
+        if !cpu.x2apic && cpu.apic_id == XAPIC_BROADCAST_ID {
+            return Ok(());
+        }
+        // Un firmware peut décrire le même CPU en xAPIC et en x2APIC : on garde
+        // la première description. Les doublons d'un même type restent et sont
+        // rejetés en aval par `percpu`.
+        if self
+            .cpus()
+            .iter()
+            .any(|known| known.apic_id == cpu.apic_id && known.x2apic != cpu.x2apic)
+        {
+            return Ok(());
+        }
         if self.cpu_count >= MAX_ACPI_CPUS {
             return Err(AcpiError::CapacityExceeded);
         }
@@ -329,10 +347,21 @@ pub fn parse<M: PhysMemory + ?Sized>(
             return Err(AcpiError::NullTableAddress);
         }
 
-        let table = read_sdt(memory, table_address)?;
+        let table = read_sdt_bytes(memory, table_address)?;
+        let is_madt = signature(table) == b"APIC";
+
+        // Seule la MADT est indispensable à Elyon : une autre table corrompue
+        // est comptée puis ignorée, la MADT reste fail-closed.
+        if !checksum_ok(table) {
+            if is_madt {
+                return Err(AcpiError::InvalidSdtChecksum);
+            }
+            topology.skipped_table_count += 1;
+            continue;
+        }
         topology.validated_table_count += 1;
 
-        if signature(table) == b"APIC" {
+        if is_madt {
             if madt_seen {
                 return Err(AcpiError::DuplicateMadt);
             }
@@ -398,6 +427,16 @@ fn parse_rsdp<M: PhysMemory + ?Sized>(memory: &M, address: u64) -> Result<RsdpIn
 }
 
 fn read_sdt<M: PhysMemory + ?Sized>(memory: &M, address: u64) -> Result<&[u8], AcpiError> {
+    let table = read_sdt_bytes(memory, address)?;
+    if !checksum_ok(table) {
+        return Err(AcpiError::InvalidSdtChecksum);
+    }
+
+    Ok(table)
+}
+
+/// Lit une SDT dont la longueur est validée, sans vérifier son checksum.
+fn read_sdt_bytes<M: PhysMemory + ?Sized>(memory: &M, address: u64) -> Result<&[u8], AcpiError> {
     let header = memory.bytes(address, SDT_HEADER_LENGTH)?;
     let length = read_u32(header, 4)? as usize;
 
@@ -405,12 +444,7 @@ fn read_sdt<M: PhysMemory + ?Sized>(memory: &M, address: u64) -> Result<&[u8], A
         return Err(AcpiError::InvalidSdtLength);
     }
 
-    let table = memory.bytes(address, length)?;
-    if !checksum_ok(table) {
-        return Err(AcpiError::InvalidSdtChecksum);
-    }
-
-    Ok(table)
+    memory.bytes(address, length)
 }
 
 fn parse_madt(address: u64, madt: &[u8], topology: &mut AcpiTopology) -> Result<(), AcpiError> {
