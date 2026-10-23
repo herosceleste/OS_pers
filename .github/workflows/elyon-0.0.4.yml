@@ -110,6 +110,10 @@ jobs:
         working-directory: Elyon-Kernel-0.0.4
         run: bash scripts/test-sched-rr-qemu.sh
 
+      - name: K004-04 LAPIC timer preemption test
+        working-directory: Elyon-Kernel-0.0.4
+        run: bash scripts/test-sched-preempt-qemu.sh
+
       - name: IOAPIC regression
         working-directory: Elyon-Kernel-0.0.4
         run: bash scripts/test-ioapic-qemu.sh

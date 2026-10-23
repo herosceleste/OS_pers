@@ -190,6 +190,9 @@ pub fn on_interrupt() {
     if !apic::eoi() {
         EOI_FAILURES.fetch_add(1, Ordering::AcqRel);
     }
+    // L'EOI est envoyé avant : si le scheduler préempte ici, la tâche élue ne
+    // reviendra pas forcément par ce handler avant le prochain tick.
+    crate::sched::on_timer_tick();
 }
 
 pub fn ticks() -> u64 {
@@ -220,6 +223,14 @@ pub fn wait_for_ticks(target: u64) -> Result<u64, TimerError> {
     } else {
         Err(TimerError::TickTimeout)
     }
+}
+
+/// Relance le timer périodique avec un compte initial déjà calibré.
+pub fn restart_periodic(initial_count: u32) -> Result<(), TimerError> {
+    if !apic::timer_start_periodic(TIMER_VECTOR, initial_count, APIC_DIVIDE_BY_16_CONFIG) {
+        return Err(TimerError::PeriodicProgrammingFailed);
+    }
+    Ok(())
 }
 
 pub fn stop() -> Result<(), TimerError> {

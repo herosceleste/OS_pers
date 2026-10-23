@@ -683,6 +683,50 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
     );
     kprintln!("ELYON_TIMER_READY");
 
+    let preemption = match sched::qualify_preemption(
+        info.kernel_stack_start,
+        info.kernel_stack_end,
+        paging::identity_limit(),
+        timer_calibration.initial_count,
+    ) {
+        Ok(summary) => summary,
+        Err(error) => {
+            kprintln!("[preempt] FAILED reason={}", error.as_str());
+            cpu::halt_forever();
+        }
+    };
+
+    kprint!(
+        "[preempt] tasks={},{},{} trace=",
+        preemption.ids[0],
+        preemption.ids[1],
+        preemption.ids[2]
+    );
+    for (index, task_id) in preemption.trace.iter().enumerate() {
+        if index == 0 {
+            kprint!("{}", task_id);
+        } else {
+            kprint!(",{}", task_id);
+        }
+    }
+    kprintln!();
+    kprintln!(
+        "[preempt] policy=timer-preemptive quantum_ticks={} target={} preemptions={} task_ticks={} min_slices={} counters={},{},{} exits={} running_max={} eoi_failures={} canaries_ok={}",
+        sched::QUANTUM_TICKS,
+        sched::PREEMPT_TARGET,
+        preemption.preemptions,
+        preemption.task_ticks,
+        preemption.min_slices,
+        preemption.counters[0],
+        preemption.counters[1],
+        preemption.counters[2],
+        preemption.exits,
+        preemption.running_max,
+        timer::eoi_failures(),
+        preemption.canaries_ok
+    );
+    kprintln!("ELYON_SCHED_PREEMPT_READY");
+
     if framebuffer::draw_boot_screen(info, paging::identity_limit()) {
         kprintln!(
             "[display] framebuffer=OK {}x{} stride={}",

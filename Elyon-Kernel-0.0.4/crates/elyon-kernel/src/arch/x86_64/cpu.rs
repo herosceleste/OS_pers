@@ -13,6 +13,14 @@ pub fn enable_interrupts() {
     unsafe { asm!("sti", options(nostack)) }
 }
 
+/// Vrai si IF est positionné sur le CPU courant.
+pub fn interrupts_enabled() -> bool {
+    let flags: u64;
+    // SAFETY: lit RFLAGS via la pile, sans effet de bord.
+    unsafe { asm!("pushfq", "pop {}", out(reg) flags, options(preserves_flags)) }
+    flags & (1 << 9) != 0
+}
+
 pub fn halt_forever() -> ! {
     disable_interrupts();
     loop {
