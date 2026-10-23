@@ -59,6 +59,10 @@ require_fixed "ELYON_SMP_STABLE" "marqueur SMP stable absent"
 require_fixed "[context] result phases=2 switches=4 online_before=4 online_after=4 prepared=0"   "changement de contexte K003-11 non confirmé"
 require_fixed "ELYON_CONTEXT_SWITCH_READY" "marqueur context-switch absent"
 
+require_regex "\[task\] ids=[1-9][0-9]*,[1-9][0-9]* unique=1 capacity=256 created=2 transitions=12 invalid_rejected=2 states_seen=0x1f"   "K004-01: modèle de tâche, IDs ou transitions invalides"
+require_fixed "[task] states=READY,RUNNING,BLOCKED,SLEEPING,DEAD affinity_enforced=1"   "K004-01: états de tâche ou affinité non qualifiés"
+require_fixed "ELYON_TASK_MODEL_READY" "K004-01: marqueur task model absent"
+
 require_regex "\[ioapic\] legacy_routes=[1-9][0-9]* overrides_applied=[0-9]+ shadowed=[0-9]+ id_mismatches=[0-9]+ masked=([1-9][0-9]*)/\1 all_masked=1"   "IOAPIC final non maîtrisé"
 require_fixed "ELYON_IOAPIC_READY" "marqueur IOAPIC absent"
 
@@ -73,4 +77,4 @@ if grep -Eq '\[KERNEL PANIC\]|\[EXCEPTION\]|\[[^]]+\] FAILED|ELYON_[A-Z_]+_FAILE
   exit 1
 fi
 
-echo "[PASS] VMware 4 vCPU: Elyon 0.0.4 K003-01..12 validés sur build_id=$EXPECTED_BUILD_ID"
+echo "[PASS] VMware 4 vCPU: Elyon 0.0.4 K003-01..12 et K004-01 validés sur build_id=$EXPECTED_BUILD_ID"
