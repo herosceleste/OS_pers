@@ -118,6 +118,16 @@ jobs:
         working-directory: Elyon-Kernel-0.0.4
         run: bash scripts/test-sched-context-qemu.sh
 
+      - name: K004-06 FPU/SSE/AVX isolation test (XSAVE when available)
+        working-directory: Elyon-Kernel-0.0.4
+        run: bash scripts/test-sched-fpu-qemu.sh
+
+      - name: K004-06 FPU/SSE isolation test (forced FXSAVE fallback)
+        working-directory: Elyon-Kernel-0.0.4
+        env:
+          ELYON_FPU_FORCE_FXSAVE: "1"
+        run: bash scripts/test-sched-fpu-qemu.sh
+
       - name: IOAPIC regression
         working-directory: Elyon-Kernel-0.0.4
         run: bash scripts/test-ioapic-qemu.sh
