@@ -118,6 +118,13 @@ ELYON_CHECK_LOG="$LOG" ELYON_CPUS=4 bash "$ROOT/scripts/test-sched-ipi-qemu.sh" 
   exit 1
 }
 
+# K004-09 : même contrôle indépendant que le test QEMU, appliqué au log VMware.
+ELYON_CHECK_LOG="$LOG" ELYON_CPUS=4 bash "$ROOT/scripts/test-sched-sleep-qemu.sh" >/dev/null || {
+  echo "[FAIL] K004-09: sleep/wakeup non conforme sous VMware" >&2
+  ELYON_CHECK_LOG="$LOG" ELYON_CPUS=4 bash "$ROOT/scripts/test-sched-sleep-qemu.sh" 2>&1 >/dev/null | head -3 >&2
+  exit 1
+}
+
 require_fixed "ELYON_KERNEL_READY_0_0_4" "boot nominal final absent"
 
 if grep -Eq '\[KERNEL PANIC\]|\[EXCEPTION\]|\[[^]]+\] FAILED|ELYON_[A-Z_]+_FAILED' "$LOG"; then
@@ -126,4 +133,4 @@ if grep -Eq '\[KERNEL PANIC\]|\[EXCEPTION\]|\[[^]]+\] FAILED|ELYON_[A-Z_]+_FAILE
   exit 1
 fi
 
-echo "[PASS] VMware 4 vCPU: Elyon 0.0.4 K003-01..12 et K004-01..08 validés sur build_id=$EXPECTED_BUILD_ID"
+echo "[PASS] VMware 4 vCPU: Elyon 0.0.4 K003-01..12 et K004-01..09 validés sur build_id=$EXPECTED_BUILD_ID"
