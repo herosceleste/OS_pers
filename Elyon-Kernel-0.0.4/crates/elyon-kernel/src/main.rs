@@ -827,6 +827,54 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
     );
     kprintln!("ELYON_SCHED_FPU_READY");
 
+    let percpu_run = match sched::qualify_percpu(
+        info.kernel_stack_start,
+        info.kernel_stack_end,
+        paging::identity_limit(),
+    ) {
+        Ok(summary) => summary,
+        Err(error) => {
+            kprintln!("[percpu-sched] FAILED reason={}", error.as_str());
+            cpu::halt_forever();
+        }
+    };
+
+    for cpu_index in 0..percpu_run.cpus {
+        kprint!(
+            "[percpu-sched] cpu={} idle={} tasks={},{} runs=",
+            cpu_index,
+            percpu_run.idle_ids[cpu_index],
+            percpu_run.worker_ids[cpu_index][0],
+            percpu_run.worker_ids[cpu_index][1]
+        );
+        let mut first = true;
+        for entry in percpu_run.trace[..percpu_run.trace_len]
+            .iter()
+            .filter(|entry| entry.cpu as usize == cpu_index)
+        {
+            if first {
+                kprint!("{}", entry.task);
+                first = false;
+            } else {
+                kprint!(",{}", entry.task);
+            }
+        }
+        kprintln!();
+    }
+    kprintln!(
+        "[percpu-sched] cpus={} tasks_per_cpu={} iterations={} trace_entries={} affinity_ok=1 rotation_ok=1 idle_ran={} idle_running_aps={} ap_fpu_ready={} running_max={} canaries_ok={}",
+        percpu_run.cpus,
+        sched::PERCPU_TASKS_PER_CPU,
+        sched::PERCPU_ITERATIONS,
+        percpu_run.trace_len,
+        percpu_run.cpus,
+        percpu_run.idle_running_aps,
+        percpu_run.ap_fpu_ready,
+        percpu_run.running_max,
+        percpu_run.canaries_ok
+    );
+    kprintln!("ELYON_SCHED_PERCPU_READY");
+
     if framebuffer::draw_boot_screen(info, paging::identity_limit()) {
         kprintln!(
             "[display] framebuffer=OK {}x{} stride={}",
