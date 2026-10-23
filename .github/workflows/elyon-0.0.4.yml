@@ -147,6 +147,10 @@ jobs:
           ELYON_FPU_FORCE_FXSAVE: "1"
         run: bash scripts/test-sched-fpu-qemu.sh
 
+      - name: K004-07 per-CPU scheduler and idle task test
+        working-directory: Elyon-Kernel-0.0.4
+        run: bash scripts/test-sched-percpu-qemu.sh
+
       - name: IOAPIC regression
         working-directory: Elyon-Kernel-0.0.4
         run: bash scripts/test-ioapic-qemu.sh
