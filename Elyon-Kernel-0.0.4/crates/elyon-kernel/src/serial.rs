@@ -6,7 +6,16 @@ use core::sync::atomic::{AtomicBool, Ordering};
 const COM1: u16 = 0x3F8;
 const RFLAGS_IF: u64 = 1 << 9;
 
+/// Serialises console output between CPUs so that lines from the BSP and the
+/// APs never interleave. Each `kprint!`/`kprintln!` call is one critical
+/// section, so every line stays whole.
 static SERIAL_LOCK: AtomicBool = AtomicBool::new(false);
+
+/// Upper bound on the wait for the lock. If a CPU faults while it holds the
+/// lock (for example an exception raised inside a print), the diagnostic must
+/// still reach the console instead of hanging silently: after this many spins
+/// the waiter writes anyway. A garbled line is better than a lost diagnostic.
+const SERIAL_LOCK_MAX_SPINS: u32 = 50_000_000;
 
 pub fn init() {
     unsafe {
@@ -49,15 +58,23 @@ pub fn print(args: fmt::Arguments<'_>) {
     // `nomem`, le `cli` sert aussi de barrière compilateur pour la section.
     unsafe { asm!("cli", options(nostack)) };
 
-    while SERIAL_LOCK
-        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
+    let mut acquired = false;
+    for _ in 0..SERIAL_LOCK_MAX_SPINS {
+        if SERIAL_LOCK
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            acquired = true;
+            break;
+        }
         spin_loop();
     }
 
     let _ = SerialPort.write_fmt(args);
-    SERIAL_LOCK.store(false, Ordering::Release);
+
+    if acquired {
+        SERIAL_LOCK.store(false, Ordering::Release);
+    }
 
     if rflags & RFLAGS_IF != 0 {
         // SAFETY: rétablit IF uniquement s'il était actif à l'entrée.

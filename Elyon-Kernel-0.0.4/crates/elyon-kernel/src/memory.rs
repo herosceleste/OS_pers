@@ -2,13 +2,18 @@ use core::ptr::{addr_of_mut, write_bytes};
 
 use elyon_abi::{BootInfo, MemoryRegionKind, PAGE_SIZE};
 
+use crate::arch::x86_64::paging;
+
 const MAX_PHYSICAL_MEMORY: u64 = 32 * 1024 * 1024 * 1024;
 const MAX_FRAMES: usize = (MAX_PHYSICAL_MEMORY / PAGE_SIZE) as usize;
 const BITMAP_BYTES: usize = MAX_FRAMES.div_ceil(8);
 const LOW_MEMORY_RESERVE_END: u64 = 1024 * 1024;
 
-static mut FRAME_BITMAP: [u8; BITMAP_BYTES] = [0xFF; BITMAP_BYTES];
+// Zero-initialised so the bitmap lives in .bss instead of inflating KERNEL.ELF
+// by 1 MiB. `init()` marks every frame as used before freeing usable regions.
+static mut FRAME_BITMAP: [u8; BITMAP_BYTES] = [0; BITMAP_BYTES];
 static mut FREE_FRAMES: usize = 0;
+static mut MANAGED_FRAMES: usize = 0;
 
 pub struct PmmStats {
     pub managed_frames: usize,
@@ -22,8 +27,23 @@ pub fn init(info: &BootInfo) -> PmmStats {
         FREE_FRAMES = 0;
     }
 
-    let managed_limit = info.highest_physical_address.min(MAX_PHYSICAL_MEMORY);
+    // Manage only RAM the firmware reports as usable, and only what the
+    // initial Elyon identity map can reach. Reserved or MMIO ranges high in the
+    // address space must not inflate the managed span, and a frame above the
+    // identity limit would fault as soon as the kernel touched it.
+    let highest_usable = info.memory_regions[..info.memory_region_count as usize]
+        .iter()
+        .filter(|region| region.kind == MemoryRegionKind::Usable)
+        .map(|region| region.end())
+        .max()
+        .unwrap_or(0);
+    let managed_limit = highest_usable
+        .min(paging::identity_limit())
+        .min(MAX_PHYSICAL_MEMORY);
     let managed_frames = (managed_limit / PAGE_SIZE) as usize;
+    unsafe {
+        MANAGED_FRAMES = managed_frames;
+    }
 
     for region in &info.memory_regions[..info.memory_region_count as usize] {
         if region.kind != MemoryRegionKind::Usable {
@@ -56,12 +76,13 @@ pub fn allocate_frame() -> Option<u64> {
 }
 
 pub fn allocate_contiguous_frames(count: usize) -> Option<u64> {
-    if count == 0 || count > MAX_FRAMES {
+    let managed_frames = unsafe { MANAGED_FRAMES };
+    if count == 0 || count > managed_frames {
         return None;
     }
 
     let first_allocatable = (LOW_MEMORY_RESERVE_END / PAGE_SIZE) as usize;
-    let last_start = MAX_FRAMES.checked_sub(count)?;
+    let last_start = managed_frames.checked_sub(count)?;
 
     'candidate: for start in first_allocatable..=last_start {
         for frame in start..start + count {
