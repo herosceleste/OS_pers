@@ -9,6 +9,7 @@
 pub mod acpi;
 pub mod ioapic;
 pub mod pit;
+pub mod run_queue;
 pub mod task_stack;
 
 #[cfg(test)]

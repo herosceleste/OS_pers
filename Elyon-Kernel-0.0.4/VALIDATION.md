@@ -1,6 +1,6 @@
 # Elyon Kernel 0.0.4 — Validation
 
-**EN COURS — K004-01 et K004-02 sont validés. K004-03 à K004-12 restent à qualifier.**
+**EN COURS — K004-01 à K004-03 sont validés. K004-04 à K004-12 restent à qualifier.**
 
 ## Baseline héritée
 
@@ -12,7 +12,7 @@ La 0.0.4 est dérivée de la Release `v0.0.3`, dont les critères K003-01 à K00
 |---|---|---|
 | K004-01 | Modèle de tâche noyau et machine d'états | **PASS** |
 | K004-02 | Pile et contexte initial dédiés | **PASS** |
-| K004-03 | Round-Robin coopératif | À faire |
+| K004-03 | Round-Robin coopératif | **PASS** |
 | K004-04 | Préemption LAPIC | À faire |
 | K004-05 | Contexte CPU scheduler complet | À faire |
 | K004-06 | Sauvegarde FPU/SSE/AVX | À faire |
@@ -113,3 +113,57 @@ Limites : le PMM n'a pas encore de libération, les piles des tâches `DEAD` res
 **K004-02 : PASS.**
 
 Le prochain critère est **K004-03 : Round-Robin coopératif avec `yield()` et run queue.**
+
+## K004-03 — Round-Robin coopératif avec `yield()` et run queue
+
+Les tâches se passent désormais la main directement, d'une tâche à l'autre. Un scheduler choisit la suivante dans une run queue FIFO.
+
+La logique pure est dans `elyon_core::run_queue`, testée sur l'hôte :
+
+- file FIFO circulaire de capacité fixe, sans allocation, qui refuse les doublons et l'identifiant 0 ;
+- `yield_next` : la tâche courante passe en fin de file et la tête reprend la main ;
+- `exit_next` : la tête reprend la main sans remettre la tâche courante en file ;
+- `is_round_robin` : une trace doit former exactement N tours des tâches, dans l'ordre.
+
+Côté noyau, le registre de tâches conserve le RSP sauvegardé de chaque tâche, écrit et relu par le switch de contexte. Le module `sched` fournit :
+
+- `yield_now()` : la tâche courante passe `READY` et en fin de file, la tête passe `RUNNING`, et le switch se fait directement de tâche à tâche ;
+- `exit_now()` : la tâche passe `DEAD` sans être remise en file ; la dernière sortie rend la main au BSP.
+
+Avant chaque switch, `transfer()` vérifie qu'exactement une tâche est `RUNNING` (aucune au retour vers le BSP). Toute erreur dans une tâche arrête le noyau de façon fail-closed.
+
+La qualification place trois tâches dans la run queue. Chacune effectue quatre itérations : elle note son passage dans une trace, puis appelle `yield_now()`, et `exit_now()` après la dernière. Le BSP vérifie :
+
+- une trace en rotation stricte ;
+- toutes les tâches `DEAD` et la file vide ;
+- au plus une tâche `RUNNING` à tout moment ;
+- 9 yields, 3 sorties, 11 switches de tâche à tâche et 2 passages par le BSP ;
+- les arguments reçus, et le RSP dans la pile propre de la tâche à chaque passage ;
+- les canaris et le RSP sauvegardé du BSP.
+
+Le script `test-sched-rr-qemu.sh` recalcule la rotation à partir de la trace du log, sans se fier au seul jugement du noyau. Il a été vérifié en échec sur des traces altérées (deux passages inversés, un passage manquant).
+
+La qualification a été exécutée sur le commit `ffa06bebafce`, GitHub Actions run **#29** du workflow Elyon 0.0.4, et en local sous QEMU 8.2.2 / OVMF, 4 vCPU.
+
+Preuves :
+
+```text
+[sched] tasks=6,7,8 trace=6,7,8,6,7,8,6,7,8,6,7,8
+[sched] policy=round-robin cooperative iterations=4 yields=9 exits=3 task_switches=11 bsp_switches=2 running_max=1 args_ok=3 rsp_ok=12 canaries_ok=3 queue_empty=1
+ELYON_SCHED_RR_READY
+[PASS] K004-03 Round-Robin coopératif: 3 tâches, 4 tours stricts, 11 switches directs tâche→tâche, une seule tâche RUNNING
+```
+
+Validation croisée sous VMware® Workstation 17 Pro 17.0.2 build-21581411, UEFI, 4 vCPU, même build :
+
+```text
+[PASS] VMware 4 vCPU: Elyon 0.0.4 K003-01..12 et K004-01..03 validés sur build_id=ffa06bebafce
+```
+
+Les contrôles indépendants des scripts K004-02 et K004-03 passent aussi sur le log VMware.
+
+Limites : tout se déroule sur le BSP, interruptions masquées, avec une run queue globale sans verrou. La préemption, les files par CPU et la synchronisation SMP relèvent de K004-04, K004-07 et K004-10. Les piles des tâches `DEAD` ne sont toujours pas récupérées.
+
+**K004-03 : PASS.**
+
+Le prochain critère est **K004-04 : préemption réelle par timer LAPIC.**

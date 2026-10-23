@@ -76,6 +76,7 @@ struct TaskSlot {
     current_cpu: AtomicU32,
     stack_start: AtomicU64,
     stack_end: AtomicU64,
+    saved_rsp: AtomicU64,
 }
 
 impl TaskSlot {
@@ -87,6 +88,7 @@ impl TaskSlot {
             current_cpu: AtomicU32::new(NO_CPU),
             stack_start: AtomicU64::new(0),
             stack_end: AtomicU64::new(0),
+            saved_rsp: AtomicU64::new(0),
         }
     }
 }
@@ -174,6 +176,7 @@ pub fn create_kernel(affinity_mask: u64) -> Result<TaskId, TaskError> {
         slot.current_cpu.store(NO_CPU, Ordering::Release);
         slot.stack_start.store(0, Ordering::Release);
         slot.stack_end.store(0, Ordering::Release);
+        slot.saved_rsp.store(0, Ordering::Release);
         slot.state.store(STATE_READY, Ordering::Release);
         CREATED_TASKS.fetch_add(1, Ordering::AcqRel);
 
@@ -305,6 +308,27 @@ pub fn stack_of(id: TaskId) -> Result<Option<(u64, u64)>, TaskError> {
         return Ok(None);
     }
     Ok(Some((slot.stack_start.load(Ordering::Acquire), end)))
+}
+
+/// Identifiant d'une tâche existante, retrouvé à partir de sa valeur brute.
+pub fn lookup(raw: u64) -> Result<TaskId, TaskError> {
+    let id = TaskId(raw);
+    find_slot(id).map(|_| id).ok_or(TaskError::UnknownTask)
+}
+
+/// Emplacement du RSP sauvegardé de la tâche, écrit et relu par le switch de
+/// contexte. Le pointeur reste valide tant que le registre statique existe.
+pub fn saved_rsp_ptr(id: TaskId) -> Result<*mut u64, TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    Ok(slot.saved_rsp.as_ptr())
+}
+
+/// Nombre de tâches actuellement RUNNING, tous CPU confondus.
+pub fn running_count() -> usize {
+    TASKS
+        .iter()
+        .filter(|slot| slot.state.load(Ordering::Acquire) == STATE_RUNNING)
+        .count()
 }
 
 pub fn created_total() -> u64 {
