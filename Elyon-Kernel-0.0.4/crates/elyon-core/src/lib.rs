@@ -16,6 +16,7 @@ pub mod preempt;
 pub mod run_queue;
 pub mod sync;
 pub mod task_stack;
+pub mod timer_queue;
 
 #[cfg(test)]
 mod tests {
