@@ -1,6 +1,6 @@
 # Elyon Kernel 0.0.4 — Validation
 
-**EN COURS — K004-01 à K004-06 sont validés. K004-07 à K004-12 restent à qualifier.**
+**EN COURS — K004-01 à K004-07 sont validés. K004-08 à K004-12 restent à qualifier.**
 
 ## Baseline héritée
 
@@ -16,7 +16,7 @@ La 0.0.4 est dérivée de la Release `v0.0.3`, dont les critères K003-01 à K00
 | K004-04 | Préemption LAPIC | **PASS** |
 | K004-05 | Contexte CPU scheduler complet | **PASS** |
 | K004-06 | Sauvegarde FPU/SSE/AVX | **PASS** |
-| K004-07 | Scheduler per-CPU + idle task | À faire |
+| K004-07 | Scheduler per-CPU + idle task | **PASS** |
 | K004-08 | Reschedule IPI + affinité | À faire |
 | K004-09 | Sleep/wakeup | À faire |
 | K004-10 | Synchronisation scheduler/IRQ/SMP | À faire |
@@ -328,3 +328,51 @@ Limites : sauvegarde systématique à chaque switch, sans mode lazy (CR0.TS) ; A
 **K004-06 : PASS.**
 
 Le prochain critère est **K004-07 : scheduler per-CPU et idle task officielle sur chaque CPU.**
+
+## K004-07 — Scheduler per-CPU et idle task officielle sur chaque CPU
+
+Chaque CPU en ligne a désormais son propre scheduler, et des tâches Elyon s'exécutent sur les AP, chacune sur le CPU désigné par son affinité. Quand sa file est vide, chaque CPU exécute son idle task officielle.
+
+La logique pure est dans `elyon_core::percpu_sched`, testée sur l'hôte :
+
+- `place()` : plus petit CPU en ligne de l'affinité ; une affinité vide ou sans CPU en ligne est refusée ;
+- `check_trace()` : chaque passage a lieu sur le CPU propriétaire de la tâche (idle tasks comprises), chaque CPU exécute exactement N tours de sa file dans l'ordre, et chaque CPU exécute son idle task ; l'entrelacement entre CPU est libre.
+
+Côté noyau :
+
+- l'état du scheduler (run queue, RSP du contexte de départ, tâche courante, horloge de tranche, zone FPU) est indexé par CPU logique, retrouvé à partir de l'APIC ID ; l'invariant `RUNNING` est vérifié par CPU ;
+- CR4.OSXSAVE et XCR0 étant propres à chaque CPU, `fpu::init_secondary()` applique sur chaque AP la configuration retenue par le BSP, relue par `xgetbv` ; les piles et zones FPU sont pré-allouées par le BSP, le PMM n'étant pas verrouillé ;
+- les AP attendent en `sti; hlt` ; le BSP remplit leur file, publie `PERCPU_ARMED[cpu]` (Release) puis les réveille par IPI ; chaque file n'est ensuite touchée que par son CPU ;
+- une file vide bascule sur l'idle task du CPU : sur un AP elle tourne indéfiniment en `sti; hlt`, sur le BSP elle repasse `READY` et rend la main au boot.
+
+La qualification place deux tâches par CPU, qui effectuent chacune trois itérations coopératives. Le BSP vérifie la trace multi-CPU, les tâches `DEAD`, les idle tasks des AP `RUNNING` sur leur propre CPU et celle du BSP `READY`, le FPU de chaque AP, au plus une tâche `RUNNING` par CPU et les canaris des douze piles.
+
+Le script `test-sched-percpu-qemu.sh` revérifie à partir du log que chaque CPU a exécuté exactement `A,B,A,B,A,B` puis son idle task, et qu'aucune tâche n'apparaît sur deux CPU. Il a été vérifié en échec sur des logs altérés (tâche migrée, ordre rompu, idle task manquante, FPU d'un AP non prête). Le même contrôle s'applique au log VMware. La stabilité a été vérifiée sur six boots QEMU à 1, 2 et 4 vCPU.
+
+La qualification a été exécutée sur le commit `3af57041527a`, GitHub Actions run **#48** du workflow Elyon 0.0.4, et en local sous QEMU 8.2.2 / OVMF, 4 vCPU.
+
+Preuves :
+
+```text
+[percpu-sched] cpu=0 idle=18 tasks=19,20 runs=19,20,19,20,19,20,18
+[percpu-sched] cpu=1 idle=21 tasks=22,23 runs=22,23,22,23,22,23,21
+[percpu-sched] cpu=2 idle=24 tasks=25,26 runs=25,26,25,26,25,26,24
+[percpu-sched] cpu=3 idle=27 tasks=28,29 runs=28,29,28,29,28,29,27
+[percpu-sched] cpus=4 tasks_per_cpu=2 iterations=3 trace_entries=28 affinity_ok=1 rotation_ok=1 idle_ran=4 idle_running_aps=3 ap_fpu_ready=3 running_max=1 canaries_ok=12
+ELYON_SCHED_PERCPU_READY
+[PASS] K004-07 scheduler per-CPU: 4 CPU, 2 tâches par CPU en Round-Robin sur leur seul CPU, idle officielle sur chaque CPU (3 AP en idle), FPU des AP prête
+```
+
+Validation croisée sous VMware® Workstation 17 Pro 17.0.2 build-21581411, UEFI, 4 vCPU, même build :
+
+```text
+[PASS] VMware 4 vCPU: Elyon 0.0.4 K003-01..12 et K004-01..07 validés sur build_id=3af57041527a
+```
+
+Les traces par CPU relevées sous VMware sont identiques à celles de QEMU, et la console série ne contient aucune ligne entremêlée alors que les quatre CPU s'exécutaient en parallèle.
+
+Limites : l'exécution est coopérative sur les AP, dont les timers LAPIC ne sont pas programmés ; les files sont remplies avant l'armement, sans migration ni réveil à distance (K004-08) ; seul le BSP alloue, le PMM n'étant pas verrouillé.
+
+**K004-07 : PASS.**
+
+Le prochain critère est **K004-08 : IPI de rescheduling, réveil distant et affinité CPU.**
