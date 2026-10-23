@@ -456,7 +456,7 @@ Ces empreintes identifient les artefacts de la qualification CI #196. Elles ne c
 
 La qualification automatisée 0.0.3 est complète. La PR #2 a été fusionnée dans `main` le 2026-10-19 (`ca57e56`).
 
-La validation croisée finale sous VMware Workstation Pro 4 vCPU a été exécutée le 2026-10-23 sur la branche `elyon-0.0.3-stabilize`, build_id `b1ee379af28b`. Elle confirme `ELYON_AP_READY` pour les trois AP, `ELYON_SMP_STABLE`, `ELYON_CONTEXT_SWITCH_READY`, `ELYON_TIMER_READY` et `ELYON_KERNEL_READY_0_0_3` :
+La validation croisée finale sous VMware Workstation 17 Pro 17.0.2 (build-21581411) en 4 vCPU a été exécutée le 2026-10-23 sur la branche `elyon-0.0.3-stabilize`, build_id `b1ee379af28b`. Elle confirme `ELYON_AP_READY` pour les trois AP, `ELYON_SMP_STABLE`, `ELYON_CONTEXT_SWITCH_READY`, `ELYON_TIMER_READY` et `ELYON_KERNEL_READY_0_0_3` :
 
 ```text
 [PASS] VMware 4 vCPU: Elyon 0.0.3 K003-01..12 validés sur build_id=b1ee379af28b

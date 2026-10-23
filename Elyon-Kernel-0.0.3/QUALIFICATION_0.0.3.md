@@ -104,7 +104,7 @@ La CI GitHub Actions **#209** valide cette correction sous QEMU, où l'ID MADT e
 - commit : `b1ee379af28b` (`ci: run host unit tests and deny clippy warnings for Elyon 0.0.3`)
 - Rust : `rustc 1.99.1 (58cf8f9c3 2026-10-13)`
 - ISO : `build/Elyon-Kernel-0.0.3-UEFI.iso`, produite par `scripts/build-vmware-iso.sh`
-- hyperviseur : VMware Workstation Pro, firmware UEFI, 4 vCPU, journal série vers fichier
+- hyperviseur : VMware® Workstation 17 Pro 17.0.2 build-21581411, firmware UEFI, 4 vCPU, journal série vers fichier
 
 Empreintes des binaires embarqués dans l'ISO, identiques à ceux qualifiés sous QEMU dans la même session :
 
