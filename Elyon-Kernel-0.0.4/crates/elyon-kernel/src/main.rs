@@ -922,6 +922,70 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         }
     }
 
+    match sched::qualify_sleep(
+        info.kernel_stack_start,
+        info.kernel_stack_end,
+        paging::identity_limit(),
+        timer_calibration.initial_count,
+    ) {
+        Ok(Some(sleep)) => {
+            for timed in sleep.timed {
+                kprintln!(
+                    "[sched-sleep] timed task={} cpu={} ms={} start={} deadline={} woke_at={} resumed_at={}",
+                    timed.task,
+                    timed.cpu,
+                    timed.ms,
+                    timed.start,
+                    timed.deadline,
+                    timed.woke_at,
+                    timed.resumed_at
+                );
+            }
+            kprintln!(
+                "[sched-sleep] shared cpu={} sleeper={} runner={} ran_while_sleeping=1 idle_entries={}",
+                sleep.shared_cpu,
+                sleep.sleeper,
+                sleep.runner,
+                sleep.idle_entries
+            );
+            kprintln!(
+                "[sched-sleep] explicit task={} cpu={} ms={} start={} deadline={} woke_at={} stale_expiries={}",
+                sleep.explicit.task,
+                sleep.explicit.cpu,
+                sleep.explicit.ms,
+                sleep.explicit.start,
+                sleep.explicit.deadline,
+                sleep.explicit.woke_at,
+                sleep.stale_expiries
+            );
+            kprintln!("[sched-sleep] zero task={} stayed_awake=1", sleep.zero_task);
+            kprintln!(
+                "[sched-sleep] cpus={} hz={} sleeps={} timer_wakes={} explicit_wakes={} order_ok=1 never_early=1 max_late={} ipi_sent={} ipi_received={} timer_queue_empty=1 idle_running_aps={} running_max={} canaries_ok={}",
+                sleep.cpus,
+                timer::TIMER_HZ,
+                sleep.sleeps,
+                sleep.timer_wakes,
+                sleep.explicit_wakes,
+                sleep.max_late,
+                sleep.ipi_sent,
+                sleep.ipi_received,
+                sleep.idle_running_aps,
+                sleep.running_max,
+                sleep.canaries_ok
+            );
+            kprintln!("ELYON_SCHED_SLEEP_READY");
+        }
+        Ok(None) => kprintln!("[sched-sleep] skipped single_cpu=1"),
+        Err(error) => {
+            kprintln!(
+                "[sched-sleep] FAILED reason={} ticks={}",
+                error.as_str(),
+                timer::ticks()
+            );
+            cpu::halt_forever();
+        }
+    }
+
     if framebuffer::draw_boot_screen(info, paging::identity_limit()) {
         kprintln!(
             "[display] framebuffer=OK {}x{} stride={}",
