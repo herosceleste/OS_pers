@@ -347,6 +347,11 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         code_selector,
         idt::smp_stability_ipi_handler(),
     );
+    idt::install_interrupt_gate(
+        sched::RESCHED_VECTOR,
+        code_selector,
+        idt::resched_ipi_handler(),
+    );
 
     if percpu_summary.cpu_count > 1 {
         let smp_summary = match smp::start_all_prepared(info) {
@@ -874,6 +879,48 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         percpu_run.canaries_ok
     );
     kprintln!("ELYON_SCHED_PERCPU_READY");
+
+    match sched::qualify_remote(
+        info.kernel_stack_start,
+        info.kernel_stack_end,
+        paging::identity_limit(),
+    ) {
+        Ok(Some(remote)) => {
+            kprintln!(
+                "[sched-ipi] remote_spawn task={} cpu={} runs=1 ipi=1",
+                remote.spawned,
+                remote.spawn_cpu
+            );
+            kprintln!(
+                "[sched-ipi] block_wake task={} cpu={} runs=2 blocked_then_woken_by_cpu=0",
+                remote.blocked,
+                remote.block_cpu
+            );
+            kprintln!(
+                "[sched-ipi] migrate task={} from={} to={} runs=1",
+                remote.migrated,
+                remote.migrate_from,
+                remote.migrate_to
+            );
+            kprintln!(
+                "[sched-ipi] cpus={} placement_ok=1 ipi_sent={} ipi_received={} blocks={} wakes=1 migrations=1 contention={} idle_running_aps={} running_max={} canaries_ok={}",
+                remote.cpus,
+                remote.ipi_sent,
+                remote.ipi_received,
+                remote.blocks,
+                remote.contention,
+                remote.idle_running_aps,
+                remote.running_max,
+                remote.canaries_ok
+            );
+            kprintln!("ELYON_SCHED_IPI_READY");
+        }
+        Ok(None) => kprintln!("[sched-ipi] skipped single_cpu=1"),
+        Err(error) => {
+            kprintln!("[sched-ipi] FAILED reason={}", error.as_str());
+            cpu::halt_forever();
+        }
+    }
 
     if framebuffer::draw_boot_screen(info, paging::identity_limit()) {
         kprintln!(
