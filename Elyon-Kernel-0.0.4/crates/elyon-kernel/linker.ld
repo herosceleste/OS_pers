@@ -22,6 +22,9 @@ SECTIONS
 
     .data ALIGN(0x1000) : {
         *(.data .data.*)
+        /* Keep the GOT before .bss: an orphan .got placed after .bss forces
+           the linker to store the whole zero-filled .bss in KERNEL.ELF. */
+        *(.got .got.*)
     } :data
 
     .bss ALIGN(0x1000) (NOLOAD) : {
