@@ -24,10 +24,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
 
+      # Le miroir Ubuntu du runner descend parfois à ~36 ko/s (20 min pour 44 Mo
+      # au run #41). Les .deb sont conservés entre les runs : apt réutilise ceux
+      # dont la version et la somme correspondent et ne télécharge que le reste.
+      - name: Restore apt package cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/apt-archives
+          key: apt-${{ runner.os }}-noble-qemu-ovmf-v1-${{ github.run_id }}
+          restore-keys: |
+            apt-${{ runner.os }}-noble-qemu-ovmf-v1-
+
       - name: Install host dependencies
         run: |
+          mkdir -p ~/apt-archives/partial
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 ovmf xorriso dosfstools mtools
+          sudo apt-get install -y --no-install-recommends \
+            -o Dir::Cache::Archives="$HOME/apt-archives" \
+            qemu-system-x86 ovmf xorriso dosfstools mtools
+          # actions/cache sauvegarde le dossier en fin de job sous l'utilisateur
+          # du runner : on lui rend les .deb lisibles et on retire le partiel.
+          sudo rm -rf ~/apt-archives/partial ~/apt-archives/lock
+          sudo chown -R "$(id -u):$(id -g)" ~/apt-archives
+          du -sh ~/apt-archives
 
       - name: Install pinned Rust toolchain
         run: |
