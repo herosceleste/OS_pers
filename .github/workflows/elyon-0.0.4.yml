@@ -102,6 +102,10 @@ jobs:
         working-directory: Elyon-Kernel-0.0.4
         run: bash scripts/test-task-model-qemu.sh
 
+      - name: K004-02 task stacks test
+        working-directory: Elyon-Kernel-0.0.4
+        run: bash scripts/test-task-stacks-qemu.sh
+
       - name: IOAPIC regression
         working-directory: Elyon-Kernel-0.0.4
         run: bash scripts/test-ioapic-qemu.sh
