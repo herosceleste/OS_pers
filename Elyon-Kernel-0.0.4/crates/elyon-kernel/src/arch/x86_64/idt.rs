@@ -204,6 +204,45 @@ elyon_apic_timer_interrupt:
     pop rax
     iretq
 
+.global elyon_resched_ipi
+elyon_resched_ipi:
+    cld
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rsp
+    and rsp, -16
+    call elyon_resched_ipi_dispatch
+    mov rsp, r12
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    iretq
+
 .global elyon_test_double_fault
 elyon_test_double_fault:
     mov rax, 0x0000001000000000
@@ -278,6 +317,7 @@ unsafe extern "C" {
     fn elyon_apic_spurious();
     fn elyon_apic_timer_interrupt();
     fn elyon_smp_stability_ipi();
+    fn elyon_resched_ipi();
 }
 
 pub fn init(code_selector: u16) {
@@ -446,4 +486,8 @@ pub fn apic_timer_handler() -> u64 {
 
 pub fn smp_stability_ipi_handler() -> u64 {
     elyon_smp_stability_ipi as *const () as usize as u64
+}
+
+pub fn resched_ipi_handler() -> u64 {
+    elyon_resched_ipi as *const () as usize as u64
 }

@@ -67,6 +67,22 @@ impl<const N: usize> RunQueue<N> {
         Ok(())
     }
 
+    /// Retire `task` de la file (migration) en conservant l'ordre des autres.
+    pub fn remove(&mut self, task: u64) -> bool {
+        if !self.contains(task) {
+            return false;
+        }
+        for _ in 0..self.len {
+            if let Some(entry) = self.pop_front()
+                && entry != task
+            {
+                // La place libérée par pop_front garantit que push_back réussit.
+                let _ = self.push_back(entry);
+            }
+        }
+        true
+    }
+
     pub fn pop_front(&mut self) -> Option<u64> {
         if self.len == 0 {
             return None;

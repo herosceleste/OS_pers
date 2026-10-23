@@ -14,10 +14,12 @@ use core::ptr::{addr_of_mut, read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use elyon_core::percpu_sched::{
-    self, Expectation, PlacementError, TraceEntry, TraceError as PercpuTraceError,
+    self, Expectation, Migration, Placed, PlacementError, TraceEntry,
+    TraceError as PercpuTraceError,
 };
 use elyon_core::preempt::{self, Quantum, SliceClock, TickDecision};
 use elyon_core::run_queue::{self, QueueError, RunQueue};
+use elyon_core::sync::RawSpinLock;
 use elyon_core::task_stack::{self, StackRegion};
 
 use crate::arch::x86_64::cpu;
@@ -212,7 +214,7 @@ pub fn qualify(
         queue().push_back(id.raw())?;
     }
 
-    let first = run_queue::exit_next(queue()).ok_or(SchedError::EmptyQueue)?;
+    let first = run_queue::exit_next(&mut queue()).ok_or(SchedError::EmptyQueue)?;
     task::start(task::lookup(first)?, BSP_CPU)?;
     BSP_SWITCHES.fetch_add(1, Ordering::AcqRel);
     transfer(BSP_CONTEXT, first)?;
@@ -334,7 +336,7 @@ fn try_yield() -> Result<(), SchedError> {
     }
 
     task::yield_ready(task::lookup(current)?)?;
-    let next = run_queue::yield_next(queue(), current)?;
+    let next = run_queue::yield_next(&mut queue(), current)?;
     YIELDS.fetch_add(1, Ordering::AcqRel);
     task::start(task::lookup(next)?, this_cpu() as u32)?;
 
@@ -354,7 +356,10 @@ fn try_exit() -> Result<(), SchedError> {
     task::terminate(task::lookup(current)?)?;
     EXITS.fetch_add(1, Ordering::AcqRel);
 
-    match run_queue::exit_next(queue()) {
+    // Le garde de file doit être relâché avant le switch : pas de temporaire
+    // dans le scrutin du `match`, qui vivrait jusqu'à la fin du bloc.
+    let next = run_queue::exit_next(&mut queue());
+    match next {
         Some(next) => {
             task::start(task::lookup(next)?, this_cpu() as u32)?;
             TASK_SWITCHES.fetch_add(1, Ordering::AcqRel);
@@ -451,21 +456,58 @@ fn reset() {
     RUNNING_MAX.store(0, Ordering::Release);
 }
 
-/// Run queue du CPU courant.
-fn queue() -> &'static mut RunQueue<QUEUE_CAPACITY> {
+static QUEUE_LOCKS: [RawSpinLock; MAX_SCHED_CPUS] = [const { RawSpinLock::new() }; MAX_SCHED_CPUS];
+/// Tours d'attente cumulés sur les verrous de file (contention, K004-08).
+static QUEUE_CONTENTION: AtomicU64 = AtomicU64::new(0);
+
+/// Accès exclusif à la run queue d'un CPU : le verrou est pris à la création
+/// et relâché à la destruction du garde. Toujours pris IRQ masquées, jamais
+/// conservé à travers un switch.
+pub struct QueueGuard {
+    cpu: usize,
+}
+
+impl core::ops::Deref for QueueGuard {
+    type Target = RunQueue<QUEUE_CAPACITY>;
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: `cpu < MAX_SCHED_CPUS` et le verrou de cette file est tenu
+        // pendant toute la vie du garde.
+        unsafe {
+            &*addr_of_mut!(QUEUES)
+                .cast::<RunQueue<QUEUE_CAPACITY>>()
+                .add(self.cpu)
+        }
+    }
+}
+
+impl core::ops::DerefMut for QueueGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: `cpu < MAX_SCHED_CPUS` et le verrou tenu garantit l'unicité de
+        // la référence mutable.
+        unsafe {
+            &mut *addr_of_mut!(QUEUES)
+                .cast::<RunQueue<QUEUE_CAPACITY>>()
+                .add(self.cpu)
+        }
+    }
+}
+
+impl Drop for QueueGuard {
+    fn drop(&mut self) {
+        QUEUE_LOCKS[self.cpu].unlock();
+    }
+}
+
+/// Run queue du CPU courant, verrouillée.
+fn queue() -> QueueGuard {
     queue_of(this_cpu())
 }
 
-fn queue_of(cpu: usize) -> &'static mut RunQueue<QUEUE_CAPACITY> {
-    // SAFETY: `cpu < MAX_SCHED_CPUS` (this_cpu() échoue sinon) ; une file n'est
-    // manipulée que par son CPU, IRQ masquées, ou par le BSP avant que ce CPU ne
-    // l'utilise, et aucune référence obtenue ici n'est conservée au-delà de
-    // l'appel en cours.
-    unsafe {
-        &mut *addr_of_mut!(QUEUES)
-            .cast::<RunQueue<QUEUE_CAPACITY>>()
-            .add(cpu)
-    }
+fn queue_of(cpu: usize) -> QueueGuard {
+    let spins = QUEUE_LOCKS[cpu].lock();
+    QUEUE_CONTENTION.fetch_add(spins, Ordering::Relaxed);
+    QueueGuard { cpu }
 }
 
 fn boot_rsp_slot(cpu: usize) -> *mut u64 {
@@ -615,7 +657,7 @@ fn preempt_current(current: u64) -> Result<(), SchedError> {
         BUSY_PREEMPTIONS[index].fetch_add(1, Ordering::AcqRel);
     }
     task::yield_ready(task::lookup(current)?)?;
-    let next = run_queue::yield_next(queue(), current)?;
+    let next = run_queue::yield_next(&mut queue(), current)?;
     task::start(task::lookup(next)?, this_cpu() as u32)?;
     clock().reset();
     if next == current {
@@ -687,7 +729,7 @@ pub fn run_preemptive(
         queue().push_back(id.raw())?;
     }
 
-    let first = run_queue::exit_next(queue()).ok_or(SchedError::EmptyQueue)?;
+    let first = run_queue::exit_next(&mut queue()).ok_or(SchedError::EmptyQueue)?;
     task::start(task::lookup(first)?, BSP_CPU)?;
     record_slice(first)?;
     clock().reset();
@@ -961,7 +1003,7 @@ pub fn ap_enter(cpu: usize) -> ! {
 }
 
 fn run_own_queue(cpu: usize) -> Result<(), SchedError> {
-    let first = run_queue::exit_next(queue_of(cpu)).ok_or(SchedError::EmptyQueue)?;
+    let first = run_queue::exit_next(&mut queue_of(cpu)).ok_or(SchedError::EmptyQueue)?;
     task::start(task::lookup(first)?, cpu as u32)?;
     BSP_SWITCHES.fetch_add(1, Ordering::AcqRel);
     transfer(BSP_CONTEXT, first)
@@ -1208,18 +1250,457 @@ extern "C" fn elyon_percpu_idle_entry(arg: u64) -> ! {
     PERCPU_DONE[cpu].store(true, Ordering::Release);
 
     if cpu == 0 {
-        // BSP : l'idle task se parque READY et rend la main au boot.
-        cpu::disable_interrupts();
-        let result = task::lookup(current)
-            .and_then(task::yield_ready)
-            .map_err(SchedError::Task)
-            .and_then(|_| transfer(current, BSP_CONTEXT));
-        if let Err(error) = result {
-            fail(error);
+        // BSP : l'idle task se parque READY et rend la main au boot, autant de
+        // fois que le BSP vide sa file (K004-07 puis K004-08).
+        loop {
+            cpu::disable_interrupts();
+            let result = task::lookup(current)
+                .and_then(task::yield_ready)
+                .map_err(SchedError::Task)
+                .and_then(|_| transfer(current, BSP_CONTEXT));
+            if let Err(error) = result {
+                fail(error);
+            }
         }
-        fail(SchedError::IdleState)
     }
 
     // AP : idle officielle, réveillable par IRQ, jamais terminée.
     cpu::idle_forever()
+}
+
+// --- K004-08 : IPI de rescheduling -------------------------------------------------
+
+/// Vecteur de l'IPI qui signale à un CPU qu'une tâche a été placée dans sa file.
+pub const RESCHED_VECTOR: u8 = 0xF2;
+
+static RESCHED_SENT: AtomicU64 = AtomicU64::new(0);
+static RESCHED_RECEIVED: AtomicU64 = AtomicU64::new(0);
+
+/// Handler de l'IPI de rescheduling, IRQ masquées : EOI d'abord, puis le CPU
+/// reprend la main sur sa file.
+pub fn on_resched_ipi() {
+    RESCHED_RECEIVED.fetch_add(1, Ordering::AcqRel);
+    let _ = crate::arch::x86_64::apic::eoi();
+    if let Err(error) = leave_idle_if_work() {
+        fail(error);
+    }
+}
+
+/// Si le CPU exécute son idle task et que sa file contient une tâche, l'idle
+/// repasse READY et la tâche prend le CPU, depuis l'IRQ. L'idle reprendra plus
+/// tard ici même, quand la file sera de nouveau vide, puis sortira par `iretq`.
+fn leave_idle_if_work() -> Result<(), SchedError> {
+    let cpu = this_cpu();
+    let idle = IDLE_IDS[cpu].load(Ordering::Acquire);
+    let current = CURRENT[cpu].load(Ordering::Acquire);
+    if idle == 0 || current != idle {
+        return Ok(());
+    }
+    let next = run_queue::exit_next(&mut queue());
+    let Some(next) = next else {
+        return Ok(());
+    };
+    task::yield_ready(task::lookup(idle)?)?;
+    task::start(task::lookup(next)?, cpu as u32)?;
+    TASK_SWITCHES.fetch_add(1, Ordering::AcqRel);
+    transfer(idle, next)
+}
+
+fn online_mask() -> u64 {
+    use crate::arch::x86_64::percpu as cpus;
+    let count = cpus::cpu_count().min(MAX_SCHED_CPUS);
+    (0..count)
+        .filter(|&index| cpus::is_online(index))
+        .fold(0u64, |mask, index| mask | (1 << index))
+}
+
+fn send_resched(target: usize) -> Result<(), SchedError> {
+    if !percpu_sched::should_send_ipi(target, this_cpu()) {
+        return Ok(());
+    }
+    let apic_id = crate::arch::x86_64::percpu::snapshot(target)
+        .ok_or(SchedError::UnknownCpu)?
+        .apic_id;
+    RESCHED_SENT.fetch_add(1, Ordering::AcqRel);
+    crate::arch::x86_64::apic::send_fixed(apic_id, RESCHED_VECTOR)
+        .map_err(|_| SchedError::ApTimeout)
+}
+
+/// Exécute `body` IRQ locales masquées, puis restaure IF (irq-save).
+fn irq_save<T>(body: impl FnOnce() -> T) -> T {
+    let interrupts = cpu::interrupts_enabled();
+    cpu::disable_interrupts();
+    let result = body();
+    if interrupts {
+        cpu::enable_interrupts();
+    }
+    result
+}
+
+/// Place une tâche READY dans la file du CPU choisi par son affinité et, si
+/// `notify`, prévient ce CPU par IPI de rescheduling. Retourne le CPU choisi.
+pub fn enqueue(task_id: u64, notify: bool) -> Result<usize, SchedError> {
+    irq_save(|| {
+        let snapshot = task::snapshot(task::lookup(task_id)?)?;
+        if snapshot.state != TaskState::Ready {
+            return Err(SchedError::Task(TaskError::InvalidTransition));
+        }
+        let cpu = percpu_sched::place(snapshot.affinity_mask, online_mask())
+            .map_err(SchedError::Placement)?;
+        queue_of(cpu).push_back(task_id)?;
+        if notify {
+            send_resched(cpu)?;
+        }
+        Ok(cpu)
+    })
+}
+
+/// Réveille une tâche BLOCKED ou SLEEPING : la transition vers READY est
+/// atomique ; seul le gagnant la remet en file et prévient son CPU.
+pub fn wake(task_id: u64) -> Result<usize, SchedError> {
+    irq_save(|| {
+        task::wake(task::lookup(task_id)?)?;
+        let snapshot = task::snapshot(task::lookup(task_id)?)?;
+        let cpu = percpu_sched::place(snapshot.affinity_mask, online_mask())
+            .map_err(SchedError::Placement)?;
+        queue_of(cpu).push_back(task_id)?;
+        send_resched(cpu)?;
+        Ok(cpu)
+    })
+}
+
+/// Change l'affinité d'une tâche READY en file et la migre si son CPU actuel
+/// sort du nouveau masque. Retourne la décision prise.
+pub fn set_affinity(task_id: u64, affinity: u64) -> Result<Migration, SchedError> {
+    irq_save(|| {
+        let mask = online_mask();
+        let current = (0..MAX_SCHED_CPUS).find(|&cpu| queue_of(cpu).contains(task_id));
+        let decision =
+            percpu_sched::migrate(current, affinity, mask).map_err(SchedError::Placement)?;
+        task::set_affinity(task::lookup(task_id)?, affinity)?;
+        match decision {
+            Migration::Stay(_) => {}
+            Migration::Move { from, to } => {
+                // Jamais deux verrous de file à la fois : retrait puis ajout.
+                if !queue_of(from).remove(task_id) {
+                    return Err(SchedError::Task(TaskError::UnknownTask));
+                }
+                queue_of(to).push_back(task_id)?;
+                send_resched(to)?;
+            }
+            Migration::Place(to) => {
+                queue_of(to).push_back(task_id)?;
+                send_resched(to)?;
+            }
+        }
+        Ok(decision)
+    })
+}
+
+/// Bloque la tâche courante. Le passage à BLOCKED et le choix de la suivante se
+/// font sous le verrou de la file du CPU : un réveil concurrent, qui doit
+/// prendre ce verrou pour remettre la tâche en file, ne peut pas s'intercaler.
+pub fn block_now() {
+    cpu::disable_interrupts();
+    if let Err(error) = try_block() {
+        fail(error);
+    }
+    // Reprise après un `wake()` : la tâche est RUNNING sur son CPU.
+    cpu::enable_interrupts();
+}
+
+fn try_block() -> Result<(), SchedError> {
+    let cpu = this_cpu();
+    let current = CURRENT[cpu].load(Ordering::Acquire);
+    if current == BSP_CONTEXT {
+        return Err(SchedError::NotInTaskContext);
+    }
+    let next = {
+        let mut guard = queue();
+        task::block(task::lookup(current)?)?;
+        run_queue::exit_next(&mut guard)
+    };
+    BLOCKS.fetch_add(1, Ordering::AcqRel);
+    match next {
+        Some(next) => {
+            task::start(task::lookup(next)?, cpu as u32)?;
+            TASK_SWITCHES.fetch_add(1, Ordering::AcqRel);
+            transfer(current, next)
+        }
+        None => {
+            let idle = IDLE_IDS[cpu].load(Ordering::Acquire);
+            if idle == 0 {
+                return Err(SchedError::IdleState);
+            }
+            task::start(task::lookup(idle)?, cpu as u32)?;
+            TASK_SWITCHES.fetch_add(1, Ordering::AcqRel);
+            transfer(current, idle)
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn elyon_resched_ipi_dispatch() {
+    on_resched_ipi();
+}
+
+// --- K004-08 : qualification du rescheduling à distance ---------------------------
+//
+// Les AP sont dans leur idle task (fin de K004-07). Trois scénarios, sur des CPU
+// qui tournent déjà :
+// - migration : une tâche READY placée sans IPI sur l'AP 1 change d'affinité
+//   vers le CPU 0 ; elle est retirée de la file de l'AP 1 et le BSP l'exécute ;
+// - création distante : une tâche placée sur l'AP 1 avec IPI ; l'idle de l'AP 1
+//   lui cède le CPU depuis le handler d'IPI ;
+// - blocage et réveil : une tâche placée sur un AP se bloque ; le BSP attend
+//   qu'elle soit BLOCKED puis la réveille, et elle reprend sur son CPU.
+
+const REMOTE_ARG_BASE: u64 = 0xE1_0408_0000;
+const ROLE_SPAWN: u64 = 0;
+const ROLE_BLOCK: u64 = 1;
+const ROLE_MIGRATE: u64 = 2;
+const REMOTE_TASKS: u64 = 3;
+const REMOTE_TRACE_CAPACITY: usize = 8;
+/// Attente maximale d'un changement d'état distant : 5000 × 1 ms.
+const REMOTE_WAIT_STEPS: u32 = 5_000;
+
+static BLOCKS: AtomicU64 = AtomicU64::new(0);
+static REMOTE_DONE: AtomicU64 = AtomicU64::new(0);
+static REMOTE_TRACE: [AtomicU64; REMOTE_TRACE_CAPACITY] =
+    [const { AtomicU64::new(0) }; REMOTE_TRACE_CAPACITY];
+static REMOTE_TRACE_LEN: AtomicUsize = AtomicUsize::new(0);
+
+pub struct RemoteQualification {
+    pub cpus: usize,
+    pub spawned: u64,
+    pub spawn_cpu: usize,
+    pub blocked: u64,
+    pub block_cpu: usize,
+    pub migrated: u64,
+    pub migrate_from: usize,
+    pub migrate_to: usize,
+    pub ipi_sent: u64,
+    pub ipi_received: u64,
+    pub blocks: u64,
+    pub contention: u64,
+    pub idle_running_aps: usize,
+    pub running_max: usize,
+    pub canaries_ok: usize,
+}
+
+/// `Ok(None)` sur une machine sans AP : rien à qualifier à distance.
+pub fn qualify_remote(
+    bsp_stack_start: u64,
+    bsp_stack_end: u64,
+    identity_limit: u64,
+) -> Result<Option<RemoteQualification>, SchedError> {
+    cpu::disable_interrupts();
+    if this_cpu() != 0 {
+        return Err(SchedError::UnknownCpu);
+    }
+    let mask = online_mask();
+    let cpus = mask.count_ones() as usize;
+    if cpus < 2 {
+        return Ok(None);
+    }
+    let bsp = StackRegion {
+        start: bsp_stack_start,
+        end: bsp_stack_end,
+    };
+    let spawn_cpu = 1usize;
+    let block_cpu = if cpus >= 3 { 2 } else { 1 };
+    let migrate_from = 1usize;
+    let migrate_to = 0usize;
+
+    BLOCKS.store(0, Ordering::Release);
+    REMOTE_DONE.store(0, Ordering::Release);
+    REMOTE_TRACE_LEN.store(0, Ordering::Release);
+    RESCHED_SENT.store(0, Ordering::Release);
+    RESCHED_RECEIVED.store(0, Ordering::Release);
+    RUNNING_MAX.store(0, Ordering::Release);
+    let entry = elyon_remote_task_entry as *const () as usize as u64;
+
+    // Migration : placée sans IPI sur l'AP 1, qui reste donc en idle, puis
+    // déplacée vers le CPU 0 avant d'avoir jamais tourné.
+    let migrated = spawn_on(
+        1 << migrate_from,
+        entry,
+        REMOTE_ARG_BASE + ROLE_MIGRATE,
+        bsp,
+        identity_limit,
+    )?;
+    if enqueue(migrated.0, false)? != migrate_from {
+        return Err(SchedError::WrongCpu);
+    }
+    match set_affinity(migrated.0, 1 << migrate_to)? {
+        Migration::Move { from, to } if from == migrate_from && to == migrate_to => {}
+        _ => return Err(SchedError::WrongCpu),
+    }
+
+    // Création distante sur un AP déjà en idle.
+    let spawned = spawn_on(
+        1 << spawn_cpu,
+        entry,
+        REMOTE_ARG_BASE + ROLE_SPAWN,
+        bsp,
+        identity_limit,
+    )?;
+    if enqueue(spawned.0, true)? != spawn_cpu {
+        return Err(SchedError::WrongCpu);
+    }
+
+    // Blocage sur un AP puis réveil depuis le BSP.
+    let blocked = spawn_on(
+        1 << block_cpu,
+        entry,
+        REMOTE_ARG_BASE + ROLE_BLOCK,
+        bsp,
+        identity_limit,
+    )?;
+    if enqueue(blocked.0, true)? != block_cpu {
+        return Err(SchedError::WrongCpu);
+    }
+    wait_until(|| {
+        task::lookup(blocked.0)
+            .and_then(task::snapshot)
+            .is_ok_and(|snapshot| snapshot.state == TaskState::Blocked)
+    })?;
+    if wake(blocked.0)? != block_cpu {
+        return Err(SchedError::WrongCpu);
+    }
+
+    // Le BSP exécute la tâche migrée ; son idle task lui rend la main.
+    run_own_queue(0)?;
+
+    wait_until(|| REMOTE_DONE.load(Ordering::Acquire) == REMOTE_TASKS)?;
+    // Les AP reviennent dans leur idle task juste après la sortie de leur tâche.
+    let idles: [u64; MAX_SCHED_CPUS] =
+        core::array::from_fn(|index| IDLE_IDS[index].load(Ordering::Acquire));
+    wait_until(|| (1..cpus).all(|index| CURRENT[index].load(Ordering::Acquire) == idles[index]))?;
+    wait_until(|| {
+        RESCHED_RECEIVED.load(Ordering::Acquire) == RESCHED_SENT.load(Ordering::Acquire)
+    })?;
+
+    let trace_len = REMOTE_TRACE_LEN
+        .load(Ordering::Acquire)
+        .min(REMOTE_TRACE_CAPACITY);
+    let mut trace = [TraceEntry { cpu: 0, task: 0 }; REMOTE_TRACE_CAPACITY];
+    for (index, slot) in trace.iter_mut().enumerate().take(trace_len) {
+        let raw = REMOTE_TRACE[index].load(Ordering::Acquire);
+        *slot = TraceEntry {
+            cpu: ((raw >> 56) as u32).wrapping_sub(1),
+            task: raw & ((1 << 56) - 1),
+        };
+    }
+    percpu_sched::check_placement(
+        &trace[..trace_len],
+        &[
+            Placed {
+                task: spawned.0,
+                cpu: spawn_cpu as u32,
+                runs: 1,
+            },
+            Placed {
+                task: blocked.0,
+                cpu: block_cpu as u32,
+                runs: 2,
+            },
+            Placed {
+                task: migrated.0,
+                cpu: migrate_to as u32,
+                runs: 1,
+            },
+        ],
+    )
+    .map_err(|error: PercpuTraceError| {
+        kprintln!("[sched-ipi] trace_error={:?}", error);
+        SchedError::Trace
+    })?;
+
+    for id in [spawned.0, blocked.0, migrated.0] {
+        if task::snapshot(task::lookup(id)?)?.state != TaskState::Dead {
+            return Err(SchedError::TaskNotDead);
+        }
+    }
+    let mut idle_running_aps = 0;
+    for (index, &idle) in idles.iter().enumerate().take(cpus).skip(1) {
+        let snapshot = task::snapshot(task::lookup(idle)?)?;
+        if snapshot.state != TaskState::Running || snapshot.current_cpu != index as u32 {
+            return Err(SchedError::IdleState);
+        }
+        idle_running_aps += 1;
+    }
+
+    let ipi_sent = RESCHED_SENT.load(Ordering::Acquire);
+    let ipi_received = RESCHED_RECEIVED.load(Ordering::Acquire);
+    // Création distante, première mise en file du bloqué, réveil : trois IPI ;
+    // la migration vers le CPU 0 n'en demande pas.
+    if ipi_sent != 3 || ipi_received != ipi_sent || BLOCKS.load(Ordering::Acquire) != 1 {
+        return Err(SchedError::CountMismatch);
+    }
+
+    let mut canaries_ok = 0;
+    for region in [spawned.1, blocked.1, migrated.1] {
+        if !stacks::canary_intact_at(region) {
+            return Err(SchedError::CanaryCorrupted);
+        }
+        canaries_ok += 1;
+    }
+
+    Ok(Some(RemoteQualification {
+        cpus,
+        spawned: spawned.0,
+        spawn_cpu,
+        blocked: blocked.0,
+        block_cpu,
+        migrated: migrated.0,
+        migrate_from,
+        migrate_to,
+        ipi_sent,
+        ipi_received,
+        blocks: BLOCKS.load(Ordering::Acquire),
+        contention: QUEUE_CONTENTION.load(Ordering::Acquire),
+        idle_running_aps,
+        running_max: RUNNING_MAX.load(Ordering::Acquire),
+        canaries_ok,
+    }))
+}
+
+fn wait_until(mut condition: impl FnMut() -> bool) -> Result<(), SchedError> {
+    for _ in 0..REMOTE_WAIT_STEPS {
+        if condition() {
+            return Ok(());
+        }
+        timer::pit_delay_us(1_000)?;
+    }
+    if condition() {
+        Ok(())
+    } else {
+        Err(SchedError::ApTimeout)
+    }
+}
+
+fn record_remote(cpu: usize, task_id: u64) {
+    let slot = REMOTE_TRACE_LEN.fetch_add(1, Ordering::AcqRel);
+    match REMOTE_TRACE.get(slot) {
+        Some(entry) => entry.store(((cpu as u64 + 1) << 56) | task_id, Ordering::Release),
+        None => fail(SchedError::TraceOverflow),
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn elyon_remote_task_entry(arg: u64) -> ! {
+    let cpu = this_cpu();
+    let current = CURRENT[cpu].load(Ordering::Acquire);
+    let role = arg.wrapping_sub(REMOTE_ARG_BASE);
+    if role >= REMOTE_TASKS {
+        fail(SchedError::ArgMismatch);
+    }
+    record_remote(cpu, current);
+    if role == ROLE_BLOCK {
+        block_now();
+        record_remote(this_cpu(), current);
+    }
+    REMOTE_DONE.fetch_add(1, Ordering::AcqRel);
+    exit_now()
 }

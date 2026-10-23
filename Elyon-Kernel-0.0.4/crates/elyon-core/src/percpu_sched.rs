@@ -53,6 +53,7 @@ pub enum TraceError {
     WrongCpu { task: u64, cpu: u32 },
     OrderBroken { cpu: u32 },
     IdleMissing { cpu: u32 },
+    RunCount { task: u64 },
 }
 
 /// Vérifie, dans cet ordre :
@@ -117,4 +118,77 @@ fn owner_of(task: u64, expectation: &Expectation<'_>) -> Option<usize> {
         .tasks
         .iter()
         .position(|tasks| tasks.contains(&task))
+}
+
+/// Un IPI de rescheduling n'est utile que vers un autre CPU : le CPU courant
+/// voit sa propre file au prochain passage dans le scheduler.
+pub const fn should_send_ipi(target_cpu: usize, this_cpu: usize) -> bool {
+    target_cpu != this_cpu
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Migration {
+    /// La tâche reste sur son CPU, toujours autorisé.
+    Stay(usize),
+    /// Le CPU courant sort de l'affinité : la tâche change de file.
+    Move { from: usize, to: usize },
+    /// La tâche n'était dans aucune file.
+    Place(usize),
+}
+
+/// Décision après un changement d'affinité de la tâche placée sur `current`.
+pub fn migrate(
+    current: Option<usize>,
+    affinity: u64,
+    online_mask: u64,
+) -> Result<Migration, PlacementError> {
+    if affinity == 0 {
+        return Err(PlacementError::EmptyAffinity);
+    }
+    if let Some(cpu) = current
+        && cpu < 64
+        && affinity & online_mask & (1 << cpu) != 0
+    {
+        return Ok(Migration::Stay(cpu));
+    }
+    let to = place(affinity, online_mask)?;
+    Ok(match current {
+        Some(from) => Migration::Move { from, to },
+        None => Migration::Place(to),
+    })
+}
+
+/// CPU et nombre de passages attendus pour une tâche.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Placed {
+    pub task: u64,
+    pub cpu: u32,
+    pub runs: u64,
+}
+
+/// Chaque passage concerne une tâche attendue, sur son CPU ; puis chaque tâche
+/// a exactement le nombre de passages prévu.
+pub fn check_placement(trace: &[TraceEntry], expected: &[Placed]) -> Result<(), TraceError> {
+    for entry in trace {
+        let placed = expected
+            .iter()
+            .find(|placed| placed.task == entry.task)
+            .ok_or(TraceError::UnknownTask { task: entry.task })?;
+        if placed.cpu != entry.cpu {
+            return Err(TraceError::WrongCpu {
+                task: entry.task,
+                cpu: entry.cpu,
+            });
+        }
+    }
+    for placed in expected {
+        let runs = trace
+            .iter()
+            .filter(|entry| entry.task == placed.task)
+            .count() as u64;
+        if runs != placed.runs {
+            return Err(TraceError::RunCount { task: placed.task });
+        }
+    }
+    Ok(())
 }

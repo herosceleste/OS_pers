@@ -105,10 +105,6 @@ pub struct TaskSnapshot {
     )]
     pub id: TaskId,
     pub state: TaskState,
-    #[expect(
-        dead_code,
-        reason = "API du modèle de tâche K004-01, pas encore consommée au boot"
-    )]
     pub affinity_mask: u64,
     pub current_cpu: u32,
 }
@@ -337,6 +333,17 @@ pub fn set_fpu_area(id: TaskId, area: u64) -> Result<(), TaskError> {
 pub fn fpu_area(id: TaskId) -> Result<u64, TaskError> {
     let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
     Ok(slot.fpu_area.load(Ordering::Acquire))
+}
+
+/// Change le masque d'affinité d'une tâche (K004-08). La migration éventuelle
+/// entre files est décidée et effectuée par le scheduler.
+pub fn set_affinity(id: TaskId, affinity_mask: u64) -> Result<(), TaskError> {
+    if affinity_mask == 0 {
+        return Err(TaskError::InvalidAffinity);
+    }
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    slot.affinity_mask.store(affinity_mask, Ordering::Release);
+    Ok(())
 }
 
 /// Nombre de tâches RUNNING sur le CPU logique `cpu`.
