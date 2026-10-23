@@ -714,6 +714,12 @@ pub fn set_busy(index: usize, busy: bool) {
     BUSY[index].store(busy, Ordering::Release);
 }
 
+/// Préemptions subies par chaque tâche pendant qu'elle était marquée occupée,
+/// lors du dernier `run_preemptive`.
+pub fn busy_preemptions() -> [u64; PREEMPT_TASKS] {
+    core::array::from_fn(|index| BUSY_PREEMPTIONS[index].load(Ordering::Acquire))
+}
+
 /// Ajoute `amount` au compteur de progression de la tâche `index`.
 pub fn add_progress(index: usize, amount: u64) {
     COUNTERS[index].fetch_add(amount, Ordering::AcqRel);
