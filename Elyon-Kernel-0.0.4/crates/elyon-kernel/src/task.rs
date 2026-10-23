@@ -339,6 +339,17 @@ pub fn fpu_area(id: TaskId) -> Result<u64, TaskError> {
     Ok(slot.fpu_area.load(Ordering::Acquire))
 }
 
+/// Nombre de tâches RUNNING sur le CPU logique `cpu`.
+pub fn running_count_on(cpu: u32) -> usize {
+    TASKS
+        .iter()
+        .filter(|slot| {
+            slot.state.load(Ordering::Acquire) == STATE_RUNNING
+                && slot.current_cpu.load(Ordering::Acquire) == cpu
+        })
+        .count()
+}
+
 /// Nombre de tâches actuellement RUNNING, tous CPU confondus.
 pub fn running_count() -> usize {
     TASKS

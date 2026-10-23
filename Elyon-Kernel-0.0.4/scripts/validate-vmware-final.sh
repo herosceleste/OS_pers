@@ -104,6 +104,13 @@ require_regex "^\[fpu\] fxsr=1 sse2=1 xsave=[01] avx=[01] xcr0_supported=0x[0-9a
 require_regex "^\[fpu-integrity\] tasks=[0-9]+,[0-9]+,[0-9]+ strategy=(xsave|fxsave) avx=(1 xmm=16 ymm_high=16|0 xmm=16 ymm_high=0) mxcsr=1 preemptions=(3[0-9]|[4-9][0-9]|[1-9][0-9]{2,}) min_slices=(1[0-9]|[2-9][0-9]) busy_preemptions=(1[0-9]|[2-9][0-9]|[1-9][0-9]{2,}),(1[0-9]|[2-9][0-9]|[1-9][0-9]{2,}),(1[0-9]|[2-9][0-9]|[1-9][0-9]{2,}) iterations=[1-9][0-9]*,[1-9][0-9]*,[1-9][0-9]* corruptions=0 exits=3 running_max=1 eoi_failures=0 canaries_ok=3\s*$"   "K004-06: synthèse d'isolation SIMD invalide"
 require_fixed "ELYON_SCHED_FPU_READY" "K004-06: marqueur FPU absent"
 
+# K004-07 : même contrôle indépendant que le test QEMU, appliqué au log VMware.
+ELYON_CHECK_LOG="$LOG" ELYON_CPUS=4 bash "$ROOT/scripts/test-sched-percpu-qemu.sh" >/dev/null || {
+  echo "[FAIL] K004-07: scheduler per-CPU non conforme sous VMware" >&2
+  ELYON_CHECK_LOG="$LOG" ELYON_CPUS=4 bash "$ROOT/scripts/test-sched-percpu-qemu.sh" 2>&1 >/dev/null | head -3 >&2
+  exit 1
+}
+
 require_fixed "ELYON_KERNEL_READY_0_0_4" "boot nominal final absent"
 
 if grep -Eq '\[KERNEL PANIC\]|\[EXCEPTION\]|\[[^]]+\] FAILED|ELYON_[A-Z_]+_FAILED' "$LOG"; then
@@ -112,4 +119,4 @@ if grep -Eq '\[KERNEL PANIC\]|\[EXCEPTION\]|\[[^]]+\] FAILED|ELYON_[A-Z_]+_FAILE
   exit 1
 fi
 
-echo "[PASS] VMware 4 vCPU: Elyon 0.0.4 K003-01..12 et K004-01..06 validés sur build_id=$EXPECTED_BUILD_ID"
+echo "[PASS] VMware 4 vCPU: Elyon 0.0.4 K003-01..12 et K004-01..07 validés sur build_id=$EXPECTED_BUILD_ID"

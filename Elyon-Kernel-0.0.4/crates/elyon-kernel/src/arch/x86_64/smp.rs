@@ -437,7 +437,7 @@ extern "sysv64" fn elyon_ap_entry(cpu_index: u64, expected_apic_id: u64) -> ! {
     kprintln!("ELYON_AP_READY cpu={} apic_id={}", index, observed_apic_id);
     kprintln!("ELYON_AP_IDLE cpu={} apic_id={}", index, observed_apic_id);
 
-    cpu::idle_forever()
+    crate::sched::ap_enter(index)
 }
 
 #[unsafe(no_mangle)]

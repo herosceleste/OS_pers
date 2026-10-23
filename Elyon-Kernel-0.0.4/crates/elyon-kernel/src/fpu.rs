@@ -29,7 +29,9 @@ static USE_XSAVE: AtomicBool = AtomicBool::new(false);
 static XCR0: AtomicU64 = AtomicU64::new(0);
 static AREA_SIZE: AtomicUsize = AtomicUsize::new(0);
 static INIT_AREA: AtomicU64 = AtomicU64::new(0);
-static BSP_AREA: AtomicU64 = AtomicU64::new(0);
+/// Nombre maximal de CPU dont le contexte de départ a une zone FPU.
+pub const MAX_FPU_CPUS: usize = 8;
+static CPU_AREAS: [AtomicU64; MAX_FPU_CPUS] = [const { AtomicU64::new(0) }; MAX_FPU_CPUS];
 
 pub struct FpuSetup {
     pub features: CpuFeatures,
@@ -46,6 +48,7 @@ pub enum FpuSetupError {
     AllocationFailed,
     Xcr0Mismatch,
     NotEnabled,
+    CpuOutOfRange,
 }
 
 impl FpuSetupError {
@@ -55,6 +58,7 @@ impl FpuSetupError {
             Self::AllocationFailed => "PMM could not allocate an FPU save area",
             Self::Xcr0Mismatch => "XCR0 does not hold the requested components",
             Self::NotEnabled => "FPU state management is not enabled",
+            Self::CpuOutOfRange => "CPU index beyond the FPU per-CPU capacity",
         }
     }
 }
@@ -136,7 +140,7 @@ pub fn init() -> Result<FpuSetup, FpuSetupError> {
     let image = unsafe { core::slice::from_raw_parts_mut(init_area as *mut u8, layout.size) };
     fpu::write_init_image(image);
     INIT_AREA.store(init_area, Ordering::Release);
-    BSP_AREA.store(allocate_area(layout)?, Ordering::Release);
+    CPU_AREAS[0].store(allocate_area(layout)?, Ordering::Release);
 
     ENABLED.store(true, Ordering::Release);
     // SAFETY: `init_area` est une image d'état initial valide pour la stratégie
@@ -153,12 +157,58 @@ pub fn init() -> Result<FpuSetup, FpuSetupError> {
     })
 }
 
+/// Prépare, depuis le BSP, la zone FPU du contexte de départ du CPU `cpu`.
+/// Le PMM n'étant pas verrouillé, les AP n'allouent jamais eux-mêmes.
+pub fn prepare_cpu_area(cpu: usize) -> Result<(), FpuSetupError> {
+    let slot = CPU_AREAS.get(cpu).ok_or(FpuSetupError::CpuOutOfRange)?;
+    if slot.load(Ordering::Acquire) == 0 {
+        slot.store(new_task_area()?, Ordering::Release);
+    }
+    Ok(())
+}
+
+/// Applique sur un AP la configuration FPU retenue par le BSP : CR0, CR4,
+/// XCR0 (relu par `xgetbv`), puis état initial. CR4 et XCR0 sont propres à
+/// chaque CPU ; sans cela, le premier `xsave` d'un switch sur l'AP fault.
+pub fn init_secondary() -> Result<(), FpuSetupError> {
+    if !enabled() {
+        return Err(FpuSetupError::NotEnabled);
+    }
+    let use_xsave = USE_XSAVE.load(Ordering::Acquire);
+    let cr0 = (read_cr0() | CR0_MP) & !(CR0_EM | CR0_TS);
+    let mut cr4 = read_cr4() | CR4_OSFXSR | CR4_OSXMMEXCPT;
+    if use_xsave {
+        cr4 |= CR4_OSXSAVE;
+    }
+    // SAFETY: mêmes réglages que init() sur le BSP, validés par CPUID ; les AP
+    // d'une même machine exposent les mêmes capacités FPU.
+    unsafe {
+        asm!("mov cr0, {}", in(reg) cr0, options(nostack, preserves_flags));
+        asm!("mov cr4, {}", in(reg) cr4, options(nostack, preserves_flags));
+    }
+    if use_xsave {
+        let xcr0 = XCR0.load(Ordering::Acquire);
+        // SAFETY: CR4.OSXSAVE vient d'être positionné sur ce CPU.
+        unsafe { xsetbv(xcr0) };
+        // SAFETY: CR4.OSXSAVE est positionné.
+        if unsafe { xgetbv() } != xcr0 {
+            return Err(FpuSetupError::Xcr0Mismatch);
+        }
+    }
+    // SAFETY: image initiale valide pour la stratégie retenue.
+    unsafe { restore(INIT_AREA.load(Ordering::Acquire)) };
+    Ok(())
+}
+
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Acquire)
 }
 
-pub fn bsp_area() -> u64 {
-    BSP_AREA.load(Ordering::Acquire)
+/// Zone FPU du contexte de départ (hors tâche) du CPU logique `cpu`, 0 si absente.
+pub fn cpu_area(cpu: usize) -> u64 {
+    CPU_AREAS
+        .get(cpu)
+        .map_or(0, |area| area.load(Ordering::Acquire))
 }
 
 /// Zone de sauvegarde d'une tâche neuve, initialisée à l'état propre.
@@ -192,7 +242,7 @@ pub fn new_task_area() -> Result<u64, FpuSetupError> {
 ///
 /// # Safety
 ///
-/// `area` doit être une zone obtenue par [`new_task_area`] ou [`bsp_area`],
+/// `area` doit être une zone obtenue par [`new_task_area`] ou [`cpu_area`],
 /// réservée au contexte courant.
 pub unsafe fn save(area: u64) {
     if USE_XSAVE.load(Ordering::Acquire) {

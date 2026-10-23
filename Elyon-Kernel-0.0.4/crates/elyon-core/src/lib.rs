@@ -10,6 +10,7 @@ pub mod acpi;
 pub mod cpu_context;
 pub mod fpu;
 pub mod ioapic;
+pub mod percpu_sched;
 pub mod pit;
 pub mod preempt;
 pub mod run_queue;
