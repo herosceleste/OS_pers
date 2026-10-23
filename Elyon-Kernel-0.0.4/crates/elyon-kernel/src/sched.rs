@@ -10,7 +10,7 @@
 //! Tout se déroule sur le BSP, interruptions masquées : la file n'a pas besoin
 //! de verrou à ce stade (K004-07 et K004-10 traiteront le per-CPU et le SMP).
 
-use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
+use core::ptr::{addr_of_mut, read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use elyon_core::preempt::{self, Quantum, SliceClock, TickDecision};
@@ -42,10 +42,18 @@ const EXPECTED_TASK_SWITCHES: u64 = TRACE_CAPACITY as u64 - 1;
 /// BSP → première tâche, puis dernière sortie → BSP.
 const EXPECTED_BSP_SWITCHES: u64 = 2;
 
-static mut QUEUE: RunQueue<QUEUE_CAPACITY> = RunQueue::new();
-static mut BSP_RSP: u64 = 0;
+/// Nombre maximal de CPU ayant leur propre état de scheduler.
+pub const MAX_SCHED_CPUS: usize = 8;
 
-static CURRENT: AtomicU64 = AtomicU64::new(BSP_CONTEXT);
+// État de scheduler propre à chaque CPU logique : sa run queue, le RSP de son
+// contexte de départ (hors tâche) et la tâche qu'il exécute. Chaque CPU ne
+// touche que son propre slot, IRQ masquées.
+static mut QUEUES: [RunQueue<QUEUE_CAPACITY>; MAX_SCHED_CPUS] =
+    [const { RunQueue::new() }; MAX_SCHED_CPUS];
+static mut BOOT_RSP: [u64; MAX_SCHED_CPUS] = [0; MAX_SCHED_CPUS];
+
+static CURRENT: [AtomicU64; MAX_SCHED_CPUS] =
+    [const { AtomicU64::new(BSP_CONTEXT) }; MAX_SCHED_CPUS];
 static IDS: [AtomicU64; QUALIFY_TASKS] = [const { AtomicU64::new(0) }; QUALIFY_TASKS];
 static TRACE: [AtomicU64; TRACE_CAPACITY] = [const { AtomicU64::new(0) }; TRACE_CAPACITY];
 static TRACE_LEN: AtomicUsize = AtomicUsize::new(0);
@@ -96,6 +104,7 @@ pub enum SchedError {
     NoProgress,
     InterruptsLeftEnabled,
     FpuAreaMissing,
+    UnknownCpu,
 }
 
 impl SchedError {
@@ -125,6 +134,7 @@ impl SchedError {
             Self::NoProgress => "a preemptible task made no progress",
             Self::InterruptsLeftEnabled => "BSP resumed with interrupts enabled",
             Self::FpuAreaMissing => "context has no FPU save area while FPU switching is on",
+            Self::UnknownCpu => "current CPU is unknown or beyond the scheduler capacity",
         }
     }
 }
@@ -195,7 +205,7 @@ pub fn qualify(
     transfer(BSP_CONTEXT, first)?;
 
     // Le BSP ne reprend la main qu'après la sortie de la dernière tâche.
-    if CURRENT.load(Ordering::Acquire) != BSP_CONTEXT {
+    if CURRENT[this_cpu()].load(Ordering::Acquire) != BSP_CONTEXT {
         return Err(SchedError::NotBackOnBsp);
     }
 
@@ -255,7 +265,7 @@ pub fn qualify(
     }
 
     // SAFETY: lecture d'un u64 statique écrit uniquement par le switch.
-    let bsp_rsp = unsafe { read_volatile(addr_of!(BSP_RSP)) };
+    let bsp_rsp = unsafe { read_volatile(boot_rsp_slot(this_cpu())) };
     if !task_stack::rsp_inside(bsp, bsp_rsp) {
         return Err(SchedError::BspRspOutsideKernelStack);
     }
@@ -305,7 +315,7 @@ pub fn exit_now() -> ! {
 }
 
 fn try_yield() -> Result<(), SchedError> {
-    let current = CURRENT.load(Ordering::Acquire);
+    let current = CURRENT[this_cpu()].load(Ordering::Acquire);
     if current == BSP_CONTEXT {
         return Err(SchedError::NotInTaskContext);
     }
@@ -313,7 +323,7 @@ fn try_yield() -> Result<(), SchedError> {
     task::yield_ready(task::lookup(current)?)?;
     let next = run_queue::yield_next(queue(), current)?;
     YIELDS.fetch_add(1, Ordering::AcqRel);
-    task::start(task::lookup(next)?, BSP_CPU)?;
+    task::start(task::lookup(next)?, this_cpu() as u32)?;
 
     if next != current {
         TASK_SWITCHES.fetch_add(1, Ordering::AcqRel);
@@ -323,7 +333,7 @@ fn try_yield() -> Result<(), SchedError> {
 }
 
 fn try_exit() -> Result<(), SchedError> {
-    let current = CURRENT.load(Ordering::Acquire);
+    let current = CURRENT[this_cpu()].load(Ordering::Acquire);
     if current == BSP_CONTEXT {
         return Err(SchedError::NotInTaskContext);
     }
@@ -333,7 +343,7 @@ fn try_exit() -> Result<(), SchedError> {
 
     match run_queue::exit_next(queue()) {
         Some(next) => {
-            task::start(task::lookup(next)?, BSP_CPU)?;
+            task::start(task::lookup(next)?, this_cpu() as u32)?;
             TASK_SWITCHES.fetch_add(1, Ordering::AcqRel);
             transfer(current, next)
         }
@@ -348,7 +358,7 @@ fn try_exit() -> Result<(), SchedError> {
 /// BSP). Les transitions d'état sont faites par l'appelant ; l'invariant « une
 /// seule tâche RUNNING » est vérifié juste avant le switch.
 fn transfer(current: u64, next: u64) -> Result<(), SchedError> {
-    let running = task::running_count();
+    let running = task::running_count_on(this_cpu() as u32);
     RUNNING_MAX.fetch_max(running, Ordering::AcqRel);
     let expected_running = if next == BSP_CONTEXT { 0 } else { 1 };
     if running != expected_running {
@@ -356,13 +366,13 @@ fn transfer(current: u64, next: u64) -> Result<(), SchedError> {
     }
 
     let old_rsp = if current == BSP_CONTEXT {
-        addr_of_mut!(BSP_RSP)
+        boot_rsp_slot(this_cpu())
     } else {
         task::saved_rsp_ptr(task::lookup(current)?)?
     };
     let new_rsp = if next == BSP_CONTEXT {
         // SAFETY: lecture d'un u64 statique écrit uniquement par le switch.
-        unsafe { read_volatile(addr_of!(BSP_RSP)) }
+        unsafe { read_volatile(boot_rsp_slot(this_cpu())) }
     } else {
         // SAFETY: l'emplacement appartient au slot statique de la tâche ; il a
         // été écrit par qualify() ou par le dernier switch qui l'a quittée.
@@ -380,7 +390,7 @@ fn transfer(current: u64, next: u64) -> Result<(), SchedError> {
         }
     }
 
-    CURRENT.store(next, Ordering::Release);
+    CURRENT[this_cpu()].store(next, Ordering::Release);
     // SAFETY: `new_rsp` désigne le frame initial ou celui laissé par le dernier
     // switch de ce contexte, sur sa propre pile ; aucun verrou n'est tenu.
     unsafe { context::switch(old_rsp, new_rsp) };
@@ -389,7 +399,7 @@ fn transfer(current: u64, next: u64) -> Result<(), SchedError> {
 
 fn fpu_area_of(context: u64) -> Result<u64, SchedError> {
     let area = if context == BSP_CONTEXT {
-        fpu::bsp_area()
+        fpu::cpu_area(this_cpu())
     } else {
         task::fpu_area(task::lookup(context)?)?
     };
@@ -401,7 +411,7 @@ fn fpu_area_of(context: u64) -> Result<u64, SchedError> {
 
 fn reset() {
     *queue() = RunQueue::new();
-    CURRENT.store(BSP_CONTEXT, Ordering::Release);
+    CURRENT[this_cpu()].store(BSP_CONTEXT, Ordering::Release);
     TRACE_LEN.store(0, Ordering::Release);
     for entry in &TRACE {
         entry.store(0, Ordering::Release);
@@ -419,10 +429,38 @@ fn reset() {
     RUNNING_MAX.store(0, Ordering::Release);
 }
 
+/// Run queue du CPU courant.
 fn queue() -> &'static mut RunQueue<QUEUE_CAPACITY> {
-    // SAFETY: la file n'est manipulée que sur le BSP, interruptions masquées, et
-    // aucune référence obtenue ici n'est conservée au-delà de l'appel en cours.
-    unsafe { &mut *addr_of_mut!(QUEUE) }
+    queue_of(this_cpu())
+}
+
+fn queue_of(cpu: usize) -> &'static mut RunQueue<QUEUE_CAPACITY> {
+    // SAFETY: `cpu < MAX_SCHED_CPUS` (this_cpu() échoue sinon) ; une file n'est
+    // manipulée que par son CPU, IRQ masquées, ou par le BSP avant que ce CPU ne
+    // l'utilise, et aucune référence obtenue ici n'est conservée au-delà de
+    // l'appel en cours.
+    unsafe {
+        &mut *addr_of_mut!(QUEUES)
+            .cast::<RunQueue<QUEUE_CAPACITY>>()
+            .add(cpu)
+    }
+}
+
+fn boot_rsp_slot(cpu: usize) -> *mut u64 {
+    // SAFETY: `cpu < MAX_SCHED_CPUS` ; seul un pointeur brut est formé.
+    unsafe { addr_of_mut!(BOOT_RSP).cast::<u64>().add(cpu) }
+}
+
+/// Index logique du CPU courant, retrouvé par son APIC ID. Fail-closed si le
+/// CPU est inconnu ou au-delà de `MAX_SCHED_CPUS`.
+pub fn this_cpu() -> usize {
+    match crate::arch::x86_64::apic::current_id()
+        .ok()
+        .and_then(crate::arch::x86_64::percpu::index_of_apic)
+    {
+        Some(cpu) if cpu < MAX_SCHED_CPUS => cpu,
+        _ => fail(SchedError::UnknownCpu),
+    }
 }
 
 fn record(current: u64) -> Result<(), SchedError> {
@@ -458,7 +496,7 @@ fn fail(error: SchedError) -> ! {
 
 #[unsafe(no_mangle)]
 extern "C" fn elyon_sched_task_entry(arg: u64) -> ! {
-    let current = CURRENT.load(Ordering::Acquire);
+    let current = CURRENT[this_cpu()].load(Ordering::Acquire);
     if let Err(error) = check_arg(current, arg) {
         fail(error);
     }
@@ -499,7 +537,8 @@ const QUANTUM: Quantum = match Quantum::new(QUANTUM_TICKS) {
 /// Part équitable minimale : la trace de 31 tranches en donne au moins 10 à chacune.
 const MIN_FAIR_SLICES: u64 = PREEMPT_TARGET / PREEMPT_TASKS as u64;
 
-static mut CLOCK: SliceClock = SliceClock::new(QUANTUM);
+static mut CLOCKS: [SliceClock; MAX_SCHED_CPUS] =
+    [const { SliceClock::new(QUANTUM) }; MAX_SCHED_CPUS];
 
 static PREEMPT_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Drapeau d'arrêt de la charge préemptible, lu aussi par l'assembleur de la
@@ -534,7 +573,7 @@ pub fn on_timer_tick() {
     if !PREEMPT_ACTIVE.load(Ordering::Acquire) {
         return;
     }
-    let current = CURRENT.load(Ordering::Acquire);
+    let current = CURRENT[this_cpu()].load(Ordering::Acquire);
     if current == BSP_CONTEXT {
         return;
     }
@@ -555,7 +594,7 @@ fn preempt_current(current: u64) -> Result<(), SchedError> {
     }
     task::yield_ready(task::lookup(current)?)?;
     let next = run_queue::yield_next(queue(), current)?;
-    task::start(task::lookup(next)?, BSP_CPU)?;
+    task::start(task::lookup(next)?, this_cpu() as u32)?;
     clock().reset();
     if next == current {
         return Ok(());
@@ -644,7 +683,7 @@ pub fn run_preemptive(
     if interrupts_left_enabled {
         return Err(SchedError::InterruptsLeftEnabled);
     }
-    if CURRENT.load(Ordering::Acquire) != BSP_CONTEXT {
+    if CURRENT[this_cpu()].load(Ordering::Acquire) != BSP_CONTEXT {
         return Err(SchedError::NotBackOnBsp);
     }
 
@@ -715,7 +754,7 @@ pub fn run_preemptive(
     }
 
     // SAFETY: lecture d'un u64 statique écrit uniquement par le switch.
-    let bsp_rsp = unsafe { read_volatile(addr_of!(BSP_RSP)) };
+    let bsp_rsp = unsafe { read_volatile(boot_rsp_slot(this_cpu())) };
     if !task_stack::rsp_inside(bsp, bsp_rsp) {
         return Err(SchedError::BspRspOutsideKernelStack);
     }
@@ -736,7 +775,7 @@ pub fn run_preemptive(
 /// Index de la tâche préemptible courante, après contrôle de son argument
 /// d'entrée. Échoue fail-closed : appelé au début de chaque entrée de tâche.
 pub fn preemptible_task_index(arg: u64) -> usize {
-    let current = CURRENT.load(Ordering::Acquire);
+    let current = CURRENT[this_cpu()].load(Ordering::Acquire);
     let index = match preemptible_index_of(current) {
         Some(index) => index,
         None => fail(SchedError::UnknownCurrentTask),
@@ -791,9 +830,9 @@ fn reset_preemption() {
 }
 
 fn clock() -> &'static mut SliceClock {
-    // SAFETY: l'horloge de tranche n'est touchée que sur le BSP, IRQ masquées
+    // SAFETY: chaque CPU ne touche que son horloge de tranche, IRQ masquées
     // (handler timer ou qualification), et aucune référence n'est conservée.
-    unsafe { &mut *addr_of_mut!(CLOCK) }
+    unsafe { &mut *addr_of_mut!(CLOCKS).cast::<SliceClock>().add(this_cpu()) }
 }
 
 fn record_slice(task_id: u64) -> Result<(), SchedError> {

@@ -500,6 +500,16 @@ pub fn prepared_count() -> usize {
         .count()
 }
 
+/// Index logique du CPU dont l'APIC ID vaut `apic_id` (BSP compris).
+pub fn index_of_apic(apic_id: u32) -> Option<usize> {
+    CPU_SLOTS.iter().take(cpu_count()).position(|slot| {
+        matches!(
+            slot.state.load(Ordering::Acquire),
+            STATE_PREPARED | STATE_ONLINE
+        ) && slot.apic_id.load(Ordering::Acquire) == apic_id
+    })
+}
+
 pub fn record_heartbeat_by_apic_id(apic_id: u32) -> bool {
     for slot in CPU_SLOTS.iter().take(cpu_count()).skip(1) {
         if slot.state.load(Ordering::Acquire) == STATE_ONLINE

@@ -29,7 +29,9 @@ static USE_XSAVE: AtomicBool = AtomicBool::new(false);
 static XCR0: AtomicU64 = AtomicU64::new(0);
 static AREA_SIZE: AtomicUsize = AtomicUsize::new(0);
 static INIT_AREA: AtomicU64 = AtomicU64::new(0);
-static BSP_AREA: AtomicU64 = AtomicU64::new(0);
+/// Nombre maximal de CPU dont le contexte de départ a une zone FPU.
+pub const MAX_FPU_CPUS: usize = 8;
+static CPU_AREAS: [AtomicU64; MAX_FPU_CPUS] = [const { AtomicU64::new(0) }; MAX_FPU_CPUS];
 
 pub struct FpuSetup {
     pub features: CpuFeatures,
@@ -136,7 +138,7 @@ pub fn init() -> Result<FpuSetup, FpuSetupError> {
     let image = unsafe { core::slice::from_raw_parts_mut(init_area as *mut u8, layout.size) };
     fpu::write_init_image(image);
     INIT_AREA.store(init_area, Ordering::Release);
-    BSP_AREA.store(allocate_area(layout)?, Ordering::Release);
+    CPU_AREAS[0].store(allocate_area(layout)?, Ordering::Release);
 
     ENABLED.store(true, Ordering::Release);
     // SAFETY: `init_area` est une image d'état initial valide pour la stratégie
@@ -157,8 +159,11 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Acquire)
 }
 
-pub fn bsp_area() -> u64 {
-    BSP_AREA.load(Ordering::Acquire)
+/// Zone FPU du contexte de départ (hors tâche) du CPU logique `cpu`, 0 si absente.
+pub fn cpu_area(cpu: usize) -> u64 {
+    CPU_AREAS
+        .get(cpu)
+        .map_or(0, |area| area.load(Ordering::Acquire))
 }
 
 /// Zone de sauvegarde d'une tâche neuve, initialisée à l'état propre.
@@ -192,7 +197,7 @@ pub fn new_task_area() -> Result<u64, FpuSetupError> {
 ///
 /// # Safety
 ///
-/// `area` doit être une zone obtenue par [`new_task_area`] ou [`bsp_area`],
+/// `area` doit être une zone obtenue par [`new_task_area`] ou [`cpu_area`],
 /// réservée au contexte courant.
 pub unsafe fn save(area: u64) {
     if USE_XSAVE.load(Ordering::Acquire) {
