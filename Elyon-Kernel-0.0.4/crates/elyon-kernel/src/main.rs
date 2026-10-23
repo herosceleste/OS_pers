@@ -5,6 +5,7 @@ mod acpi;
 mod arch;
 mod context;
 mod context_integrity;
+mod fpu;
 mod framebuffer;
 mod memory;
 mod sched;
@@ -501,6 +502,33 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         stacks.canaries_ok
     );
     kprintln!("ELYON_TASK_STACKS_READY");
+
+    let fpu_setup = match fpu::init() {
+        Ok(setup) => setup,
+        Err(error) => {
+            kprintln!("[fpu] FAILED reason={}", error.as_str());
+            cpu::halt_forever();
+        }
+    };
+    kprintln!(
+        "[fpu] fxsr={} sse2={} xsave={} avx={} xcr0_supported={:#x} strategy={} xcr0={:#x} avx_enabled={} area={} align={} forced_fxsave={} cr0={:#x} cr4={:#x}",
+        if fpu_setup.features.fxsr { 1 } else { 0 },
+        if fpu_setup.features.sse2 { 1 } else { 0 },
+        if fpu_setup.features.xsave { 1 } else { 0 },
+        if fpu_setup.features.avx { 1 } else { 0 },
+        fpu_setup.features.xcr0_supported,
+        fpu_setup.strategy.as_str(),
+        match fpu_setup.strategy {
+            elyon_core::fpu::Strategy::Xsave { xcr0 } => xcr0,
+            elyon_core::fpu::Strategy::Fxsave => 0,
+        },
+        if fpu_setup.strategy.avx() { 1 } else { 0 },
+        fpu_setup.layout.size,
+        fpu_setup.layout.align,
+        if fpu_setup.forced_fxsave { 1 } else { 0 },
+        fpu_setup.cr0,
+        fpu_setup.cr4
+    );
 
     let rr = match sched::qualify(
         info.kernel_stack_start,

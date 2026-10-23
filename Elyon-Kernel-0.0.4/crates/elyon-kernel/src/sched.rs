@@ -18,6 +18,7 @@ use elyon_core::run_queue::{self, QueueError, RunQueue};
 use elyon_core::task_stack::{self, StackRegion};
 
 use crate::arch::x86_64::cpu;
+use crate::fpu::{self, FpuSetupError};
 use crate::task::{self, TaskError, TaskState};
 use crate::task_stack::{self as stacks, TaskStackError};
 use crate::timer::{self, TimerError};
@@ -75,6 +76,7 @@ pub enum SchedError {
     Stack(TaskStackError),
     Queue(QueueError),
     Timer(TimerError),
+    Fpu(FpuSetupError),
     EmptyQueue,
     NotInTaskContext,
     NotBackOnBsp,
@@ -93,6 +95,7 @@ pub enum SchedError {
     TooFewSlices,
     NoProgress,
     InterruptsLeftEnabled,
+    FpuAreaMissing,
 }
 
 impl SchedError {
@@ -102,6 +105,7 @@ impl SchedError {
             Self::Stack(error) => error.as_str(),
             Self::Queue(error) => error.as_str(),
             Self::Timer(error) => error.as_str(),
+            Self::Fpu(error) => error.as_str(),
             Self::EmptyQueue => "run queue empty when a task was expected",
             Self::NotInTaskContext => "yield or exit called outside a task",
             Self::NotBackOnBsp => "BSP resumed while a task is still current",
@@ -120,6 +124,7 @@ impl SchedError {
             Self::TooFewSlices => "a task received fewer slices than its fair share",
             Self::NoProgress => "a preemptible task made no progress",
             Self::InterruptsLeftEnabled => "BSP resumed with interrupts enabled",
+            Self::FpuAreaMissing => "context has no FPU save area while FPU switching is on",
         }
     }
 }
@@ -133,6 +138,12 @@ impl From<TaskError> for SchedError {
 impl From<QueueError> for SchedError {
     fn from(error: QueueError) -> Self {
         Self::Queue(error)
+    }
+}
+
+impl From<FpuSetupError> for SchedError {
+    fn from(error: FpuSetupError) -> Self {
+        Self::Fpu(error)
     }
 }
 
@@ -166,6 +177,9 @@ pub fn qualify(
     let mut regions = [StackRegion { start: 0, end: 0 }; QUALIFY_TASKS];
     for (index, region) in regions.iter_mut().enumerate() {
         let id = task::create_kernel(BSP_AFFINITY)?;
+        if fpu::enabled() {
+            task::set_fpu_area(id, fpu::new_task_area()?)?;
+        }
         let prepared = stacks::prepare(id, entry, ARG_BASE + index as u64, bsp, identity_limit)?;
         // SAFETY: l'emplacement appartient au slot statique de la tâche, qui n'a
         // encore jamais été exécutée ; seul le switch le relira.
@@ -355,11 +369,34 @@ fn transfer(current: u64, next: u64) -> Result<(), SchedError> {
         unsafe { read_volatile(task::saved_rsp_ptr(task::lookup(next)?)?) }
     };
 
+    if fpu::enabled() {
+        let old_area = fpu_area_of(current)?;
+        let new_area = fpu_area_of(next)?;
+        // SAFETY: chaque contexte a sa propre zone (BSP ou tâche) ; on sauvegarde
+        // l'état SIMD du sortant avant de charger celui de l'entrant (eager).
+        unsafe {
+            fpu::save(old_area);
+            fpu::restore(new_area);
+        }
+    }
+
     CURRENT.store(next, Ordering::Release);
     // SAFETY: `new_rsp` désigne le frame initial ou celui laissé par le dernier
     // switch de ce contexte, sur sa propre pile ; aucun verrou n'est tenu.
     unsafe { context::switch(old_rsp, new_rsp) };
     Ok(())
+}
+
+fn fpu_area_of(context: u64) -> Result<u64, SchedError> {
+    let area = if context == BSP_CONTEXT {
+        fpu::bsp_area()
+    } else {
+        task::fpu_area(task::lookup(context)?)?
+    };
+    if area == 0 {
+        return Err(SchedError::FpuAreaMissing);
+    }
+    Ok(area)
 }
 
 fn reset() {
@@ -577,6 +614,9 @@ pub fn run_preemptive(
     let mut regions = [StackRegion { start: 0, end: 0 }; PREEMPT_TASKS];
     for (index, region) in regions.iter_mut().enumerate() {
         let id = task::create_kernel(BSP_AFFINITY)?;
+        if fpu::enabled() {
+            task::set_fpu_area(id, fpu::new_task_area()?)?;
+        }
         let prepared = stacks::prepare(id, entry, arg_base + index as u64, bsp, identity_limit)?;
         // SAFETY: l'emplacement appartient au slot statique de la tâche, qui n'a
         // encore jamais été exécutée ; seul le switch le relira.
