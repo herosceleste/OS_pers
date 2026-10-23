@@ -87,6 +87,14 @@ require_regex "^\[preempt\] tasks=([0-9]+),([0-9]+),([0-9]+) trace=(\1,\2,\3,){1
 require_regex "^\[preempt\] policy=timer-preemptive quantum_ticks=1 target=30 preemptions=(3[0-9]|[4-9][0-9]|[1-9][0-9]{2,}) task_ticks=(3[0-9]|[4-9][0-9]|[1-9][0-9]{2,}) min_slices=(1[0-9]|[2-9][0-9]) counters=[1-9][0-9]*,[1-9][0-9]*,[1-9][0-9]* exits=3 running_max=1 eoi_failures=0 canaries_ok=3\s*$"   "K004-04: synthèse de préemption invalide"
 require_fixed "ELYON_SCHED_PREEMPT_READY" "K004-04: marqueur préemption absent"
 
+if grep -Fq "[context-integrity] FAILED" "$LOG"; then
+  echo "[FAIL] K004-05: corruption de contexte détectée sous VMware" >&2
+  grep -F "[context-integrity] FAILED" "$LOG" >&2
+  exit 1
+fi
+require_regex "^\[context-integrity\] tasks=[0-9]+,[0-9]+,[0-9]+ registers=15 df=1 preemptions=(3[0-9]|[4-9][0-9]|[1-9][0-9]{2,}) min_slices=(1[0-9]|[2-9][0-9]) busy_preemptions=(1[0-9]|[2-9][0-9]|[1-9][0-9]{2,}),(1[0-9]|[2-9][0-9]|[1-9][0-9]{2,}),(1[0-9]|[2-9][0-9]|[1-9][0-9]{2,}) iterations=[1-9][0-9]*,[1-9][0-9]*,[1-9][0-9]* corruptions=0 exits=3 running_max=1 eoi_failures=0 canaries_ok=3\s*$"   "K004-05: synthèse d'intégrité du contexte invalide"
+require_fixed "ELYON_SCHED_CONTEXT_READY" "K004-05: marqueur contexte absent"
+
 require_fixed "ELYON_KERNEL_READY_0_0_4" "boot nominal final absent"
 
 if grep -Eq '\[KERNEL PANIC\]|\[EXCEPTION\]|\[[^]]+\] FAILED|ELYON_[A-Z_]+_FAILED' "$LOG"; then
@@ -95,4 +103,4 @@ if grep -Eq '\[KERNEL PANIC\]|\[EXCEPTION\]|\[[^]]+\] FAILED|ELYON_[A-Z_]+_FAILE
   exit 1
 fi
 
-echo "[PASS] VMware 4 vCPU: Elyon 0.0.4 K003-01..12 et K004-01..04 validés sur build_id=$EXPECTED_BUILD_ID"
+echo "[PASS] VMware 4 vCPU: Elyon 0.0.4 K003-01..12 et K004-01..05 validés sur build_id=$EXPECTED_BUILD_ID"
