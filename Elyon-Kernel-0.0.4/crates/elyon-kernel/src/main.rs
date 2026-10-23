@@ -903,10 +903,11 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
                 remote.migrate_to
             );
             kprintln!(
-                "[sched-ipi] cpus={} placement_ok=1 ipi_sent={} ipi_received={} blocks={} wakes=1 migrations=1 contention={} idle_running_aps={} running_max={} canaries_ok={}",
+                "[sched-ipi] cpus={} placement_ok=1 ipi_sent={} ipi_received={} ipi_coalesced={} blocks={} wakes=1 migrations=1 contention={} idle_running_aps={} running_max={} canaries_ok={}",
                 remote.cpus,
                 remote.ipi_sent,
                 remote.ipi_received,
+                remote.ipi_sent - remote.ipi_received,
                 remote.blocks,
                 remote.contention,
                 remote.idle_running_aps,
@@ -960,7 +961,7 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
             );
             kprintln!("[sched-sleep] zero task={} stayed_awake=1", sleep.zero_task);
             kprintln!(
-                "[sched-sleep] cpus={} hz={} sleeps={} timer_wakes={} explicit_wakes={} order_ok=1 never_early=1 max_late={} ipi_sent={} ipi_received={} timer_queue_empty=1 idle_running_aps={} running_max={} canaries_ok={}",
+                "[sched-sleep] cpus={} hz={} sleeps={} timer_wakes={} explicit_wakes={} order_ok=1 never_early=1 max_late={} ipi_sent={} ipi_received={} ipi_coalesced={} timer_queue_empty=1 idle_running_aps={} running_max={} canaries_ok={}",
                 sleep.cpus,
                 timer::TIMER_HZ,
                 sleep.sleeps,
@@ -969,6 +970,7 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
                 sleep.max_late,
                 sleep.ipi_sent,
                 sleep.ipi_received,
+                sleep.ipi_sent - sleep.ipi_received,
                 sleep.idle_running_aps,
                 sleep.running_max,
                 sleep.canaries_ok

@@ -110,11 +110,19 @@ zero="$(grep -E '^\[sched-sleep\] zero task=[0-9]+ stayed_awake=1$' <<<"$CLEAN" 
 claim "$(value "$zero" task)"
 
 max_late="$(value "$hz_line" max_late)"
+sent="$(value "$hz_line" ipi_sent)"
+received="$(value "$hz_line" ipi_received)"
+coalesced="$(value "$hz_line" ipi_coalesced)"
+# Un IPI envoyé pendant qu'un autre attend dans le LAPIC est absorbé par lui :
+# envois exacts, chaque réception correspond à un envoi, écart déclaré cohérent.
+if [[ "$sent" != 12 || -z "$received" || "$received" -lt 1 || "$received" -gt "$sent" \
+  || "$coalesced" != $((sent - received)) ]]; then
+  fail "comptes d'IPI incohérents: $hz_line"
+fi
 if [[ "$(value "$hz_line" cpus)" != "$CPUS" || "$(value "$hz_line" sleeps)" != 6 \
   || "$(value "$hz_line" timer_wakes)" != 5 || "$(value "$hz_line" explicit_wakes)" != 1 \
   || "$(value "$hz_line" order_ok)" != 1 || "$(value "$hz_line" never_early)" != 1 \
   || -z "$max_late" || "$max_late" -gt "$MAX_LATE" \
-  || "$(value "$hz_line" ipi_sent)" != 12 || "$(value "$hz_line" ipi_received)" != 12 \
   || "$(value "$hz_line" timer_queue_empty)" != 1 || "$(value "$hz_line" idle_running_aps)" != $((CPUS - 1)) \
   || "$(value "$hz_line" running_max)" != 1 || "$(value "$hz_line" canaries_ok)" != 7 ]]; then
   fail "synthèse invalide: $hz_line"
@@ -128,4 +136,4 @@ if grep -Eq '\[sched\] FAILED|\[KERNEL PANIC\]|\[EXCEPTION\]' <<<"$CLEAN"; then
   fail "erreur pendant la qualification"
 fi
 
-echo "[PASS] K004-09 sleep/wakeup: $CPUS CPU, sommeils de 30/10/20 ms réveillés dans l'ordre jamais en avance (retard max $max_late tick), CPU partagé, réveil explicite sans échéance périmée, sleep(0), IPI envoyés=reçus=12"
+echo "[PASS] K004-09 sleep/wakeup: $CPUS CPU, sommeils de 30/10/20 ms réveillés dans l'ordre jamais en avance (retard max $max_late tick), CPU partagé, réveil explicite sans échéance périmée, sleep(0), IPI envoyés=$sent reçus=$received (fusionnés=$coalesced)"

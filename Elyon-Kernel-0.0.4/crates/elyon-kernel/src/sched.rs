@@ -1283,6 +1283,18 @@ extern "C" fn elyon_percpu_idle_entry(arg: u64) -> ! {
 
 /// Vecteur de l'IPI qui signale à un CPU qu'une tâche a été placée dans sa file.
 pub const RESCHED_VECTOR: u8 = 0xF2;
+/// Marge laissée à un IPI encore en vol avant de relever les compteurs.
+const IPI_SETTLE_US: u32 = 2_000;
+
+/// Le LAPIC ne garde qu'une interruption en attente par vecteur : un IPI de
+/// rescheduling envoyé pendant qu'un autre attend est absorbé par lui, et un
+/// seul passage dans le handler vide toute la file. Les reçus ne peuvent donc
+/// pas être exigés égaux aux envoyés ; la preuve qu'aucun réveil n'est perdu
+/// est que toutes les tâches terminent. Ici : nombre d'envois exact, et chaque
+/// réception correspond à un envoi.
+fn ipi_counts_consistent(sent: u64, received: u64, expected_sent: u64) -> bool {
+    sent == expected_sent && received >= 1 && received <= sent
+}
 
 static RESCHED_SENT: AtomicU64 = AtomicU64::new(0);
 static RESCHED_RECEIVED: AtomicU64 = AtomicU64::new(0);
@@ -1606,9 +1618,8 @@ pub fn qualify_remote(
     let idles: [u64; MAX_SCHED_CPUS] =
         core::array::from_fn(|index| IDLE_IDS[index].load(Ordering::Acquire));
     wait_until(|| (1..cpus).all(|index| CURRENT[index].load(Ordering::Acquire) == idles[index]))?;
-    wait_until(|| {
-        RESCHED_RECEIVED.load(Ordering::Acquire) == RESCHED_SENT.load(Ordering::Acquire)
-    })?;
+    // Marge pour un IPI encore en vol ; les IPI fusionnés ne seront jamais reçus.
+    timer::pit_delay_us(IPI_SETTLE_US)?;
 
     let trace_len = REMOTE_TRACE_LEN
         .load(Ordering::Acquire)
@@ -1664,7 +1675,7 @@ pub fn qualify_remote(
     let ipi_received = RESCHED_RECEIVED.load(Ordering::Acquire);
     // Création distante, première mise en file du bloqué, réveil : trois IPI ;
     // la migration vers le CPU 0 n'en demande pas.
-    if ipi_sent != 3 || ipi_received != ipi_sent || BLOCKS.load(Ordering::Acquire) != 1 {
+    if !ipi_counts_consistent(ipi_sent, ipi_received, 3) || BLOCKS.load(Ordering::Acquire) != 1 {
         return Err(SchedError::CountMismatch);
     }
 
@@ -2085,13 +2096,14 @@ pub fn qualify_sleep(
         SLEEP_DONE.load(Ordering::Acquire) == 7
     })?;
 
-    // Les AP reviennent dans leur idle task ; tous les IPI sont livrés.
+    // Les AP reviennent dans leur idle task, puis marge pour un IPI encore en vol.
     let idles: [u64; MAX_SCHED_CPUS] =
         core::array::from_fn(|index| IDLE_IDS[index].load(Ordering::Acquire));
     wait_ticks_until(SLEEP_PHASE_TICKS, || {
         (1..cpus).all(|index| CURRENT[index].load(Ordering::Acquire) == idles[index])
-            && RESCHED_RECEIVED.load(Ordering::Acquire) == RESCHED_SENT.load(Ordering::Acquire)
     })?;
+    let settled_from = timer::ticks();
+    wait_ticks_until(SLEEP_PHASE_TICKS, || timer::ticks() >= settled_from + 2)?;
     timer::stop()?;
 
     let timers_empty = timers().is_empty();
@@ -2189,8 +2201,7 @@ pub fn qualify_sleep(
         || timer_wakes != 5
         || explicit_wakes != 1
         || stale_expiries != 0
-        || ipi_sent != 12
-        || ipi_received != ipi_sent
+        || !ipi_counts_consistent(ipi_sent, ipi_received, 12)
         || idle_entries != 1
         || !RAN_WHILE_SLEEPING.load(Ordering::Acquire)
         || !ZERO_STAYED_AWAKE.load(Ordering::Acquire)

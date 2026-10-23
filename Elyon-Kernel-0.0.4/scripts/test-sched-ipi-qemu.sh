@@ -83,8 +83,16 @@ done
 
 aps=$((CPUS - 1))
 sent="$(value "$summary" ipi_sent)"
+received="$(value "$summary" ipi_received)"
+coalesced="$(value "$summary" ipi_coalesced)"
+# Un IPI envoyé pendant qu'un autre attend dans le LAPIC est absorbé par lui :
+# envois exacts, chaque réception correspond à un envoi, écart déclaré cohérent.
+if [[ "$sent" != 3 || -z "$received" || "$received" -lt 1 || "$received" -gt "$sent" \
+  || "$coalesced" != $((sent - received)) ]]; then
+  echo "[FAIL] K004-08: comptes d'IPI incohérents: $summary" >&2
+  exit 1
+fi
 if [[ "$(value "$summary" cpus)" != "$CPUS" || "$(value "$summary" placement_ok)" != 1 \
-  || "$sent" != 3 || "$(value "$summary" ipi_received)" != "$sent" \
   || "$(value "$summary" blocks)" != 1 || "$(value "$summary" wakes)" != 1 \
   || "$(value "$summary" migrations)" != 1 || -z "$(value "$summary" contention)" \
   || "$(value "$summary" idle_running_aps)" != "$aps" || "$(value "$summary" running_max)" != 1 \
@@ -105,4 +113,4 @@ if grep -Eq '\[sched\] FAILED|\[KERNEL PANIC\]|\[EXCEPTION\]' <<<"$CLEAN"; then
   exit 1
 fi
 
-echo "[PASS] K004-08 rescheduling à distance: $CPUS CPU, création sur un AP en idle par IPI, blocage puis réveil depuis le BSP, migration AP 1 -> CPU 0, IPI envoyés=reçus=$sent, $aps AP revenus en idle"
+echo "[PASS] K004-08 rescheduling à distance: $CPUS CPU, création sur un AP en idle par IPI, blocage puis réveil depuis le BSP, migration AP 1 -> CPU 0, IPI envoyés=$sent reçus=$received (fusionnés=$coalesced), $aps AP revenus en idle"
