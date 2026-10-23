@@ -1,6 +1,6 @@
 # Elyon Kernel 0.0.4 — Validation
 
-**EN COURS — K004-01 à K004-03 sont validés. K004-04 à K004-12 restent à qualifier.**
+**EN COURS — K004-01 à K004-04 sont validés. K004-05 à K004-12 restent à qualifier.**
 
 ## Baseline héritée
 
@@ -13,7 +13,7 @@ La 0.0.4 est dérivée de la Release `v0.0.3`, dont les critères K003-01 à K00
 | K004-01 | Modèle de tâche noyau et machine d'états | **PASS** |
 | K004-02 | Pile et contexte initial dédiés | **PASS** |
 | K004-03 | Round-Robin coopératif | **PASS** |
-| K004-04 | Préemption LAPIC | À faire |
+| K004-04 | Préemption LAPIC | **PASS** |
 | K004-05 | Contexte CPU scheduler complet | À faire |
 | K004-06 | Sauvegarde FPU/SSE/AVX | À faire |
 | K004-07 | Scheduler per-CPU + idle task | À faire |
@@ -167,3 +167,58 @@ Limites : tout se déroule sur le BSP, interruptions masquées, avec une run que
 **K004-03 : PASS.**
 
 Le prochain critère est **K004-04 : préemption réelle par timer LAPIC.**
+
+## K004-04 — Préemption réelle par timer LAPIC
+
+Des tâches qui n'appellent jamais `yield()` se partagent désormais le CPU : c'est l'interruption du timer LAPIC qui décide du passage de main, quand le quantum de la tâche courante est épuisé.
+
+La logique pure est dans `elyon_core::preempt`, testée sur l'hôte :
+
+- `Quantum` : durée d'une tranche en ticks, au moins un ;
+- `SliceClock` : décision Continuer/Préempter à chaque tick ; une tranche épuisée redemande la préemption tant que le scheduler ne l'a pas remise à zéro ;
+- `is_rotation` et `min_slices` : rotation stricte d'une trace et part de la tâche la moins servie.
+
+Chemin de préemption côté noyau :
+
+- le stub `elyon_apic_timer_interrupt` sauvegarde les quinze registres généraux ;
+- `timer::on_interrupt` envoie l'EOI, puis appelle `sched::on_timer_tick` ;
+- tranche épuisée, la tâche courante passe `READY` et en fin de file, la suivante passe `RUNNING`, et le switch se fait depuis l'IRQ, sur la pile de la tâche interrompue ; celle-ci reprendra plus tard par son propre `iretq` ;
+- une tâche neuve démarre avec IF=0 dans son frame initial et active elle-même les interruptions.
+
+Politique d'interruptions : `yield_now()` manipule la run queue IRQ masquées et restaure IF au retour (irq-save), `exit_now()` masque les IRQ dès son entrée. Un tick ne peut donc jamais interrompre une mise à jour de la file. Aucun verrou ne traverse un switch.
+
+La qualification lance trois tâches en boucle de calcul pure, sans `yield`, avec un quantum d'un tick à 100 Hz. Après 30 préemptions, un drapeau d'arrêt est levé et les tâches sortent. La trace n'enregistre que les tranches antérieures à l'arrêt : elle compte exactement 31 entrées en rotation stricte, quelle que soit la cadence réelle des ticks. Le BSP vérifie :
+
+- au moins 30 préemptions, la rotation stricte et au moins 10 tranches par tâche ;
+- des compteurs de progression non nuls pour chaque tâche ;
+- toutes les tâches `DEAD`, la file vide, au plus une tâche `RUNNING` et 3 sorties ;
+- les arguments, les canaris et le RSP sauvegardé du BSP ;
+- IF=0 au retour sur le BSP, puis l'arrêt du timer sans échec d'EOI.
+
+Le script `test-sched-preempt-qemu.sh` recalcule la trace, la rotation et la répartition à partir du log. Les nombres de préemptions sont vérifiés comme des minimums, le timer continuant de tourner jusqu'à la sortie des tâches. Le script a été vérifié en échec sur des logs altérés (rotation rompue, tâche sans progression, `running_max=2`). La stabilité a été vérifiée sur 7 boots QEMU à 1, 2 et 4 vCPU.
+
+La qualification a été exécutée sur le commit `13271ff4d25b`, GitHub Actions run **#33** du workflow Elyon 0.0.4, et en local sous QEMU 8.2.2 / OVMF, 4 vCPU.
+
+Preuves :
+
+```text
+[preempt] tasks=9,10,11 trace=9,10,11,9,10,11,9,10,11,9,10,11,9,10,11,9,10,11,9,10,11,9,10,11,9,10,11,9,10,11,9
+[preempt] policy=timer-preemptive quantum_ticks=1 target=30 preemptions=30 task_ticks=30 min_slices=10 counters=594299,574945,594274 exits=3 running_max=1 eoi_failures=0 canaries_ok=3
+ELYON_SCHED_PREEMPT_READY
+[PASS] K004-04 préemption LAPIC: 3 tâches sans yield, 30 préemptions timer, 31 tranches en rotation stricte, une seule tâche RUNNING
+```
+
+Validation croisée sous VMware® Workstation 17 Pro 17.0.2 build-21581411, UEFI, 4 vCPU, même build :
+
+```text
+[PASS] VMware 4 vCPU: Elyon 0.0.4 K003-01..12 et K004-01..04 validés sur build_id=13271ff4d25b
+[preempt] policy=timer-preemptive quantum_ticks=1 target=30 preemptions=30 task_ticks=30 min_slices=10 counters=3630849,3669487,3718779 exits=3 running_max=1 eoi_failures=0 canaries_ok=3
+```
+
+Sous VMware, le timer est asynchrone par rapport à l'exécution virtualisée des tâches : les compteurs y sont environ six fois plus élevés que sous TCG, et la trace est identique.
+
+Limites : la cible `x86_64-unknown-none` compile sans SSE, aucun état FPU n'est donc en jeu ; l'isolation FPU/SSE/AVX relève de K004-06. La préemption ne tourne que sur le BSP avec une run queue globale ; le per-CPU, l'IPI de rescheduling et la synchronisation SMP relèvent de K004-07, K004-08 et K004-10.
+
+**K004-04 : PASS.**
+
+Le prochain critère est **K004-05 : sauvegarde/restauration complète du contexte CPU requis par le scheduler.**
