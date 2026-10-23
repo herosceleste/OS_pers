@@ -23,9 +23,16 @@ const BUILD_ID: &str = match option_env!("ELYON_BUILD_ID") {
 const TEST_UD: bool = option_env!("ELYON_TEST_UD").is_some();
 const TEST_DF: bool = option_env!("ELYON_TEST_DF").is_some();
 
+/// Point d'entrée du noyau, atteint par saut depuis le loader UEFI.
+///
+/// # Safety
+///
+/// `info_ptr` doit être nul ou pointer vers un `BootInfo` initialisé, aligné,
+/// mappé en identité et non modifié pendant la vie du noyau ; les UEFI Boot
+/// Services doivent être terminés et les interruptions masquées.
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text._start")]
-pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
+pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
     serial::init();
     cpu::disable_interrupts();
 
@@ -144,11 +151,18 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         topology.root_address
     );
     kprintln!(
-        "[acpi] root={} entries={} validated={}",
+        "[acpi] root={} entries={} validated={} skipped={}",
         topology.root_kind.as_str(),
         topology.root_entries,
-        topology.validated_table_count
+        topology.validated_table_count,
+        topology.skipped_table_count
     );
+    if topology.skipped_table_count != 0 {
+        kprintln!(
+            "[acpi] WARN skipped={} non-essential table(s) with invalid checksum",
+            topology.skipped_table_count
+        );
+    }
     kprintln!(
         "[acpi] MADT=OK address={:#018x} lapic={:#018x} flags={:#x}",
         topology.madt_address,
@@ -306,6 +320,22 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
 
     kprintln!("ELYON_PERCPU_READY");
 
+    // Les AP exécutent `sti` dès leur entrée : toute source d'IRQ externe doit
+    // être masquée avant le premier INIT/SIPI (ARCHITECTURE §10).
+    timer::mask_legacy_pic();
+    let mut ioapic = match ioapic::discover_and_mask(&topology, info) {
+        Ok(summary) => summary,
+        Err(error) => {
+            kprintln!("[ioapic] FAILED reason={}", error.as_str());
+            cpu::halt_forever();
+        }
+    };
+    kprintln!(
+        "[irq] pre_smp legacy_pic_masked=1 ioapic_masked={}/{}",
+        ioapic.masked_entries,
+        ioapic.total_redirection_entries
+    );
+
     idt::install_interrupt_gate(
         smp::STABILITY_VECTOR,
         code_selector,
@@ -401,13 +431,10 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
     );
     kprintln!("ELYON_CONTEXT_SWITCH_READY");
 
-    let ioapic = match ioapic::init(&topology, lapic.apic_id) {
-        Ok(summary) => summary,
-        Err(error) => {
-            kprintln!("[ioapic] FAILED reason={}", error.as_str());
-            cpu::halt_forever();
-        }
-    };
+    if let Err(error) = ioapic::route_legacy(&mut ioapic, &topology, lapic.apic_id) {
+        kprintln!("[ioapic] FAILED reason={}", error.as_str());
+        cpu::halt_forever();
+    }
 
     kprintln!(
         "[ioapic] controllers={} bsp_apic_id={}",
@@ -477,8 +504,9 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
     };
 
     kprintln!(
-        "[timer] source=PIT2 pit_count={} lapic_elapsed={} divide={} effective_hz={} initial_count={} target_hz={}",
-        timer_calibration.pit_count,
+        "[timer] source={} pit_count={} lapic_elapsed={} divide={} effective_hz={} initial_count={} target_hz={}",
+        timer_calibration.source.as_str(),
+        timer_calibration.pit_ticks,
         timer_calibration.lapic_elapsed,
         timer_calibration.divide,
         timer_calibration.effective_lapic_hz,
@@ -491,9 +519,27 @@ pub extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         timer::QUALIFICATION_TICKS
     );
 
+    if let Some(pit_failure) = timer_calibration.pit_failure {
+        kprintln!(
+            "[timer] WARN pit_calibration_failed reason={} fallback=CPUID40000010",
+            pit_failure.as_str()
+        );
+    }
+
     cpu::enable_interrupts();
     let timer_ticks = timer::wait_for_ticks(timer::QUALIFICATION_TICKS);
     cpu::disable_interrupts();
+    let timer_ticks = match timer_ticks {
+        Ok(ticks) => ticks,
+        Err(error) => {
+            kprintln!(
+                "[timer] FAILED reason={} ticks={}",
+                error.as_str(),
+                timer::ticks()
+            );
+            cpu::halt_forever();
+        }
+    };
 
     if let Err(error) = timer::stop() {
         kprintln!("[timer] FAILED reason={}", error.as_str());

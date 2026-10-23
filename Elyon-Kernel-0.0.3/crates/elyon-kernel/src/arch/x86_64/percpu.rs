@@ -501,8 +501,7 @@ pub fn prepared_count() -> usize {
 }
 
 pub fn record_heartbeat_by_apic_id(apic_id: u32) -> bool {
-    for index in 1..cpu_count() {
-        let slot = &CPU_SLOTS[index];
+    for slot in CPU_SLOTS.iter().take(cpu_count()).skip(1) {
         if slot.state.load(Ordering::Acquire) == STATE_ONLINE
             && slot.apic_id.load(Ordering::Acquire) == apic_id
         {
