@@ -73,6 +73,10 @@ fi
 require_fixed "[task-stack] tasks=3 distinct=1 overlaps=0 owned=3 rounds=2 switches=12 args_ok=3 canaries_ok=3"   "K004-02: synthèse piles/contextes invalide"
 require_fixed "ELYON_TASK_STACKS_READY" "K004-02: marqueur task stacks absent"
 
+require_regex "^\[sched\] tasks=([0-9]+),([0-9]+),([0-9]+) trace=\1,\2,\3,\1,\2,\3,\1,\2,\3,\1,\2,\3\s*$"   "K004-03: trace Round-Robin stricte absente"
+require_fixed "[sched] policy=round-robin cooperative iterations=4 yields=9 exits=3 task_switches=11 bsp_switches=2 running_max=1 args_ok=3 rsp_ok=12 canaries_ok=3 queue_empty=1"   "K004-03: synthèse scheduler invalide"
+require_fixed "ELYON_SCHED_RR_READY" "K004-03: marqueur scheduler absent"
+
 require_regex "\[ioapic\] legacy_routes=[1-9][0-9]* overrides_applied=[0-9]+ shadowed=[0-9]+ id_mismatches=[0-9]+ masked=([1-9][0-9]*)/\1 all_masked=1"   "IOAPIC final non maîtrisé"
 require_fixed "ELYON_IOAPIC_READY" "marqueur IOAPIC absent"
 
@@ -87,4 +91,4 @@ if grep -Eq '\[KERNEL PANIC\]|\[EXCEPTION\]|\[[^]]+\] FAILED|ELYON_[A-Z_]+_FAILE
   exit 1
 fi
 
-echo "[PASS] VMware 4 vCPU: Elyon 0.0.4 K003-01..12, K004-01 et K004-02 validés sur build_id=$EXPECTED_BUILD_ID"
+echo "[PASS] VMware 4 vCPU: Elyon 0.0.4 K003-01..12 et K004-01..03 validés sur build_id=$EXPECTED_BUILD_ID"
