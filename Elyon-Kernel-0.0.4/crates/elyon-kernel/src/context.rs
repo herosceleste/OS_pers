@@ -57,6 +57,19 @@ unsafe extern "C" {
     fn elyon_context_task_trampoline();
 }
 
+/// Sauvegarde le contexte courant dans `*old_rsp` puis reprend celui de `new_rsp`.
+///
+/// # Safety
+///
+/// `old_rsp` doit être valide en écriture jusqu'au retour dans ce contexte.
+/// `new_rsp` doit désigner un frame laissé par `elyon_context_switch` ou
+/// construit par `elyon_core::task_stack::initial_frame`, sur une pile mappée en
+/// identité et réservée à ce seul contexte. Aucun verrou ne doit traverser le switch.
+pub unsafe fn switch(old_rsp: *mut u64, new_rsp: u64) {
+    // SAFETY: contrat reporté sur l'appelant, voir ci-dessus.
+    unsafe { elyon_context_switch(old_rsp, new_rsp) }
+}
+
 pub struct ContextQualification {
     pub task_stack_start: u64,
     pub task_stack_end: u64,

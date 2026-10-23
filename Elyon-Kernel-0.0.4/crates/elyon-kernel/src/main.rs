@@ -8,6 +8,7 @@ mod framebuffer;
 mod memory;
 mod serial;
 mod task;
+mod task_stack;
 mod timer;
 
 use core::panic::PanicInfo;
@@ -462,6 +463,42 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
     );
     kprintln!("[task] states=READY,RUNNING,BLOCKED,SLEEPING,DEAD affinity_enforced=1");
     kprintln!("ELYON_TASK_MODEL_READY");
+
+    let stacks = match task_stack::qualify(
+        info.kernel_stack_start,
+        info.kernel_stack_end,
+        paging::identity_limit(),
+    ) {
+        Ok(summary) => summary,
+        Err(error) => {
+            kprintln!("[task-stack] FAILED reason={}", error.as_str());
+            cpu::halt_forever();
+        }
+    };
+
+    for report in &stacks.tasks {
+        kprintln!(
+            "[task-stack] task={} stack={:#018x}..{:#018x} size={} KiB initial_rsp={:#018x} observed_rsp={:#018x} saved_rsp={:#018x} arg={:#x} canary=OK",
+            report.id,
+            report.stack.start,
+            report.stack.end,
+            report.stack.size() / 1024,
+            report.initial_rsp,
+            report.observed_rsp,
+            report.saved_rsp,
+            report.arg
+        );
+    }
+    kprintln!(
+        "[task-stack] tasks={} distinct=1 overlaps=0 owned={} rounds={} switches={} args_ok={} canaries_ok={}",
+        task_stack::QUALIFY_TASKS,
+        stacks.owned,
+        task_stack::ROUNDS,
+        stacks.switches,
+        stacks.args_ok,
+        stacks.canaries_ok
+    );
+    kprintln!("ELYON_TASK_STACKS_READY");
 
     if let Err(error) = ioapic::route_legacy(&mut ioapic, &topology, lapic.apic_id) {
         kprintln!("[ioapic] FAILED reason={}", error.as_str());

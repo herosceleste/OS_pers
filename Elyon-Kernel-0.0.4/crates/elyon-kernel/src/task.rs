@@ -74,6 +74,8 @@ struct TaskSlot {
     state: AtomicU8,
     affinity_mask: AtomicU64,
     current_cpu: AtomicU32,
+    stack_start: AtomicU64,
+    stack_end: AtomicU64,
 }
 
 impl TaskSlot {
@@ -83,6 +85,8 @@ impl TaskSlot {
             state: AtomicU8::new(STATE_EMPTY),
             affinity_mask: AtomicU64::new(0),
             current_cpu: AtomicU32::new(NO_CPU),
+            stack_start: AtomicU64::new(0),
+            stack_end: AtomicU64::new(0),
         }
     }
 }
@@ -112,6 +116,8 @@ pub enum TaskError {
     UnknownTask,
     InvalidTransition,
     CpuOutsideAffinity,
+    StackAlreadyAttached,
+    StackInUse,
 }
 
 impl TaskError {
@@ -122,6 +128,8 @@ impl TaskError {
             Self::UnknownTask => "unknown task id",
             Self::InvalidTransition => "illegal task state transition",
             Self::CpuOutsideAffinity => "CPU is outside task affinity mask",
+            Self::StackAlreadyAttached => "task already owns a stack",
+            Self::StackInUse => "stack overlaps the stack of another active task",
         }
     }
 }
@@ -164,6 +172,8 @@ pub fn create_kernel(affinity_mask: u64) -> Result<TaskId, TaskError> {
         slot.id.store(id_raw, Ordering::Release);
         slot.affinity_mask.store(affinity_mask, Ordering::Release);
         slot.current_cpu.store(NO_CPU, Ordering::Release);
+        slot.stack_start.store(0, Ordering::Release);
+        slot.stack_end.store(0, Ordering::Release);
         slot.state.store(STATE_READY, Ordering::Release);
         CREATED_TASKS.fetch_add(1, Ordering::AcqRel);
 
@@ -254,6 +264,47 @@ pub fn terminate(id: TaskId) -> Result<(), TaskError> {
         .map_err(|_| TaskError::InvalidTransition)?;
     slot.current_cpu.store(NO_CPU, Ordering::Release);
     Ok(())
+}
+
+/// Attribue la pile `[start, end)` à une tâche READY qui n'en possède pas encore.
+///
+/// Invariant K004-02 : une pile n'appartient qu'à une seule tâche active. Une
+/// pile qui chevauche celle d'une tâche non DEAD est refusée. L'attribution est
+/// faite par le BSP pendant le boot, avant que les tâches ne s'exécutent.
+pub fn attach_stack(id: TaskId, start: u64, end: u64) -> Result<(), TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    if slot.state.load(Ordering::Acquire) != STATE_READY {
+        return Err(TaskError::InvalidTransition);
+    }
+    if slot.stack_end.load(Ordering::Acquire) != 0 {
+        return Err(TaskError::StackAlreadyAttached);
+    }
+
+    for other in &TASKS {
+        let state = other.state.load(Ordering::Acquire);
+        if matches!(state, STATE_EMPTY | STATE_ALLOCATING | STATE_DEAD) {
+            continue;
+        }
+        let other_start = other.stack_start.load(Ordering::Acquire);
+        let other_end = other.stack_end.load(Ordering::Acquire);
+        if other_end != 0 && start < other_end && other_start < end {
+            return Err(TaskError::StackInUse);
+        }
+    }
+
+    slot.stack_start.store(start, Ordering::Release);
+    slot.stack_end.store(end, Ordering::Release);
+    Ok(())
+}
+
+/// Pile `[start, end)` attribuée à la tâche, si elle en possède une.
+pub fn stack_of(id: TaskId) -> Result<Option<(u64, u64)>, TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    let end = slot.stack_end.load(Ordering::Acquire);
+    if end == 0 {
+        return Ok(None);
+    }
+    Ok(Some((slot.stack_start.load(Ordering::Acquire), end)))
 }
 
 pub fn created_total() -> u64 {
