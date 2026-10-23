@@ -18,6 +18,7 @@ use elyon_core::percpu_sched::{
 };
 use elyon_core::preempt::{self, Quantum, SliceClock, TickDecision};
 use elyon_core::run_queue::{self, QueueError, RunQueue};
+use elyon_core::sync::RawSpinLock;
 use elyon_core::task_stack::{self, StackRegion};
 
 use crate::arch::x86_64::cpu;
@@ -212,7 +213,7 @@ pub fn qualify(
         queue().push_back(id.raw())?;
     }
 
-    let first = run_queue::exit_next(queue()).ok_or(SchedError::EmptyQueue)?;
+    let first = run_queue::exit_next(&mut queue()).ok_or(SchedError::EmptyQueue)?;
     task::start(task::lookup(first)?, BSP_CPU)?;
     BSP_SWITCHES.fetch_add(1, Ordering::AcqRel);
     transfer(BSP_CONTEXT, first)?;
@@ -334,7 +335,7 @@ fn try_yield() -> Result<(), SchedError> {
     }
 
     task::yield_ready(task::lookup(current)?)?;
-    let next = run_queue::yield_next(queue(), current)?;
+    let next = run_queue::yield_next(&mut queue(), current)?;
     YIELDS.fetch_add(1, Ordering::AcqRel);
     task::start(task::lookup(next)?, this_cpu() as u32)?;
 
@@ -354,7 +355,10 @@ fn try_exit() -> Result<(), SchedError> {
     task::terminate(task::lookup(current)?)?;
     EXITS.fetch_add(1, Ordering::AcqRel);
 
-    match run_queue::exit_next(queue()) {
+    // Le garde de file doit être relâché avant le switch : pas de temporaire
+    // dans le scrutin du `match`, qui vivrait jusqu'à la fin du bloc.
+    let next = run_queue::exit_next(&mut queue());
+    match next {
         Some(next) => {
             task::start(task::lookup(next)?, this_cpu() as u32)?;
             TASK_SWITCHES.fetch_add(1, Ordering::AcqRel);
@@ -451,21 +455,58 @@ fn reset() {
     RUNNING_MAX.store(0, Ordering::Release);
 }
 
-/// Run queue du CPU courant.
-fn queue() -> &'static mut RunQueue<QUEUE_CAPACITY> {
+static QUEUE_LOCKS: [RawSpinLock; MAX_SCHED_CPUS] = [const { RawSpinLock::new() }; MAX_SCHED_CPUS];
+/// Tours d'attente cumulés sur les verrous de file (contention, K004-08).
+static QUEUE_CONTENTION: AtomicU64 = AtomicU64::new(0);
+
+/// Accès exclusif à la run queue d'un CPU : le verrou est pris à la création
+/// et relâché à la destruction du garde. Toujours pris IRQ masquées, jamais
+/// conservé à travers un switch.
+pub struct QueueGuard {
+    cpu: usize,
+}
+
+impl core::ops::Deref for QueueGuard {
+    type Target = RunQueue<QUEUE_CAPACITY>;
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: `cpu < MAX_SCHED_CPUS` et le verrou de cette file est tenu
+        // pendant toute la vie du garde.
+        unsafe {
+            &*addr_of_mut!(QUEUES)
+                .cast::<RunQueue<QUEUE_CAPACITY>>()
+                .add(self.cpu)
+        }
+    }
+}
+
+impl core::ops::DerefMut for QueueGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: `cpu < MAX_SCHED_CPUS` et le verrou tenu garantit l'unicité de
+        // la référence mutable.
+        unsafe {
+            &mut *addr_of_mut!(QUEUES)
+                .cast::<RunQueue<QUEUE_CAPACITY>>()
+                .add(self.cpu)
+        }
+    }
+}
+
+impl Drop for QueueGuard {
+    fn drop(&mut self) {
+        QUEUE_LOCKS[self.cpu].unlock();
+    }
+}
+
+/// Run queue du CPU courant, verrouillée.
+fn queue() -> QueueGuard {
     queue_of(this_cpu())
 }
 
-fn queue_of(cpu: usize) -> &'static mut RunQueue<QUEUE_CAPACITY> {
-    // SAFETY: `cpu < MAX_SCHED_CPUS` (this_cpu() échoue sinon) ; une file n'est
-    // manipulée que par son CPU, IRQ masquées, ou par le BSP avant que ce CPU ne
-    // l'utilise, et aucune référence obtenue ici n'est conservée au-delà de
-    // l'appel en cours.
-    unsafe {
-        &mut *addr_of_mut!(QUEUES)
-            .cast::<RunQueue<QUEUE_CAPACITY>>()
-            .add(cpu)
-    }
+fn queue_of(cpu: usize) -> QueueGuard {
+    let spins = QUEUE_LOCKS[cpu].lock();
+    QUEUE_CONTENTION.fetch_add(spins, Ordering::Relaxed);
+    QueueGuard { cpu }
 }
 
 fn boot_rsp_slot(cpu: usize) -> *mut u64 {
@@ -615,7 +656,7 @@ fn preempt_current(current: u64) -> Result<(), SchedError> {
         BUSY_PREEMPTIONS[index].fetch_add(1, Ordering::AcqRel);
     }
     task::yield_ready(task::lookup(current)?)?;
-    let next = run_queue::yield_next(queue(), current)?;
+    let next = run_queue::yield_next(&mut queue(), current)?;
     task::start(task::lookup(next)?, this_cpu() as u32)?;
     clock().reset();
     if next == current {
@@ -687,7 +728,7 @@ pub fn run_preemptive(
         queue().push_back(id.raw())?;
     }
 
-    let first = run_queue::exit_next(queue()).ok_or(SchedError::EmptyQueue)?;
+    let first = run_queue::exit_next(&mut queue()).ok_or(SchedError::EmptyQueue)?;
     task::start(task::lookup(first)?, BSP_CPU)?;
     record_slice(first)?;
     clock().reset();
@@ -961,7 +1002,7 @@ pub fn ap_enter(cpu: usize) -> ! {
 }
 
 fn run_own_queue(cpu: usize) -> Result<(), SchedError> {
-    let first = run_queue::exit_next(queue_of(cpu)).ok_or(SchedError::EmptyQueue)?;
+    let first = run_queue::exit_next(&mut queue_of(cpu)).ok_or(SchedError::EmptyQueue)?;
     task::start(task::lookup(first)?, cpu as u32)?;
     BSP_SWITCHES.fetch_add(1, Ordering::AcqRel);
     transfer(BSP_CONTEXT, first)
