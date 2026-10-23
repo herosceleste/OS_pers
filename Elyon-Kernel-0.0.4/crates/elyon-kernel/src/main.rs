@@ -6,6 +6,7 @@ mod arch;
 mod context;
 mod framebuffer;
 mod memory;
+mod sched;
 mod serial;
 mod task;
 mod task_stack;
@@ -499,6 +500,51 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         stacks.canaries_ok
     );
     kprintln!("ELYON_TASK_STACKS_READY");
+
+    let rr = match sched::qualify(
+        info.kernel_stack_start,
+        info.kernel_stack_end,
+        paging::identity_limit(),
+    ) {
+        Ok(summary) => summary,
+        Err(error) => {
+            kprintln!("[sched] FAILED reason={}", error.as_str());
+            cpu::halt_forever();
+        }
+    };
+
+    let t = &rr.trace;
+    kprintln!(
+        "[sched] tasks={},{},{} trace={},{},{},{},{},{},{},{},{},{},{},{}",
+        rr.ids[0],
+        rr.ids[1],
+        rr.ids[2],
+        t[0],
+        t[1],
+        t[2],
+        t[3],
+        t[4],
+        t[5],
+        t[6],
+        t[7],
+        t[8],
+        t[9],
+        t[10],
+        t[11]
+    );
+    kprintln!(
+        "[sched] policy=round-robin cooperative iterations={} yields={} exits={} task_switches={} bsp_switches={} running_max={} args_ok={} rsp_ok={} canaries_ok={} queue_empty=1",
+        sched::ITERATIONS,
+        rr.yields,
+        rr.exits,
+        rr.task_switches,
+        rr.bsp_switches,
+        rr.running_max,
+        rr.args_ok,
+        rr.rsp_ok,
+        rr.canaries_ok
+    );
+    kprintln!("ELYON_SCHED_RR_READY");
 
     if let Err(error) = ioapic::route_legacy(&mut ioapic, &topology, lapic.apic_id) {
         kprintln!("[ioapic] FAILED reason={}", error.as_str());
