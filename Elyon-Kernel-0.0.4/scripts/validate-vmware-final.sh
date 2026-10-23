@@ -63,6 +63,16 @@ require_regex "\[task\] ids=[1-9][0-9]*,[1-9][0-9]* unique=1 capacity=256 create
 require_fixed "[task] states=READY,RUNNING,BLOCKED,SLEEPING,DEAD affinity_enforced=1"   "K004-01: états de tâche ou affinité non qualifiés"
 require_fixed "ELYON_TASK_MODEL_READY" "K004-01: marqueur task model absent"
 
+mapfile -t TASK_STACKS < <(
+  tr -d '\r' <"$LOG" | grep -E '^\[task-stack\] task=[0-9]+ stack=0x[0-9a-f]+\.\.0x[0-9a-f]+ size=64 KiB initial_rsp=0x[0-9a-f]+ observed_rsp=0x[0-9a-f]+ saved_rsp=0x[0-9a-f]+ arg=0x[0-9a-f]+ canary=OK$'
+)
+if [[ "${#TASK_STACKS[@]}" -ne 3 ]]; then
+  echo "[FAIL] K004-02: 3 tâches avec pile dédiée attendues sous VMware, obtenues: ${#TASK_STACKS[@]}" >&2
+  exit 1
+fi
+require_fixed "[task-stack] tasks=3 distinct=1 overlaps=0 owned=3 rounds=2 switches=12 args_ok=3 canaries_ok=3"   "K004-02: synthèse piles/contextes invalide"
+require_fixed "ELYON_TASK_STACKS_READY" "K004-02: marqueur task stacks absent"
+
 require_regex "\[ioapic\] legacy_routes=[1-9][0-9]* overrides_applied=[0-9]+ shadowed=[0-9]+ id_mismatches=[0-9]+ masked=([1-9][0-9]*)/\1 all_masked=1"   "IOAPIC final non maîtrisé"
 require_fixed "ELYON_IOAPIC_READY" "marqueur IOAPIC absent"
 
@@ -77,4 +87,4 @@ if grep -Eq '\[KERNEL PANIC\]|\[EXCEPTION\]|\[[^]]+\] FAILED|ELYON_[A-Z_]+_FAILE
   exit 1
 fi
 
-echo "[PASS] VMware 4 vCPU: Elyon 0.0.4 K003-01..12 et K004-01 validés sur build_id=$EXPECTED_BUILD_ID"
+echo "[PASS] VMware 4 vCPU: Elyon 0.0.4 K003-01..12, K004-01 et K004-02 validés sur build_id=$EXPECTED_BUILD_ID"
