@@ -4,6 +4,7 @@
 mod acpi;
 mod arch;
 mod context;
+mod context_integrity;
 mod framebuffer;
 mod memory;
 mod sched;
@@ -726,6 +727,39 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         preemption.canaries_ok
     );
     kprintln!("ELYON_SCHED_PREEMPT_READY");
+
+    let integrity = match context_integrity::qualify(
+        info.kernel_stack_start,
+        info.kernel_stack_end,
+        paging::identity_limit(),
+        timer_calibration.initial_count,
+    ) {
+        Ok(summary) => summary,
+        Err(error) => {
+            kprintln!("[context-integrity] FAILED reason={}", error.as_str());
+            cpu::halt_forever();
+        }
+    };
+
+    kprintln!(
+        "[context-integrity] tasks={},{},{} registers=15 df=1 preemptions={} min_slices={} busy_preemptions={},{},{} iterations={},{},{} corruptions=0 exits={} running_max={} eoi_failures={} canaries_ok={}",
+        integrity.run.ids[0],
+        integrity.run.ids[1],
+        integrity.run.ids[2],
+        integrity.run.preemptions,
+        integrity.run.min_slices,
+        integrity.busy_preemptions[0],
+        integrity.busy_preemptions[1],
+        integrity.busy_preemptions[2],
+        integrity.iterations[0],
+        integrity.iterations[1],
+        integrity.iterations[2],
+        integrity.run.exits,
+        integrity.run.running_max,
+        timer::eoi_failures(),
+        integrity.run.canaries_ok
+    );
+    kprintln!("ELYON_SCHED_CONTEXT_READY");
 
     if framebuffer::draw_boot_screen(info, paging::identity_limit()) {
         kprintln!(

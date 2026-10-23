@@ -1,6 +1,6 @@
 # Elyon Kernel 0.0.4 — Validation
 
-**EN COURS — K004-01 à K004-04 sont validés. K004-05 à K004-12 restent à qualifier.**
+**EN COURS — K004-01 à K004-05 sont validés. K004-06 à K004-12 restent à qualifier.**
 
 ## Baseline héritée
 
@@ -14,7 +14,7 @@ La 0.0.4 est dérivée de la Release `v0.0.3`, dont les critères K003-01 à K00
 | K004-02 | Pile et contexte initial dédiés | **PASS** |
 | K004-03 | Round-Robin coopératif | **PASS** |
 | K004-04 | Préemption LAPIC | **PASS** |
-| K004-05 | Contexte CPU scheduler complet | À faire |
+| K004-05 | Contexte CPU scheduler complet | **PASS** |
 | K004-06 | Sauvegarde FPU/SSE/AVX | À faire |
 | K004-07 | Scheduler per-CPU + idle task | À faire |
 | K004-08 | Reschedule IPI + affinité | À faire |
@@ -222,3 +222,52 @@ Limites : la cible `x86_64-unknown-none` compile sans SSE, aucun état FPU n'est
 **K004-04 : PASS.**
 
 Le prochain critère est **K004-05 : sauvegarde/restauration complète du contexte CPU requis par le scheduler.**
+
+## K004-05 — Contexte CPU complet préservé par le scheduler
+
+Le contexte qu'une tâche doit retrouver intact se compose des quinze registres généraux, de RSP, de RIP et de RFLAGS, y compris les bits qu'elle contrôle elle-même comme DF. Elyon n'utilise qu'un espace d'adressage (un seul CR3), pas de base FS/GS et pas de SSE : aucun autre état n'est en jeu à ce stade.
+
+Ce contexte est sauvegardé par deux chemins :
+
+- **préemption** : le stub d'IRQ timer sauvegarde les quinze registres généraux, le CPU empile RIP, CS, RFLAGS, RSP et SS, et la tâche reprend par `iretq` ;
+- **switch coopératif** : `elyon_context_switch` sauvegarde les registres callee-saved, RFLAGS et RSP ; les registres caller-saved n'ont pas à survivre à un appel selon l'ABI SysV.
+
+La logique pure est dans `elyon_core::cpu_context`, testée sur l'hôte : liste des registres et de ceux que préserve chaque chemin, motifs 64 bits uniques par tâche et par registre, et rapport de corruption registre par registre et pour DF.
+
+La qualification fait tourner trois tâches sous préemption timer (quantum d'un tick, 30 préemptions). Chacune exécute `elyon_context_integrity_loop`, une boucle en assembleur qui charge son motif dans les quinze registres généraux, positionne DF, puis revérifie chaque registre et DF à chaque itération, jusqu'au drapeau d'arrêt. Au premier écart, la boucle écrit l'état observé et le noyau s'arrête fail-closed en nommant le registre corrompu. Les motifs étant propres à chaque tâche, un registre qui passerait d'une tâche à une autre est détecté de la même façon.
+
+Le BSP vérifie en plus qu'au moins 10 préemptions par tâche ont eu lieu pendant la boucle de vérification, que chaque tâche a effectivement itéré, ainsi que la rotation, les états, l'invariant `RUNNING`, les canaris et l'absence d'échec d'EOI.
+
+La vérification a été confrontée à des fautes réelles. Deux injections locales, non conservées dans le code, modifient le stub d'IRQ timer pour corrompre le contexte sauvegardé juste avant `iretq` :
+
+```text
+r9 ^= 1   → [context-integrity] FAILED task_index=0 register=r9 expected=0xe10500095a5a0008 observed=0xe10500095a5a0009 mask=0x0100 df_lost=0
+DF effacé → [context-integrity] FAILED task_index=0 df_lost=1 rflags=0x246
+```
+
+Dans les deux cas, la qualification K004-04 passait encore : c'est ce critère qui établit l'intégrité du contexte. Le script `test-sched-context-qemu.sh` rejette le log réel de l'injection ainsi que des logs altérés (préemptions en boucle insuffisantes, `corruptions=1`, itérations nulles).
+
+La qualification a été exécutée sur le commit `6daf803f0dcc`, GitHub Actions run **#37** du workflow Elyon 0.0.4, et en local sous QEMU 8.2.2 / OVMF, 4 vCPU.
+
+Preuves :
+
+```text
+[context-integrity] tasks=12,13,14 registers=15 df=1 preemptions=30 min_slices=10 busy_preemptions=10,10,10 iterations=3100652,3196159,3177120 corruptions=0 exits=3 running_max=1 eoi_failures=0 canaries_ok=3
+ELYON_SCHED_CONTEXT_READY
+[PASS] K004-05 contexte CPU: 15 registres + DF intacts sous préemption, 10,10,10 préemptions en boucle, aucune corruption
+```
+
+Validation croisée sous VMware® Workstation 17 Pro 17.0.2 build-21581411, UEFI, 4 vCPU, même build :
+
+```text
+[PASS] VMware 4 vCPU: Elyon 0.0.4 K003-01..12 et K004-01..05 validés sur build_id=6daf803f0dcc
+[context-integrity] tasks=12,13,14 registers=15 df=1 preemptions=30 min_slices=10 busy_preemptions=10,10,10 iterations=3426121667,20693287,35121995 corruptions=0 exits=3 running_max=1 eoi_failures=0 canaries_ok=3
+```
+
+Environ 3,5 milliards de vérifications sous virtualisation matérielle, sans corruption. Sur ce boot, la durée réelle des tranches a été très inégale (de 20 millions à 3,4 milliards d'itérations par tâche), signe de ticks délivrés avec retard, vraisemblablement par mise en pause du vCPU côté hôte ; la rotation est restée exacte. L'équité en temps réel n'est pas un critère de K004-05.
+
+Limites : pas d'état FPU/SSE (K004-06), un seul espace d'adressage, pas de ring 3, BSP uniquement.
+
+**K004-05 : PASS.**
+
+Le prochain critère est **K004-06 : isolation FPU/SSE/AVX par tâche via XSAVE/XRSTOR ou fallback qualifié.**

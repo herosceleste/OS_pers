@@ -18,7 +18,7 @@ permissions:
 jobs:
   build-and-boot:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
@@ -113,6 +113,10 @@ jobs:
       - name: K004-04 LAPIC timer preemption test
         working-directory: Elyon-Kernel-0.0.4
         run: bash scripts/test-sched-preempt-qemu.sh
+
+      - name: K004-05 CPU context integrity test
+        working-directory: Elyon-Kernel-0.0.4
+        run: bash scripts/test-sched-context-qemu.sh
 
       - name: IOAPIC regression
         working-directory: Elyon-Kernel-0.0.4

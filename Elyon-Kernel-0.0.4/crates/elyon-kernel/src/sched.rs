@@ -465,7 +465,13 @@ const MIN_FAIR_SLICES: u64 = PREEMPT_TARGET / PREEMPT_TASKS as u64;
 static mut CLOCK: SliceClock = SliceClock::new(QUANTUM);
 
 static PREEMPT_ACTIVE: AtomicBool = AtomicBool::new(false);
-static STOP: AtomicBool = AtomicBool::new(false);
+/// Drapeau d'arrêt de la charge préemptible, lu aussi par l'assembleur de la
+/// boucle d'intégrité K004-05 (d'où le nom de symbole stable).
+#[unsafe(no_mangle)]
+pub static ELYON_SCHED_STOP: AtomicBool = AtomicBool::new(false);
+static ACTIVE_ARG_BASE: AtomicU64 = AtomicU64::new(0);
+static BUSY: [AtomicBool; PREEMPT_TASKS] = [const { AtomicBool::new(false) }; PREEMPT_TASKS];
+static BUSY_PREEMPTIONS: [AtomicU64; PREEMPT_TASKS] = [const { AtomicU64::new(0) }; PREEMPT_TASKS];
 static PREEMPTIONS: AtomicU64 = AtomicU64::new(0);
 static TASK_TICKS: AtomicU64 = AtomicU64::new(0);
 static PREEMPT_IDS: [AtomicU64; PREEMPT_TASKS] = [const { AtomicU64::new(0) }; PREEMPT_TASKS];
@@ -505,6 +511,11 @@ pub fn on_timer_tick() {
 }
 
 fn preempt_current(current: u64) -> Result<(), SchedError> {
+    if let Some(index) = preemptible_index_of(current)
+        && BUSY[index].load(Ordering::Acquire)
+    {
+        BUSY_PREEMPTIONS[index].fetch_add(1, Ordering::AcqRel);
+    }
     task::yield_ready(task::lookup(current)?)?;
     let next = run_queue::yield_next(queue(), current)?;
     task::start(task::lookup(next)?, BSP_CPU)?;
@@ -514,10 +525,10 @@ fn preempt_current(current: u64) -> Result<(), SchedError> {
     }
 
     let preemptions = PREEMPTIONS.fetch_add(1, Ordering::AcqRel) + 1;
-    if !STOP.load(Ordering::Acquire) {
+    if !ELYON_SCHED_STOP.load(Ordering::Acquire) {
         record_slice(next)?;
         if preemptions >= PREEMPT_TARGET {
-            STOP.store(true, Ordering::Release);
+            ELYON_SCHED_STOP.store(true, Ordering::Release);
         }
     }
 
@@ -531,27 +542,42 @@ pub fn qualify_preemption(
     identity_limit: u64,
     timer_initial_count: u32,
 ) -> Result<PreemptQualification, SchedError> {
+    run_preemptive(
+        bsp_stack_start,
+        bsp_stack_end,
+        identity_limit,
+        timer_initial_count,
+        elyon_preempt_task_entry as *const () as usize as u64,
+        PREEMPT_ARG_BASE,
+    )
+}
+
+/// Fait tourner `PREEMPT_TASKS` tâches d'entrée `entry` (argument
+/// `arg_base + index`) sous préemption timer jusqu'à `PREEMPT_TARGET`
+/// préemptions, puis vérifie trace, progression, états et invariants.
+pub fn run_preemptive(
+    bsp_stack_start: u64,
+    bsp_stack_end: u64,
+    identity_limit: u64,
+    timer_initial_count: u32,
+    entry: u64,
+    arg_base: u64,
+) -> Result<PreemptQualification, SchedError> {
     cpu::disable_interrupts();
 
     let bsp = StackRegion {
         start: bsp_stack_start,
         end: bsp_stack_end,
     };
-    let entry = elyon_preempt_task_entry as *const () as usize as u64;
 
     reset();
     reset_preemption();
+    ACTIVE_ARG_BASE.store(arg_base, Ordering::Release);
 
     let mut regions = [StackRegion { start: 0, end: 0 }; PREEMPT_TASKS];
     for (index, region) in regions.iter_mut().enumerate() {
         let id = task::create_kernel(BSP_AFFINITY)?;
-        let prepared = stacks::prepare(
-            id,
-            entry,
-            PREEMPT_ARG_BASE + index as u64,
-            bsp,
-            identity_limit,
-        )?;
+        let prepared = stacks::prepare(id, entry, arg_base + index as u64, bsp, identity_limit)?;
         // SAFETY: l'emplacement appartient au slot statique de la tâche, qui n'a
         // encore jamais été exécutée ; seul le switch le relira.
         unsafe { write_volatile(task::saved_rsp_ptr(id)?, prepared.initial_rsp) };
@@ -603,6 +629,13 @@ pub fn qualify_preemption(
     let min_slices = preempt::min_slices(&trace, &ids);
     if min_slices < MIN_FAIR_SLICES {
         return Err(SchedError::TooFewSlices);
+    }
+
+    // Chaque tranche terminée par le timer l'a été pendant la charge de travail.
+    for busy in &BUSY_PREEMPTIONS {
+        if busy.load(Ordering::Acquire) < MIN_FAIR_SLICES {
+            return Err(SchedError::TooFewSlices);
+        }
     }
 
     let mut counters = [0u64; PREEMPT_TASKS];
@@ -660,14 +693,59 @@ pub fn qualify_preemption(
     })
 }
 
+/// Index de la tâche préemptible courante, après contrôle de son argument
+/// d'entrée. Échoue fail-closed : appelé au début de chaque entrée de tâche.
+pub fn preemptible_task_index(arg: u64) -> usize {
+    let current = CURRENT.load(Ordering::Acquire);
+    let index = match preemptible_index_of(current) {
+        Some(index) => index,
+        None => fail(SchedError::UnknownCurrentTask),
+    };
+    if arg != ACTIVE_ARG_BASE.load(Ordering::Acquire) + index as u64 {
+        fail(SchedError::ArgMismatch);
+    }
+    ARGS_OK.fetch_add(1, Ordering::AcqRel);
+    index
+}
+
+/// Marque la tâche `index` comme occupée par sa charge de travail : les
+/// préemptions subies pendant ce temps sont comptées à part.
+pub fn set_busy(index: usize, busy: bool) {
+    BUSY[index].store(busy, Ordering::Release);
+}
+
+/// Préemptions subies par chaque tâche pendant qu'elle était marquée occupée,
+/// lors du dernier `run_preemptive`.
+pub fn busy_preemptions() -> [u64; PREEMPT_TASKS] {
+    core::array::from_fn(|index| BUSY_PREEMPTIONS[index].load(Ordering::Acquire))
+}
+
+/// Ajoute `amount` au compteur de progression de la tâche `index`.
+pub fn add_progress(index: usize, amount: u64) {
+    COUNTERS[index].fetch_add(amount, Ordering::AcqRel);
+}
+
+fn preemptible_index_of(task_id: u64) -> Option<usize> {
+    PREEMPT_IDS
+        .iter()
+        .position(|id| id.load(Ordering::Acquire) == task_id)
+}
+
 fn reset_preemption() {
     PREEMPT_ACTIVE.store(false, Ordering::Release);
-    STOP.store(false, Ordering::Release);
+    ELYON_SCHED_STOP.store(false, Ordering::Release);
     PREEMPTIONS.store(0, Ordering::Release);
     TASK_TICKS.store(0, Ordering::Release);
     PREEMPT_TRACE_LEN.store(0, Ordering::Release);
-    for entry in PREEMPT_TRACE.iter().chain(COUNTERS.iter()) {
+    for entry in PREEMPT_TRACE
+        .iter()
+        .chain(COUNTERS.iter())
+        .chain(BUSY_PREEMPTIONS.iter())
+    {
         entry.store(0, Ordering::Release);
+    }
+    for busy in &BUSY {
+        busy.store(false, Ordering::Release);
     }
     clock().reset();
 }
@@ -689,26 +767,17 @@ fn record_slice(task_id: u64) -> Result<(), SchedError> {
 
 #[unsafe(no_mangle)]
 extern "C" fn elyon_preempt_task_entry(arg: u64) -> ! {
-    let current = CURRENT.load(Ordering::Acquire);
-    let index = match PREEMPT_IDS
-        .iter()
-        .position(|id| id.load(Ordering::Acquire) == current)
-    {
-        Some(index) => index,
-        None => fail(SchedError::UnknownCurrentTask),
-    };
-    if arg != PREEMPT_ARG_BASE + index as u64 {
-        fail(SchedError::ArgMismatch);
-    }
-    ARGS_OK.fetch_add(1, Ordering::AcqRel);
+    let index = preemptible_task_index(arg);
 
     // Le frame initial porte IF=0 : la tâche ouvre elle-même les interruptions
     // pour que le timer puisse la préempter. Elle ne cède jamais volontairement.
     cpu::enable_interrupts();
-    while !STOP.load(Ordering::Acquire) {
-        COUNTERS[index].fetch_add(1, Ordering::Relaxed);
+    set_busy(index, true);
+    while !ELYON_SCHED_STOP.load(Ordering::Acquire) {
+        add_progress(index, 1);
         core::hint::spin_loop();
     }
+    set_busy(index, false);
 
     exit_now()
 }
