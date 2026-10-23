@@ -11,14 +11,16 @@
 //! de verrou à ce stade (K004-07 et K004-10 traiteront le per-CPU et le SMP).
 
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+use elyon_core::preempt::{self, Quantum, SliceClock, TickDecision};
 use elyon_core::run_queue::{self, QueueError, RunQueue};
 use elyon_core::task_stack::{self, StackRegion};
 
 use crate::arch::x86_64::cpu;
 use crate::task::{self, TaskError, TaskState};
 use crate::task_stack::{self as stacks, TaskStackError};
+use crate::timer::{self, TimerError};
 use crate::{context, kprintln};
 
 pub const QUALIFY_TASKS: usize = 3;
@@ -72,6 +74,7 @@ pub enum SchedError {
     Task(TaskError),
     Stack(TaskStackError),
     Queue(QueueError),
+    Timer(TimerError),
     EmptyQueue,
     NotInTaskContext,
     NotBackOnBsp,
@@ -86,6 +89,10 @@ pub enum SchedError {
     CountMismatch,
     CanaryCorrupted,
     BspRspOutsideKernelStack,
+    TooFewPreemptions,
+    TooFewSlices,
+    NoProgress,
+    InterruptsLeftEnabled,
 }
 
 impl SchedError {
@@ -94,6 +101,7 @@ impl SchedError {
             Self::Task(error) => error.as_str(),
             Self::Stack(error) => error.as_str(),
             Self::Queue(error) => error.as_str(),
+            Self::Timer(error) => error.as_str(),
             Self::EmptyQueue => "run queue empty when a task was expected",
             Self::NotInTaskContext => "yield or exit called outside a task",
             Self::NotBackOnBsp => "BSP resumed while a task is still current",
@@ -108,6 +116,10 @@ impl SchedError {
             Self::CountMismatch => "unexpected yield, exit or switch count",
             Self::CanaryCorrupted => "task stack canary overwritten",
             Self::BspRspOutsideKernelStack => "saved BSP RSP outside loader-provided kernel stack",
+            Self::TooFewPreemptions => "timer did not preempt the tasks often enough",
+            Self::TooFewSlices => "a task received fewer slices than its fair share",
+            Self::NoProgress => "a preemptible task made no progress",
+            Self::InterruptsLeftEnabled => "BSP resumed with interrupts enabled",
         }
     }
 }
@@ -121,6 +133,12 @@ impl From<TaskError> for SchedError {
 impl From<QueueError> for SchedError {
     fn from(error: QueueError) -> Self {
         Self::Queue(error)
+    }
+}
+
+impl From<TimerError> for SchedError {
+    fn from(error: TimerError) -> Self {
+        Self::Timer(error)
     }
 }
 
@@ -244,15 +262,27 @@ pub fn qualify(
 
 /// Cède le CPU : la tâche courante repasse en fin de run queue et la tâche en
 /// tête reprend la main, directement depuis cette tâche.
+///
+/// La run queue est manipulée IRQ masquées (irq-save) : un tick ne peut pas
+/// préempter la tâche au milieu de la mise à jour. L'état d'IF est restauré au
+/// retour, quand la tâche reprend la main.
 pub fn yield_now() {
+    let interrupts = cpu::interrupts_enabled();
+    cpu::disable_interrupts();
     if let Err(error) = try_yield() {
         fail(error);
+    }
+    if interrupts {
+        cpu::enable_interrupts();
     }
 }
 
 /// Termine la tâche courante : elle passe DEAD et n'est pas remise en file. La
 /// tâche suivante reprend la main ; si la file est vide, le BSP la reprend.
+///
+/// IRQ masquées dès l'entrée : la tâche ne reprend jamais, rien à restaurer.
 pub fn exit_now() -> ! {
+    cpu::disable_interrupts();
     if let Err(error) = try_exit() {
         fail(error);
     }
@@ -403,6 +433,281 @@ extern "C" fn elyon_sched_task_entry(arg: u64) -> ! {
         if iteration + 1 < ITERATIONS {
             yield_now();
         }
+    }
+
+    exit_now()
+}
+
+// --- K004-04 : préemption par timer LAPIC ------------------------------------------
+//
+// Trois tâches tournent en boucle de calcul pure, sans jamais céder. À chaque
+// tick, `on_timer_tick` (appelé par le handler timer après l'EOI) décompte la
+// tranche de la tâche courante ; tranche épuisée, la tâche repasse en fin de
+// file et le switch se fait depuis l'IRQ, sur sa pile : elle reprendra plus
+// tard par son propre `iretq`. Après `PREEMPT_TARGET` préemptions, un drapeau
+// d'arrêt est levé et les tâches sortent. La trace n'enregistre que les
+// tranches antérieures à l'arrêt : elle compte exactement `PREEMPT_TARGET + 1`
+// entrées en rotation stricte, quelle que soit la cadence réelle des ticks.
+
+pub const PREEMPT_TASKS: usize = 3;
+pub const PREEMPT_TARGET: u64 = 30;
+pub const PREEMPT_TRACE_CAPACITY: usize = PREEMPT_TARGET as usize + 1;
+pub const QUANTUM_TICKS: u32 = 1;
+
+const PREEMPT_ARG_BASE: u64 = 0xE1_0404_0000;
+const QUANTUM: Quantum = match Quantum::new(QUANTUM_TICKS) {
+    Ok(quantum) => quantum,
+    Err(_) => panic!("QUANTUM_TICKS must be at least one"),
+};
+/// Part équitable minimale : la trace de 31 tranches en donne au moins 10 à chacune.
+const MIN_FAIR_SLICES: u64 = PREEMPT_TARGET / PREEMPT_TASKS as u64;
+
+static mut CLOCK: SliceClock = SliceClock::new(QUANTUM);
+
+static PREEMPT_ACTIVE: AtomicBool = AtomicBool::new(false);
+static STOP: AtomicBool = AtomicBool::new(false);
+static PREEMPTIONS: AtomicU64 = AtomicU64::new(0);
+static TASK_TICKS: AtomicU64 = AtomicU64::new(0);
+static PREEMPT_IDS: [AtomicU64; PREEMPT_TASKS] = [const { AtomicU64::new(0) }; PREEMPT_TASKS];
+static COUNTERS: [AtomicU64; PREEMPT_TASKS] = [const { AtomicU64::new(0) }; PREEMPT_TASKS];
+static PREEMPT_TRACE: [AtomicU64; PREEMPT_TRACE_CAPACITY] =
+    [const { AtomicU64::new(0) }; PREEMPT_TRACE_CAPACITY];
+static PREEMPT_TRACE_LEN: AtomicUsize = AtomicUsize::new(0);
+
+pub struct PreemptQualification {
+    pub ids: [u64; PREEMPT_TASKS],
+    pub trace: [u64; PREEMPT_TRACE_CAPACITY],
+    pub preemptions: u64,
+    pub task_ticks: u64,
+    pub min_slices: u64,
+    pub counters: [u64; PREEMPT_TASKS],
+    pub exits: u64,
+    pub running_max: usize,
+    pub canaries_ok: usize,
+}
+
+/// Appelé par le handler timer, IRQ masquées, après l'EOI.
+pub fn on_timer_tick() {
+    if !PREEMPT_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    let current = CURRENT.load(Ordering::Acquire);
+    if current == BSP_CONTEXT {
+        return;
+    }
+    TASK_TICKS.fetch_add(1, Ordering::AcqRel);
+    if clock().on_tick() == TickDecision::Continue {
+        return;
+    }
+    if let Err(error) = preempt_current(current) {
+        fail(error);
+    }
+}
+
+fn preempt_current(current: u64) -> Result<(), SchedError> {
+    task::yield_ready(task::lookup(current)?)?;
+    let next = run_queue::yield_next(queue(), current)?;
+    task::start(task::lookup(next)?, BSP_CPU)?;
+    clock().reset();
+    if next == current {
+        return Ok(());
+    }
+
+    let preemptions = PREEMPTIONS.fetch_add(1, Ordering::AcqRel) + 1;
+    if !STOP.load(Ordering::Acquire) {
+        record_slice(next)?;
+        if preemptions >= PREEMPT_TARGET {
+            STOP.store(true, Ordering::Release);
+        }
+    }
+
+    TASK_SWITCHES.fetch_add(1, Ordering::AcqRel);
+    transfer(current, next)
+}
+
+pub fn qualify_preemption(
+    bsp_stack_start: u64,
+    bsp_stack_end: u64,
+    identity_limit: u64,
+    timer_initial_count: u32,
+) -> Result<PreemptQualification, SchedError> {
+    cpu::disable_interrupts();
+
+    let bsp = StackRegion {
+        start: bsp_stack_start,
+        end: bsp_stack_end,
+    };
+    let entry = elyon_preempt_task_entry as *const () as usize as u64;
+
+    reset();
+    reset_preemption();
+
+    let mut regions = [StackRegion { start: 0, end: 0 }; PREEMPT_TASKS];
+    for (index, region) in regions.iter_mut().enumerate() {
+        let id = task::create_kernel(BSP_AFFINITY)?;
+        let prepared = stacks::prepare(
+            id,
+            entry,
+            PREEMPT_ARG_BASE + index as u64,
+            bsp,
+            identity_limit,
+        )?;
+        // SAFETY: l'emplacement appartient au slot statique de la tâche, qui n'a
+        // encore jamais été exécutée ; seul le switch le relira.
+        unsafe { write_volatile(task::saved_rsp_ptr(id)?, prepared.initial_rsp) };
+        PREEMPT_IDS[index].store(id.raw(), Ordering::Release);
+        *region = prepared.region;
+        queue().push_back(id.raw())?;
+    }
+
+    let first = run_queue::exit_next(queue()).ok_or(SchedError::EmptyQueue)?;
+    task::start(task::lookup(first)?, BSP_CPU)?;
+    record_slice(first)?;
+    clock().reset();
+    PREEMPT_ACTIVE.store(true, Ordering::Release);
+    timer::restart_periodic(timer_initial_count)?;
+
+    BSP_SWITCHES.fetch_add(1, Ordering::AcqRel);
+    transfer(BSP_CONTEXT, first)?;
+
+    // La dernière tâche sortie rend la main ici, IRQ masquées.
+    PREEMPT_ACTIVE.store(false, Ordering::Release);
+    let interrupts_left_enabled = cpu::interrupts_enabled();
+    cpu::disable_interrupts();
+    timer::stop()?;
+    if interrupts_left_enabled {
+        return Err(SchedError::InterruptsLeftEnabled);
+    }
+    if CURRENT.load(Ordering::Acquire) != BSP_CONTEXT {
+        return Err(SchedError::NotBackOnBsp);
+    }
+
+    let mut ids = [0u64; PREEMPT_TASKS];
+    for (index, id) in ids.iter_mut().enumerate() {
+        *id = PREEMPT_IDS[index].load(Ordering::Acquire);
+    }
+    let mut trace = [0u64; PREEMPT_TRACE_CAPACITY];
+    for (index, entry) in trace.iter_mut().enumerate() {
+        *entry = PREEMPT_TRACE[index].load(Ordering::Acquire);
+    }
+
+    let preemptions = PREEMPTIONS.load(Ordering::Acquire);
+    if preemptions < PREEMPT_TARGET {
+        return Err(SchedError::TooFewPreemptions);
+    }
+    if PREEMPT_TRACE_LEN.load(Ordering::Acquire) != PREEMPT_TRACE_CAPACITY
+        || !preempt::is_rotation(&trace, &ids)
+    {
+        return Err(SchedError::NotRoundRobin);
+    }
+    let min_slices = preempt::min_slices(&trace, &ids);
+    if min_slices < MIN_FAIR_SLICES {
+        return Err(SchedError::TooFewSlices);
+    }
+
+    let mut counters = [0u64; PREEMPT_TASKS];
+    for (index, counter) in counters.iter_mut().enumerate() {
+        *counter = COUNTERS[index].load(Ordering::Acquire);
+        if *counter == 0 {
+            return Err(SchedError::NoProgress);
+        }
+    }
+
+    for &raw in &ids {
+        if task::snapshot(task::lookup(raw)?)?.state != TaskState::Dead {
+            return Err(SchedError::TaskNotDead);
+        }
+    }
+    if !queue().is_empty() {
+        return Err(SchedError::QueueNotEmpty);
+    }
+    if task::running_count() != 0 || RUNNING_MAX.load(Ordering::Acquire) != 1 {
+        return Err(SchedError::RunningInvariant);
+    }
+
+    let exits = EXITS.load(Ordering::Acquire);
+    if exits != PREEMPT_TASKS as u64
+        || ARGS_OK.load(Ordering::Acquire) != PREEMPT_TASKS as u64
+        || BSP_SWITCHES.load(Ordering::Acquire) != EXPECTED_BSP_SWITCHES
+    {
+        return Err(SchedError::CountMismatch);
+    }
+
+    let mut canaries_ok = 0;
+    for region in &regions {
+        if !stacks::canary_intact_at(*region) {
+            return Err(SchedError::CanaryCorrupted);
+        }
+        canaries_ok += 1;
+    }
+
+    // SAFETY: lecture d'un u64 statique écrit uniquement par le switch.
+    let bsp_rsp = unsafe { read_volatile(addr_of!(BSP_RSP)) };
+    if !task_stack::rsp_inside(bsp, bsp_rsp) {
+        return Err(SchedError::BspRspOutsideKernelStack);
+    }
+
+    Ok(PreemptQualification {
+        ids,
+        trace,
+        preemptions,
+        task_ticks: TASK_TICKS.load(Ordering::Acquire),
+        min_slices,
+        counters,
+        exits,
+        running_max: RUNNING_MAX.load(Ordering::Acquire),
+        canaries_ok,
+    })
+}
+
+fn reset_preemption() {
+    PREEMPT_ACTIVE.store(false, Ordering::Release);
+    STOP.store(false, Ordering::Release);
+    PREEMPTIONS.store(0, Ordering::Release);
+    TASK_TICKS.store(0, Ordering::Release);
+    PREEMPT_TRACE_LEN.store(0, Ordering::Release);
+    for entry in PREEMPT_TRACE.iter().chain(COUNTERS.iter()) {
+        entry.store(0, Ordering::Release);
+    }
+    clock().reset();
+}
+
+fn clock() -> &'static mut SliceClock {
+    // SAFETY: l'horloge de tranche n'est touchée que sur le BSP, IRQ masquées
+    // (handler timer ou qualification), et aucune référence n'est conservée.
+    unsafe { &mut *addr_of_mut!(CLOCK) }
+}
+
+fn record_slice(task_id: u64) -> Result<(), SchedError> {
+    let slot = PREEMPT_TRACE_LEN.fetch_add(1, Ordering::AcqRel);
+    PREEMPT_TRACE
+        .get(slot)
+        .ok_or(SchedError::TraceOverflow)?
+        .store(task_id, Ordering::Release);
+    Ok(())
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn elyon_preempt_task_entry(arg: u64) -> ! {
+    let current = CURRENT.load(Ordering::Acquire);
+    let index = match PREEMPT_IDS
+        .iter()
+        .position(|id| id.load(Ordering::Acquire) == current)
+    {
+        Some(index) => index,
+        None => fail(SchedError::UnknownCurrentTask),
+    };
+    if arg != PREEMPT_ARG_BASE + index as u64 {
+        fail(SchedError::ArgMismatch);
+    }
+    ARGS_OK.fetch_add(1, Ordering::AcqRel);
+
+    // Le frame initial porte IF=0 : la tâche ouvre elle-même les interruptions
+    // pour que le timer puisse la préempter. Elle ne cède jamais volontairement.
+    cpu::enable_interrupts();
+    while !STOP.load(Ordering::Acquire) {
+        COUNTERS[index].fetch_add(1, Ordering::Relaxed);
+        core::hint::spin_loop();
     }
 
     exit_now()
