@@ -122,7 +122,6 @@ pub fn qualify(
         end: bsp_stack_end,
     };
     let entry = elyon_task_stack_entry as *const () as usize as u64;
-    let trampoline = elyon_task_trampoline as *const () as usize as u64;
 
     SWITCHES.store(0, Ordering::Release);
     for index in 0..QUALIFY_TASKS {
@@ -137,49 +136,12 @@ pub fn qualify(
 
     for index in 0..QUALIFY_TASKS {
         let id = task::create_kernel(BSP_AFFINITY).map_err(TaskStackError::Task)?;
-        let start = memory::allocate_contiguous_frames(STACK_FRAMES)
-            .ok_or(TaskStackError::AllocationFailed)?;
-        let region = StackRegion {
-            start,
-            end: start + STACK_SIZE,
-        };
+        let prepared = prepare(id, entry, ARG_BASE + index as u64, bsp, identity_limit)?;
+        let region = prepared.region;
+        let rsp = prepared.initial_rsp;
 
-        task_stack::validate_region(region, STACK_SIZE, identity_limit)
-            .map_err(TaskStackError::Stack)?;
-        if task_stack::overlaps(region, bsp) {
-            return Err(TaskStackError::Overlap);
-        }
-
-        // SAFETY: la région vient d'être réservée au PMM, validate_region garantit
-        // qu'elle est entièrement mappée en identité, et aucune tâche ne s'y exécute.
-        unsafe {
-            write_bytes(start as *mut u8, 0, STACK_SIZE as usize);
-            let bottom = start as *mut u64;
-            for word in 0..CANARY_QWORDS {
-                write_volatile(bottom.add(word), CANARY);
-            }
-        }
-
-        let (rsp, frame) = task_stack::initial_frame(FrameSpec {
-            stack: region,
-            entry,
-            arg: ARG_BASE + index as u64,
-            trampoline,
-            rflags: INITIAL_RFLAGS,
-        })
-        .map_err(TaskStackError::Stack)?;
-
-        // SAFETY: `rsp` est le sommet de la pile réservée ci-dessus, aligné sur 16,
-        // et le frame tient dans la pile (vérifié par initial_frame).
-        unsafe {
-            let slots = rsp as *mut u64;
-            for (slot, value) in frame.iter().enumerate() {
-                write_volatile(slots.add(slot), *value);
-            }
-            write_volatile(task_rsp_slot(index), rsp);
-        }
-
-        task::attach_stack(id, region.start, region.end).map_err(TaskStackError::Task)?;
+        // SAFETY: écriture d'un u64 statique, lu uniquement par le switch.
+        unsafe { write_volatile(task_rsp_slot(index), rsp) };
 
         ids[index] = Some(id);
         regions[index] = region;
@@ -242,16 +204,7 @@ pub fn qualify(
 
     let mut canaries_ok = 0;
     for region in &regions {
-        let mut words = [0u64; CANARY_QWORDS];
-        // SAFETY: le bas de pile est mappé (validate_region) et plus aucune tâche
-        // ne s'y exécute : toutes ont rendu la main au BSP.
-        unsafe {
-            let bottom = region.start as *const u64;
-            for (word, value) in words.iter_mut().enumerate() {
-                *value = read_volatile(bottom.add(word));
-            }
-        }
-        if !task_stack::canary_intact(&words) {
+        if !canary_intact_at(*region) {
             return Err(TaskStackError::CanaryCorrupted);
         }
         canaries_ok += 1;
@@ -298,6 +251,87 @@ pub fn qualify(
         canaries_ok,
         switches,
     })
+}
+
+/// Pile prête à être exécutée : réservée, attribuée à la tâche, frame initial écrit.
+#[derive(Clone, Copy)]
+pub struct PreparedStack {
+    pub region: StackRegion,
+    pub initial_rsp: u64,
+}
+
+/// Réserve une pile de 64 KiB au PMM pour la tâche READY `id`, la met à zéro,
+/// pose les canaris, écrit le frame initial (entrée `entry`, argument `arg`,
+/// retour vers `elyon_task_trampoline`) et l'attribue à la tâche.
+pub fn prepare(
+    id: TaskId,
+    entry: u64,
+    arg: u64,
+    bsp: StackRegion,
+    identity_limit: u64,
+) -> Result<PreparedStack, TaskStackError> {
+    let start =
+        memory::allocate_contiguous_frames(STACK_FRAMES).ok_or(TaskStackError::AllocationFailed)?;
+    let region = StackRegion {
+        start,
+        end: start + STACK_SIZE,
+    };
+
+    task_stack::validate_region(region, STACK_SIZE, identity_limit)
+        .map_err(TaskStackError::Stack)?;
+    if task_stack::overlaps(region, bsp) {
+        return Err(TaskStackError::Overlap);
+    }
+
+    // SAFETY: la région vient d'être réservée au PMM, validate_region garantit
+    // qu'elle est entièrement mappée en identité, et aucune tâche ne s'y exécute.
+    unsafe {
+        write_bytes(start as *mut u8, 0, STACK_SIZE as usize);
+        let bottom = start as *mut u64;
+        for word in 0..CANARY_QWORDS {
+            write_volatile(bottom.add(word), CANARY);
+        }
+    }
+
+    let (rsp, frame) = task_stack::initial_frame(FrameSpec {
+        stack: region,
+        entry,
+        arg,
+        trampoline: elyon_task_trampoline as *const () as usize as u64,
+        rflags: INITIAL_RFLAGS,
+    })
+    .map_err(TaskStackError::Stack)?;
+
+    // SAFETY: `rsp` est le sommet de la pile réservée ci-dessus, aligné sur 16,
+    // et le frame tient dans la pile (vérifié par initial_frame).
+    unsafe {
+        let slots = rsp as *mut u64;
+        for (slot, value) in frame.iter().enumerate() {
+            write_volatile(slots.add(slot), *value);
+        }
+    }
+
+    task::attach_stack(id, region.start, region.end).map_err(TaskStackError::Task)?;
+
+    Ok(PreparedStack {
+        region,
+        initial_rsp: rsp,
+    })
+}
+
+/// Vrai si les canaris du bas de `region` portent encore leur motif.
+/// À n'appeler que lorsqu'aucune tâche ne s'exécute sur cette pile.
+pub fn canary_intact_at(region: StackRegion) -> bool {
+    let mut words = [0u64; CANARY_QWORDS];
+    // SAFETY: les piles de tâches sont mappées en identité (validate_region) et
+    // l'appelant garantit qu'aucune tâche ne s'y exécute pendant la lecture.
+    unsafe {
+        let bottom = region.start as *const u64;
+        for (word, value) in words.iter_mut().enumerate() {
+            *value = read_volatile(bottom.add(word));
+        }
+    }
+    task_stack::canary_intact(&words)
 }
 
 fn check_rsp(
