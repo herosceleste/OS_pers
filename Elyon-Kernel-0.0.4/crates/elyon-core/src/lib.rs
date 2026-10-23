@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod acpi;
+pub mod cpu_context;
 pub mod ioapic;
 pub mod pit;
 pub mod preempt;
