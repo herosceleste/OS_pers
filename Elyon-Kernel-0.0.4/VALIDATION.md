@@ -1,6 +1,6 @@
 # Elyon Kernel 0.0.4 — Validation
 
-**EN COURS — K004-01 à K004-07 sont validés. K004-08 à K004-12 restent à qualifier.**
+**EN COURS — K004-01 à K004-08 sont validés. K004-09 à K004-12 restent à qualifier.**
 
 ## Baseline héritée
 
@@ -17,7 +17,7 @@ La 0.0.4 est dérivée de la Release `v0.0.3`, dont les critères K003-01 à K00
 | K004-05 | Contexte CPU scheduler complet | **PASS** |
 | K004-06 | Sauvegarde FPU/SSE/AVX | **PASS** |
 | K004-07 | Scheduler per-CPU + idle task | **PASS** |
-| K004-08 | Reschedule IPI + affinité | À faire |
+| K004-08 | Reschedule IPI + affinité | **PASS** |
 | K004-09 | Sleep/wakeup | À faire |
 | K004-10 | Synchronisation scheduler/IRQ/SMP | À faire |
 | K004-11 | Stress SMP | À faire |
@@ -376,3 +376,58 @@ Limites : l'exécution est coopérative sur les AP, dont les timers LAPIC ne son
 **K004-07 : PASS.**
 
 Le prochain critère est **K004-08 : IPI de rescheduling, réveil distant et affinité CPU.**
+
+## K004-08 — IPI de rescheduling, réveil à distance et affinité CPU
+
+Un CPU peut désormais placer du travail sur un autre CPU déjà en marche : création d'une tâche sur un AP en idle, réveil d'une tâche bloquée sur un autre CPU, migration d'une tâche `READY` quand son affinité change. Le CPU cible est prévenu par un IPI de rescheduling.
+
+La logique pure est dans `elyon_core`, testée sur l'hôte :
+
+- `sync::RawSpinLock` : spinlock sans donnée et sans `unsafe` ; avec 8 threads réels effectuant chacun 20 000 lectures-écritures non atomiques sous le verrou, aucune mise à jour n'est perdue ;
+- `RunQueue::remove()` : retrait d'une tâche pour migration, l'ordre des autres étant conservé ;
+- `percpu_sched` : `should_send_ipi()` (jamais vers soi-même), `migrate()` (la tâche reste, change de file ou est placée ; masque vide ou hors ligne refusé), `check_placement()` (chaque passage sur le CPU attendu, nombre exact de passages par tâche).
+
+Côté noyau :
+
+- chaque file par CPU est protégée par un spinlock, pris IRQ masquées par un garde qui le relâche avant tout switch ; jamais deux verrous de file à la fois ;
+- le vecteur `0xF2` a son propre stub ; le handler envoie l'EOI puis, si le CPU exécute son idle task et que sa file n'est pas vide, l'idle repasse `READY` et la tâche prend le CPU depuis l'IRQ ; l'idle reprend plus tard au même point et sort par `iretq` ;
+- `enqueue()`, `wake()` et `set_affinity()` placent la tâche selon son affinité et n'envoient l'IPI qu'à un autre CPU ;
+- `block_now()` passe la tâche à `BLOCKED` et choisit la suivante sous le verrou de la file du CPU : un réveil concurrent, qui doit prendre ce verrou pour remettre la tâche en file, ne peut pas s'intercaler ;
+- l'idle task du BSP rend la main au boot à chaque fois que la file du BSP se vide.
+
+La qualification, exécutée après K004-07 alors que les AP sont dans leur idle task, enchaîne trois scénarios :
+
+1. une tâche placée sans IPI sur l'AP 1 change d'affinité vers le CPU 0 : elle est retirée de la file de l'AP 1, et le BSP l'exécute ;
+2. une tâche est créée sur l'AP 1 avec IPI : l'idle de l'AP 1 lui cède le CPU ;
+3. une tâche placée sur l'AP 2 se bloque ; le BSP attend qu'elle soit `BLOCKED`, la réveille, et elle reprend sur l'AP 2.
+
+Le BSP vérifie le placement et le nombre de passages de chaque tâche, 3 IPI envoyés et autant de reçus, les tâches `DEAD`, le retour des AP dans leur idle task, au plus une tâche `RUNNING` par CPU et les canaris.
+
+Deux injections de faute ont été rejetées : un handler d'IPI qui ne change pas de tâche, et une migration qui ne retire pas la tâche de sa file d'origine. Le script `test-sched-ipi-qemu.sh` revérifie à partir du log les CPU de chaque scénario, l'unicité des tâches par rapport à K004-07, la synthèse et l'ordre des marqueurs ; 13 copies altérées d'un log réel sont toutes refusées. Le même contrôle s'applique au log VMware. K004-03 à K004-07 ont été rejoués après le verrouillage des files.
+
+La qualification a été exécutée sur le commit `bfec2994a411`, GitHub Actions run **#52** du workflow Elyon 0.0.4, et en local sous QEMU 8.2.2 / OVMF, 4 vCPU.
+
+Preuves :
+
+```text
+[sched-ipi] remote_spawn task=31 cpu=1 runs=1 ipi=1
+[sched-ipi] block_wake task=32 cpu=2 runs=2 blocked_then_woken_by_cpu=0
+[sched-ipi] migrate task=30 from=1 to=0 runs=1
+[sched-ipi] cpus=4 placement_ok=1 ipi_sent=3 ipi_received=3 blocks=1 wakes=1 migrations=1 contention=0 idle_running_aps=3 running_max=1 canaries_ok=3
+ELYON_SCHED_IPI_READY
+[PASS] K004-08 rescheduling à distance: 4 CPU, création sur un AP en idle par IPI, blocage puis réveil depuis le BSP, migration AP 1 -> CPU 0, IPI envoyés=reçus=3, 3 AP revenus en idle
+```
+
+Validation croisée sous VMware® Workstation 17 Pro 17.0.2 build-21581411, UEFI, 4 vCPU, même build :
+
+```text
+[PASS] VMware 4 vCPU: Elyon 0.0.4 K003-01..12 et K004-01..08 validés sur build_id=bfec2994a411
+```
+
+Les lignes `[sched-ipi]` relevées sous VMware sont identiques à celles de QEMU.
+
+Limites : seules les tâches `READY` en file migrent, pas une tâche en cours d'exécution ; l'IPI ne fait changer de tâche qu'un CPU en idle, sans préempter une tâche en cours ; aucune contention n'a été observée sur les verrous de file (`contention=0`), qui seront mis sous charge par K004-10 et K004-11 ; seul le BSP alloue, le PMM n'étant pas verrouillé.
+
+**K004-08 : PASS.**
+
+Le prochain critère est **K004-09 : sleep/wakeup.**
