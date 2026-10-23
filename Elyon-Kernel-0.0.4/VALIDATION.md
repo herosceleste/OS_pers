@@ -1,6 +1,6 @@
 # Elyon Kernel 0.0.4 — Validation
 
-**EN COURS — K004-01 à K004-05 sont validés. K004-06 à K004-12 restent à qualifier.**
+**EN COURS — K004-01 à K004-06 sont validés. K004-07 à K004-12 restent à qualifier.**
 
 ## Baseline héritée
 
@@ -15,7 +15,7 @@ La 0.0.4 est dérivée de la Release `v0.0.3`, dont les critères K003-01 à K00
 | K004-03 | Round-Robin coopératif | **PASS** |
 | K004-04 | Préemption LAPIC | **PASS** |
 | K004-05 | Contexte CPU scheduler complet | **PASS** |
-| K004-06 | Sauvegarde FPU/SSE/AVX | À faire |
+| K004-06 | Sauvegarde FPU/SSE/AVX | **PASS** |
 | K004-07 | Scheduler per-CPU + idle task | À faire |
 | K004-08 | Reschedule IPI + affinité | À faire |
 | K004-09 | Sleep/wakeup | À faire |
@@ -271,3 +271,60 @@ Limites : pas d'état FPU/SSE (K004-06), un seul espace d'adressage, pas de ring
 **K004-05 : PASS.**
 
 Le prochain critère est **K004-06 : isolation FPU/SSE/AVX par tâche via XSAVE/XRSTOR ou fallback qualifié.**
+
+## K004-06 — Isolation FPU/SSE/AVX par tâche
+
+Avant ce critère, `CR4=0x668` portait déjà OSFXSR et OSXMMEXCPT, hérités de l'UEFI, et `CR0` avait EM=0 et TS=0 : les instructions SSE s'exécutaient sans piège, mais sans aucune isolation entre tâches. Le noyau étant compilé en soft-float, seul le code des tâches touche aux registres x87/SSE/AVX.
+
+La logique pure est dans `elyon_core::fpu`, testée sur l'hôte :
+
+- `choose()` : XSAVE avec x87|SSE, plus AVX seulement si CPUID et la feuille XSAVE le rapportent, jamais de composant au-delà d'AVX ; repli FXSAVE sinon ; refus des CPU sans FXSR ou SSE2 ;
+- `area_layout()` : 512 octets alignés sur 16 pour FXSAVE, taille CPUID entre 576 et 4096 octets alignée sur 64 pour XSAVE ;
+- `write_init_image()` : FCW `0x037F`, MXCSR `0x1F80`, en-tête XSAVE vide ;
+- motifs XMM, moitiés hautes YMM et MXCSR propres à chaque tâche, et comparaison.
+
+Côté noyau :
+
+- activation : CR0 (EM=0, MP=1, TS=0), CR4 (OSFXSR, OSXMMEXCPT, et OSXSAVE si XSAVE est retenu), `xsetbv` puis relecture de XCR0 par `xgetbv` ; taille de zone lue dans CPUID.0xD ;
+- chaque tâche reçoit une zone de sauvegarde PMM copiée depuis l'image initiale ; le BSP a la sienne ;
+- `transfer()` sauvegarde l'état SIMD du contexte sortant et restaure celui du contexte entrant à chaque switch (stratégie eager) ; une zone manquante arrête le noyau fail-closed ;
+- un build avec la variable `ELYON_FPU_FORCE_FXSAVE` définie force le repli FXSAVE, pour le qualifier sur un CPU qui dispose de XSAVE.
+
+La qualification fait tourner trois tâches sous préemption timer (quantum d'un tick, 30 préemptions). Chacune exécute `elyon_simd_integrity_loop`, qui charge son MXCSR et ses motifs dans XMM0..15, ainsi que dans les moitiés hautes de YMM0..15 si AVX est actif, puis les revérifie à chaque itération. Au premier écart, le noyau s'arrête fail-closed en nommant le registre (`xmmN`, `ymmN_high` ou `mxcsr`). Le BSP vérifie en plus au moins 10 préemptions par tâche pendant la boucle, la progression, la rotation, les états, l'invariant `RUNNING`, les canaris et l'absence d'échec d'EOI.
+
+La vérification a été confrontée à une faute réelle : une injection locale, non conservée dans le code, désactive la sauvegarde et la restauration dans `transfer()`.
+
+```text
+xsave  → [fpu-integrity] FAILED task_index=0 register=xmm0 expected=0xf1e600015a5a0000f0e600015a5a0000 observed=0xf1e602015a5a0200f0e602015a5a0200 xmm_mask=0xffff ymm_mask=0xffff
+fxsave → [fpu-integrity] FAILED task_index=0 register=xmm0 … xmm_mask=0xffff ymm_mask=0x0000
+```
+
+La tâche 0 y lit exactement les motifs de la tâche 2 dans tous ses registres : c'est la fuite que ce critère empêche. K004-05 passait encore. Le script `test-sched-fpu-qemu.sh` exige XSAVE quand le CPU le propose, ou le repli FXSAVE en build forcé ; il rejette les deux logs réels d'injection, un log par défaut présenté comme FXSAVE forcé et un XCR0 débordant (`0x27`). La CI l'exécute sur les deux chemins.
+
+La qualification a été exécutée sur le commit `3063cd63747b`, GitHub Actions run **#41** du workflow Elyon 0.0.4, et en local sous QEMU 8.2.2 / OVMF, 4 vCPU, sur les deux chemins.
+
+Preuves :
+
+```text
+[fpu] fxsr=1 sse2=1 xsave=1 avx=1 xcr0_supported=0x21f strategy=xsave xcr0=0x7 avx_enabled=1 area=832 align=64 forced_fxsave=0 cr0=0x80010033 cr4=0x40668
+[fpu-integrity] tasks=15,16,17 strategy=xsave avx=1 xmm=16 ymm_high=16 mxcsr=1 preemptions=30 min_slices=10 busy_preemptions=10,10,10 iterations=384308,405060,395278 corruptions=0 exits=3 running_max=1 eoi_failures=0 canaries_ok=3
+ELYON_SCHED_FPU_READY
+[PASS] K004-06 isolation FPU par tâche (xsave, avx=1): xmm=16 ymm_high=16 mxcsr intacts sous préemption, 10,10,10 préemptions en boucle, aucune corruption
+[PASS] K004-06 isolation FPU par tâche (fxsave, avx=0): xmm=16 ymm_high=0 mxcsr intacts sous préemption, 10,10,10 préemptions en boucle, aucune corruption
+```
+
+Validation croisée sous VMware® Workstation 17 Pro 17.0.2 build-21581411, UEFI, 4 vCPU, même build :
+
+```text
+[PASS] VMware 4 vCPU: Elyon 0.0.4 K003-01..12 et K004-01..06 validés sur build_id=3063cd63747b
+[fpu] fxsr=1 sse2=1 xsave=1 avx=1 xcr0_supported=0xe7 strategy=xsave xcr0=0x7 avx_enabled=1 area=832 align=64 forced_fxsave=0 cr0=0x80010033 cr4=0x40668
+[fpu-integrity] tasks=15,16,17 strategy=xsave avx=1 xmm=16 ymm_high=16 mxcsr=1 preemptions=30 min_slices=10 busy_preemptions=10,10,10 iterations=5185283,5227557,5137738 corruptions=0 exits=3 running_max=1 eoi_failures=0 canaries_ok=3
+```
+
+VMware expose AVX-512 (`xcr0_supported=0xe7` : opmask, ZMM_Hi256, Hi16_ZMM) ; seuls x87|SSE|AVX (`0x7`) sont activés et la zone reste à 832 octets.
+
+Limites : sauvegarde systématique à chaque switch, sans mode lazy (CR0.TS) ; AVX-512 volontairement non pris en charge ; le noyau lui-même n'utilise pas le SIMD ; BSP uniquement ; le repli FXSAVE n'est exercé qu'en build forcé, QEMU et VMware proposant tous deux XSAVE.
+
+**K004-06 : PASS.**
+
+Le prochain critère est **K004-07 : scheduler per-CPU et idle task officielle sur chaque CPU.**

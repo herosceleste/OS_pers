@@ -77,6 +77,7 @@ struct TaskSlot {
     stack_start: AtomicU64,
     stack_end: AtomicU64,
     saved_rsp: AtomicU64,
+    fpu_area: AtomicU64,
 }
 
 impl TaskSlot {
@@ -89,6 +90,7 @@ impl TaskSlot {
             stack_start: AtomicU64::new(0),
             stack_end: AtomicU64::new(0),
             saved_rsp: AtomicU64::new(0),
+            fpu_area: AtomicU64::new(0),
         }
     }
 }
@@ -177,6 +179,7 @@ pub fn create_kernel(affinity_mask: u64) -> Result<TaskId, TaskError> {
         slot.stack_start.store(0, Ordering::Release);
         slot.stack_end.store(0, Ordering::Release);
         slot.saved_rsp.store(0, Ordering::Release);
+        slot.fpu_area.store(0, Ordering::Release);
         slot.state.store(STATE_READY, Ordering::Release);
         CREATED_TASKS.fetch_add(1, Ordering::AcqRel);
 
@@ -321,6 +324,19 @@ pub fn lookup(raw: u64) -> Result<TaskId, TaskError> {
 pub fn saved_rsp_ptr(id: TaskId) -> Result<*mut u64, TaskError> {
     let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
     Ok(slot.saved_rsp.as_ptr())
+}
+
+/// Attribue à la tâche sa zone de sauvegarde FPU/SSE/AVX (K004-06).
+pub fn set_fpu_area(id: TaskId, area: u64) -> Result<(), TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    slot.fpu_area.store(area, Ordering::Release);
+    Ok(())
+}
+
+/// Zone de sauvegarde FPU de la tâche, 0 si elle n'en a pas.
+pub fn fpu_area(id: TaskId) -> Result<u64, TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    Ok(slot.fpu_area.load(Ordering::Acquire))
 }
 
 /// Nombre de tâches actuellement RUNNING, tous CPU confondus.

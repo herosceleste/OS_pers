@@ -95,6 +95,15 @@ fi
 require_regex "^\[context-integrity\] tasks=[0-9]+,[0-9]+,[0-9]+ registers=15 df=1 preemptions=(3[0-9]|[4-9][0-9]|[1-9][0-9]{2,}) min_slices=(1[0-9]|[2-9][0-9]) busy_preemptions=(1[0-9]|[2-9][0-9]|[1-9][0-9]{2,}),(1[0-9]|[2-9][0-9]|[1-9][0-9]{2,}),(1[0-9]|[2-9][0-9]|[1-9][0-9]{2,}) iterations=[1-9][0-9]*,[1-9][0-9]*,[1-9][0-9]* corruptions=0 exits=3 running_max=1 eoi_failures=0 canaries_ok=3\s*$"   "K004-05: synthèse d'intégrité du contexte invalide"
 require_fixed "ELYON_SCHED_CONTEXT_READY" "K004-05: marqueur contexte absent"
 
+if grep -Eq '\[(fpu|fpu-integrity)\] FAILED' "$LOG"; then
+  echo "[FAIL] K004-06: échec FPU ou corruption SIMD détectée sous VMware" >&2
+  grep -E '\[(fpu|fpu-integrity)\] FAILED' "$LOG" >&2
+  exit 1
+fi
+require_regex "^\[fpu\] fxsr=1 sse2=1 xsave=[01] avx=[01] xcr0_supported=0x[0-9a-f]+ strategy=(xsave xcr0=0x[37] avx_enabled=[01] area=[0-9]+ align=64|fxsave xcr0=0x0 avx_enabled=0 area=512 align=16) forced_fxsave=0 "   "K004-06: configuration FPU invalide"
+require_regex "^\[fpu-integrity\] tasks=[0-9]+,[0-9]+,[0-9]+ strategy=(xsave|fxsave) avx=(1 xmm=16 ymm_high=16|0 xmm=16 ymm_high=0) mxcsr=1 preemptions=(3[0-9]|[4-9][0-9]|[1-9][0-9]{2,}) min_slices=(1[0-9]|[2-9][0-9]) busy_preemptions=(1[0-9]|[2-9][0-9]|[1-9][0-9]{2,}),(1[0-9]|[2-9][0-9]|[1-9][0-9]{2,}),(1[0-9]|[2-9][0-9]|[1-9][0-9]{2,}) iterations=[1-9][0-9]*,[1-9][0-9]*,[1-9][0-9]* corruptions=0 exits=3 running_max=1 eoi_failures=0 canaries_ok=3\s*$"   "K004-06: synthèse d'isolation SIMD invalide"
+require_fixed "ELYON_SCHED_FPU_READY" "K004-06: marqueur FPU absent"
+
 require_fixed "ELYON_KERNEL_READY_0_0_4" "boot nominal final absent"
 
 if grep -Eq '\[KERNEL PANIC\]|\[EXCEPTION\]|\[[^]]+\] FAILED|ELYON_[A-Z_]+_FAILED' "$LOG"; then
@@ -103,4 +112,4 @@ if grep -Eq '\[KERNEL PANIC\]|\[EXCEPTION\]|\[[^]]+\] FAILED|ELYON_[A-Z_]+_FAILE
   exit 1
 fi
 
-echo "[PASS] VMware 4 vCPU: Elyon 0.0.4 K003-01..12 et K004-01..05 validés sur build_id=$EXPECTED_BUILD_ID"
+echo "[PASS] VMware 4 vCPU: Elyon 0.0.4 K003-01..12 et K004-01..06 validés sur build_id=$EXPECTED_BUILD_ID"

@@ -8,6 +8,7 @@
 
 pub mod acpi;
 pub mod cpu_context;
+pub mod fpu;
 pub mod ioapic;
 pub mod pit;
 pub mod preempt;

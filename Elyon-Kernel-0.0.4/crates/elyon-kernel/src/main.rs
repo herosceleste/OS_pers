@@ -5,6 +5,8 @@ mod acpi;
 mod arch;
 mod context;
 mod context_integrity;
+mod fpu;
+mod fpu_integrity;
 mod framebuffer;
 mod memory;
 mod sched;
@@ -502,6 +504,33 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
     );
     kprintln!("ELYON_TASK_STACKS_READY");
 
+    let fpu_setup = match fpu::init() {
+        Ok(setup) => setup,
+        Err(error) => {
+            kprintln!("[fpu] FAILED reason={}", error.as_str());
+            cpu::halt_forever();
+        }
+    };
+    kprintln!(
+        "[fpu] fxsr={} sse2={} xsave={} avx={} xcr0_supported={:#x} strategy={} xcr0={:#x} avx_enabled={} area={} align={} forced_fxsave={} cr0={:#x} cr4={:#x}",
+        if fpu_setup.features.fxsr { 1 } else { 0 },
+        if fpu_setup.features.sse2 { 1 } else { 0 },
+        if fpu_setup.features.xsave { 1 } else { 0 },
+        if fpu_setup.features.avx { 1 } else { 0 },
+        fpu_setup.features.xcr0_supported,
+        fpu_setup.strategy.as_str(),
+        match fpu_setup.strategy {
+            elyon_core::fpu::Strategy::Xsave { xcr0 } => xcr0,
+            elyon_core::fpu::Strategy::Fxsave => 0,
+        },
+        if fpu_setup.strategy.avx() { 1 } else { 0 },
+        fpu_setup.layout.size,
+        fpu_setup.layout.align,
+        if fpu_setup.forced_fxsave { 1 } else { 0 },
+        fpu_setup.cr0,
+        fpu_setup.cr4
+    );
+
     let rr = match sched::qualify(
         info.kernel_stack_start,
         info.kernel_stack_end,
@@ -760,6 +789,43 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         integrity.run.canaries_ok
     );
     kprintln!("ELYON_SCHED_CONTEXT_READY");
+
+    let simd = match fpu_integrity::qualify(
+        info.kernel_stack_start,
+        info.kernel_stack_end,
+        paging::identity_limit(),
+        timer_calibration.initial_count,
+        fpu_setup.strategy.avx(),
+    ) {
+        Ok(summary) => summary,
+        Err(error) => {
+            kprintln!("[fpu-integrity] FAILED reason={}", error.as_str());
+            cpu::halt_forever();
+        }
+    };
+
+    kprintln!(
+        "[fpu-integrity] tasks={},{},{} strategy={} avx={} xmm=16 ymm_high={} mxcsr=1 preemptions={} min_slices={} busy_preemptions={},{},{} iterations={},{},{} corruptions=0 exits={} running_max={} eoi_failures={} canaries_ok={}",
+        simd.run.ids[0],
+        simd.run.ids[1],
+        simd.run.ids[2],
+        fpu_setup.strategy.as_str(),
+        if simd.avx { 1 } else { 0 },
+        if simd.avx { 16 } else { 0 },
+        simd.run.preemptions,
+        simd.run.min_slices,
+        simd.busy_preemptions[0],
+        simd.busy_preemptions[1],
+        simd.busy_preemptions[2],
+        simd.iterations[0],
+        simd.iterations[1],
+        simd.iterations[2],
+        simd.run.exits,
+        simd.run.running_max,
+        timer::eoi_failures(),
+        simd.run.canaries_ok
+    );
+    kprintln!("ELYON_SCHED_FPU_READY");
 
     if framebuffer::draw_boot_screen(info, paging::identity_limit()) {
         kprintln!(
