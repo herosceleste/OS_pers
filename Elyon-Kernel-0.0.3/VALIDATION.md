@@ -2,7 +2,7 @@
 
 ## Statut
 
-**QUALIFICATION AUTOMATISÉE TERMINÉE — K003-01 à K003-12 sont validés. Validation croisée VMware finale à exécuter avant fusion.**
+**QUALIFICATION TERMINÉE — K003-01 à K003-12 sont validés sous QEMU/OVMF et en validation croisée VMware Workstation Pro 4 vCPU (build_id `b1ee379af28b`, branche `elyon-0.0.3-stabilize`).**
 
 Baseline de départ : fusion 0.0.2 dans `main`, commit `303feeeff93b4ed1b5b3092cc16a4d8c4489f252`.
 
@@ -158,6 +158,14 @@ La première validation VMware 4 vCPU a atteint avec succès ACPI, LAPIC, per-CP
 VMware annonce dans MADT un IOAPIC `id=4` à `0xFEC00000`, GSI base 0. Cette observation a révélé que l'égalité stricte des deux représentations d'ID était une politique trop restrictive pour la portabilité hyperviseur. Elyon conserve désormais la divergence comme `id_mismatch` diagnostique, sans masquer les contrôles réellement utilisés pour le routage.
 
 La correction a été qualifiée sous QEMU par GitHub Actions run **#209**. QEMU conserve `madt_id=0 hw_id=0 id_match=1`, `id_mismatches=0`, et K003-05/K003-12/#UD/#DF restent PASS. La validation VMware doit être rejouée avec la nouvelle ISO avant fusion.
+
+Validation VMware rejouée le 2026-10-23 sur `b1ee379af28b` : la divergence est bien journalisée sans arrêt du noyau.
+
+```text
+[ioapic] WARNING id_mismatch madt_id=4 hw_id=0 policy=diagnostic-only
+[ioapic] legacy_routes=15 overrides_applied=1 shadowed=1 id_mismatches=1 masked=24/24 all_masked=1
+ELYON_IOAPIC_READY
+```
 
 ## K003-06 — Timer noyau
 
@@ -446,7 +454,15 @@ Ces empreintes identifient les artefacts de la qualification CI #196. Elles ne c
 
 ### État de fusion
 
-La qualification automatisée 0.0.3 est complète. La PR #2 reste volontairement en Draft jusqu'à une validation croisée finale sous VMware Workstation Pro avec 4 vCPU. Cette vérification doit confirmer au minimum `ELYON_AP_READY` pour les trois AP, `ELYON_SMP_STABLE`, `ELYON_CONTEXT_SWITCH_READY`, `ELYON_TIMER_READY` et `ELYON_KERNEL_READY_0_0_3`.
+La qualification automatisée 0.0.3 est complète. La PR #2 a été fusionnée dans `main` le 2026-10-19 (`ca57e56`).
+
+La validation croisée finale sous VMware Workstation 17 Pro 17.0.2 (build-21581411) en 4 vCPU a été exécutée le 2026-10-23 sur la branche `elyon-0.0.3-stabilize`, build_id `b1ee379af28b`. Elle confirme `ELYON_AP_READY` pour les trois AP, `ELYON_SMP_STABLE`, `ELYON_CONTEXT_SWITCH_READY`, `ELYON_TIMER_READY` et `ELYON_KERNEL_READY_0_0_3` :
+
+```text
+[PASS] VMware 4 vCPU: Elyon 0.0.3 K003-01..12 validés sur build_id=b1ee379af28b
+```
+
+Le détail des preuves figure dans `QUALIFICATION_0.0.3.md`.
 
 ## Régressions 0.0.2
 
@@ -478,4 +494,4 @@ La simple présence de structures ACPI, APIC, TSS ou d'un trampoline dans le cod
 
 ## Prochaine étape
 
-Tous les critères **K003-01 à K003-12** sont validés en CI. La prochaine action avant fusion est la **validation croisée VMware Workstation Pro en 4 vCPU** sur la branche `elyon-0.0.3`.
+Tous les critères **K003-01 à K003-12** sont validés en CI et en validation croisée VMware Workstation Pro 4 vCPU. La prochaine action est de proposer la fusion de la branche `elyon-0.0.3-stabilize` dans `main`.

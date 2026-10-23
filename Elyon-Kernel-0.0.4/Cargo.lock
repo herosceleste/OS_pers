@@ -31,10 +31,18 @@ name = "elyon-abi"
 version = "0.0.4"
 
 [[package]]
+name = "elyon-core"
+version = "0.0.4"
+dependencies = [
+ "elyon-abi",
+]
+
+[[package]]
 name = "elyon-kernel"
 version = "0.0.4"
 dependencies = [
  "elyon-abi",
+ "elyon-core",
  "x86_64",
 ]
 

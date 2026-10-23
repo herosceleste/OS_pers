@@ -33,6 +33,10 @@ pub enum TaskState {
 }
 
 impl TaskState {
+    #[expect(
+        dead_code,
+        reason = "API du modèle de tâche K004-01, pas encore consommée au boot"
+    )]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ready => "READY",
@@ -87,8 +91,16 @@ static TASKS: [TaskSlot; MAX_TASKS] = [const { TaskSlot::empty() }; MAX_TASKS];
 
 #[derive(Clone, Copy)]
 pub struct TaskSnapshot {
+    #[expect(
+        dead_code,
+        reason = "API du modèle de tâche K004-01, pas encore consommée au boot"
+    )]
     pub id: TaskId,
     pub state: TaskState,
+    #[expect(
+        dead_code,
+        reason = "API du modèle de tâche K004-01, pas encore consommée au boot"
+    )]
     pub affinity_mask: u64,
     pub current_cpu: u32,
 }
