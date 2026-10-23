@@ -83,6 +83,10 @@ require_fixed "ELYON_IOAPIC_READY" "marqueur IOAPIC absent"
 require_regex "\[timer\] ticks=(1[0-9][0-9]|[2-9][0-9]{2,}) eoi_failures=0 periodic=1"   "timer LAPIC non confirmé"
 require_fixed "ELYON_TIMER_READY" "marqueur timer absent"
 
+require_regex "^\[preempt\] tasks=([0-9]+),([0-9]+),([0-9]+) trace=(\1,\2,\3,){10}\1\s*$"   "K004-04: trace de préemption stricte (31 tranches) absente"
+require_regex "^\[preempt\] policy=timer-preemptive quantum_ticks=1 target=30 preemptions=(3[0-9]|[4-9][0-9]|[1-9][0-9]{2,}) task_ticks=(3[0-9]|[4-9][0-9]|[1-9][0-9]{2,}) min_slices=(1[0-9]|[2-9][0-9]) counters=[1-9][0-9]*,[1-9][0-9]*,[1-9][0-9]* exits=3 running_max=1 eoi_failures=0 canaries_ok=3\s*$"   "K004-04: synthèse de préemption invalide"
+require_fixed "ELYON_SCHED_PREEMPT_READY" "K004-04: marqueur préemption absent"
+
 require_fixed "ELYON_KERNEL_READY_0_0_4" "boot nominal final absent"
 
 if grep -Eq '\[KERNEL PANIC\]|\[EXCEPTION\]|\[[^]]+\] FAILED|ELYON_[A-Z_]+_FAILED' "$LOG"; then
@@ -91,4 +95,4 @@ if grep -Eq '\[KERNEL PANIC\]|\[EXCEPTION\]|\[[^]]+\] FAILED|ELYON_[A-Z_]+_FAILE
   exit 1
 fi
 
-echo "[PASS] VMware 4 vCPU: Elyon 0.0.4 K003-01..12 et K004-01..03 validés sur build_id=$EXPECTED_BUILD_ID"
+echo "[PASS] VMware 4 vCPU: Elyon 0.0.4 K003-01..12 et K004-01..04 validés sur build_id=$EXPECTED_BUILD_ID"
