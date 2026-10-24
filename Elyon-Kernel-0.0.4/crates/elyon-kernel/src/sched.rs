@@ -13,18 +13,19 @@
 use core::ptr::{addr_of_mut, read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+use elyon_core::lock_order::LockClass;
 use elyon_core::percpu_sched::{
     self, Expectation, Migration, Placed, PlacementError, TraceEntry,
     TraceError as PercpuTraceError,
 };
 use elyon_core::preempt::{self, Quantum, SliceClock, TickDecision};
 use elyon_core::run_queue::{self, QueueError, RunQueue};
-use elyon_core::sync::RawSpinLock;
 use elyon_core::task_stack::{self, StackRegion};
 use elyon_core::timer_queue::{self, SleepRecord, TimerQueue, TimerQueueError};
 
 use crate::arch::x86_64::cpu;
 use crate::fpu::{self, FpuSetupError};
+use crate::sync::{IrqGuard, IrqSpinLock};
 use crate::task::{self, TaskError, TaskState};
 use crate::task_stack::{self as stacks, TaskStackError};
 use crate::timer::{self, TimerError};
@@ -54,8 +55,8 @@ pub const MAX_SCHED_CPUS: usize = 8;
 // État de scheduler propre à chaque CPU logique : sa run queue, le RSP de son
 // contexte de départ (hors tâche) et la tâche qu'il exécute. Chaque CPU ne
 // touche que son propre slot, IRQ masquées.
-static mut QUEUES: [RunQueue<QUEUE_CAPACITY>; MAX_SCHED_CPUS] =
-    [const { RunQueue::new() }; MAX_SCHED_CPUS];
+static QUEUES: [IrqSpinLock<RunQueue<QUEUE_CAPACITY>>; MAX_SCHED_CPUS] =
+    [const { IrqSpinLock::new(LockClass::RunQueue, RunQueue::new()) }; MAX_SCHED_CPUS];
 static mut BOOT_RSP: [u64; MAX_SCHED_CPUS] = [0; MAX_SCHED_CPUS];
 
 static CURRENT: [AtomicU64; MAX_SCHED_CPUS] =
@@ -392,6 +393,8 @@ fn try_exit() -> Result<(), SchedError> {
 /// BSP). Les transitions d'état sont faites par l'appelant ; l'invariant « une
 /// seule tâche RUNNING » est vérifié juste avant le switch.
 fn transfer(current: u64, next: u64) -> Result<(), SchedError> {
+    // K004-10 : aucun verrou emporté à travers le switch, IRQ masquées.
+    crate::sync::assert_switch_allowed();
     let running = task::running_count_on(this_cpu() as u32);
     RUNNING_MAX.fetch_max(running, Ordering::AcqRel);
     let expected_running = if next == BSP_CONTEXT { 0 } else { 1 };
@@ -463,58 +466,14 @@ fn reset() {
     RUNNING_MAX.store(0, Ordering::Release);
 }
 
-static QUEUE_LOCKS: [RawSpinLock; MAX_SCHED_CPUS] = [const { RawSpinLock::new() }; MAX_SCHED_CPUS];
-/// Tours d'attente cumulés sur les verrous de file (contention, K004-08).
-static QUEUE_CONTENTION: AtomicU64 = AtomicU64::new(0);
-
-/// Accès exclusif à la run queue d'un CPU : le verrou est pris à la création
-/// et relâché à la destruction du garde. Toujours pris IRQ masquées, jamais
-/// conservé à travers un switch.
-pub struct QueueGuard {
-    cpu: usize,
-}
-
-impl core::ops::Deref for QueueGuard {
-    type Target = RunQueue<QUEUE_CAPACITY>;
-
-    fn deref(&self) -> &Self::Target {
-        // SAFETY: `cpu < MAX_SCHED_CPUS` et le verrou de cette file est tenu
-        // pendant toute la vie du garde.
-        unsafe {
-            &*addr_of_mut!(QUEUES)
-                .cast::<RunQueue<QUEUE_CAPACITY>>()
-                .add(self.cpu)
-        }
-    }
-}
-
-impl core::ops::DerefMut for QueueGuard {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        // SAFETY: `cpu < MAX_SCHED_CPUS` et le verrou tenu garantit l'unicité de
-        // la référence mutable.
-        unsafe {
-            &mut *addr_of_mut!(QUEUES)
-                .cast::<RunQueue<QUEUE_CAPACITY>>()
-                .add(self.cpu)
-        }
-    }
-}
-
-impl Drop for QueueGuard {
-    fn drop(&mut self) {
-        QUEUE_LOCKS[self.cpu].unlock();
-    }
-}
-
-/// Run queue du CPU courant, verrouillée.
-fn queue() -> QueueGuard {
+/// Run queue du CPU courant, verrouillée : le garde masque les IRQ et n'est
+/// jamais conservé à travers un switch (vérifié par `transfer`).
+fn queue() -> IrqGuard<'static, RunQueue<QUEUE_CAPACITY>> {
     queue_of(this_cpu())
 }
 
-fn queue_of(cpu: usize) -> QueueGuard {
-    let spins = QUEUE_LOCKS[cpu].lock();
-    QUEUE_CONTENTION.fetch_add(spins, Ordering::Relaxed);
-    QueueGuard { cpu }
+fn queue_of(cpu: usize) -> IrqGuard<'static, RunQueue<QUEUE_CAPACITY>> {
+    QUEUES[cpu].lock()
 }
 
 fn boot_rsp_slot(cpu: usize) -> *mut u64 {
@@ -1380,7 +1339,10 @@ pub fn enqueue(task_id: u64, notify: bool) -> Result<usize, SchedError> {
 
 /// Réveille une tâche BLOCKED ou SLEEPING : la transition vers READY est
 /// atomique ; seul le gagnant la remet en file et prévient son CPU.
-pub fn wake(task_id: u64) -> Result<usize, SchedError> {
+/// Réveille une tâche BLOCKED ou SLEEPING. `Ok(None)` : la tâche n'était pas
+/// endormie (déjà réveillée par un autre CPU ou par son échéance, ou pas encore
+/// bloquée) ; entre réveils concurrents, un seul obtient `Some(cpu)` (K004-10).
+pub fn wake(task_id: u64) -> Result<Option<usize>, SchedError> {
     irq_save(|| {
         // Un réveil explicite annule l'échéance en attente : le tick ne pourra
         // plus réveiller la tâche une seconde fois (K004-09).
@@ -1388,7 +1350,11 @@ pub fn wake(task_id: u64) -> Result<usize, SchedError> {
             log_wake(task_id, timer::ticks(), true);
             EXPLICIT_WAKES.fetch_add(1, Ordering::AcqRel);
         }
-        wake_task(task_id)
+        match wake_task(task_id) {
+            Ok(cpu) => Ok(Some(cpu)),
+            Err(SchedError::Task(TaskError::InvalidTransition)) => Ok(None),
+            Err(error) => Err(error),
+        }
     })
 }
 
@@ -1606,7 +1572,7 @@ pub fn qualify_remote(
             .and_then(task::snapshot)
             .is_ok_and(|snapshot| snapshot.state == TaskState::Blocked)
     })?;
-    if wake(blocked.0)? != block_cpu {
+    if wake(blocked.0)? != Some(block_cpu) {
         return Err(SchedError::WrongCpu);
     }
 
@@ -1699,7 +1665,7 @@ pub fn qualify_remote(
         ipi_sent,
         ipi_received,
         blocks: BLOCKS.load(Ordering::Acquire),
-        contention: QUEUE_CONTENTION.load(Ordering::Acquire),
+        contention: crate::sync::total_contention(),
         idle_running_aps,
         running_max: RUNNING_MAX.load(Ordering::Acquire),
         canaries_ok,
@@ -1754,8 +1720,8 @@ extern "C" fn elyon_remote_task_entry(arg: u64) -> ! {
 // la file temporelle avant de prendre une file de CPU.
 
 const TIMER_CAPACITY: usize = 16;
-static mut TIMERS: TimerQueue<TIMER_CAPACITY> = TimerQueue::new();
-static TIMER_LOCK: RawSpinLock = RawSpinLock::new();
+static TIMERS: IrqSpinLock<TimerQueue<TIMER_CAPACITY>> =
+    IrqSpinLock::new(LockClass::TimerQueue, TimerQueue::new());
 
 static SLEEPS: AtomicU64 = AtomicU64::new(0);
 static TIMER_WAKES: AtomicU64 = AtomicU64::new(0);
@@ -1764,35 +1730,9 @@ static STALE_EXPIRIES: AtomicU64 = AtomicU64::new(0);
 /// Passages d'un CPU à son idle task parce que sa tâche s'est bloquée ou endormie.
 static IDLE_ENTRIES: [AtomicU64; MAX_SCHED_CPUS] = [const { AtomicU64::new(0) }; MAX_SCHED_CPUS];
 
-/// Accès exclusif à la file temporelle, IRQ masquées, jamais à travers un switch.
-struct TimerGuard;
-
-impl core::ops::Deref for TimerGuard {
-    type Target = TimerQueue<TIMER_CAPACITY>;
-
-    fn deref(&self) -> &Self::Target {
-        // SAFETY: le verrou de la file temporelle est tenu pendant la vie du garde.
-        unsafe { &*addr_of_mut!(TIMERS) }
-    }
-}
-
-impl core::ops::DerefMut for TimerGuard {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        // SAFETY: le verrou tenu garantit l'unicité de la référence mutable.
-        unsafe { &mut *addr_of_mut!(TIMERS) }
-    }
-}
-
-impl Drop for TimerGuard {
-    fn drop(&mut self) {
-        TIMER_LOCK.unlock();
-    }
-}
-
-fn timers() -> TimerGuard {
-    let spins = TIMER_LOCK.lock();
-    QUEUE_CONTENTION.fetch_add(spins, Ordering::Relaxed);
-    TimerGuard
+/// File temporelle verrouillée, IRQ masquées, jamais à travers un switch.
+fn timers() -> IrqGuard<'static, TimerQueue<TIMER_CAPACITY>> {
+    TIMERS.lock()
 }
 
 // Journal des sommeils, pour la qualification : un enregistrement par sommeil.
@@ -1813,7 +1753,14 @@ static SLEEP_WAKES: [AtomicU64; SLEEP_LOG_CAPACITY] =
 static SLEEP_EXPLICIT: [AtomicBool; SLEEP_LOG_CAPACITY] =
     [const { AtomicBool::new(false) }; SLEEP_LOG_CAPACITY];
 
+/// Le journal n'enregistre que pendant la qualification K004-09 : hors de cette
+/// fenêtre, `sleep_ms()` ne dépend pas de sa capacité.
+static SLEEP_LOG_ON: AtomicBool = AtomicBool::new(false);
+
 fn log_sleep(task_id: u64, start: u64, deadline: u64) -> Result<(), SchedError> {
+    if !SLEEP_LOG_ON.load(Ordering::Acquire) {
+        return Ok(());
+    }
     let index = SLEEP_LOG_LEN.fetch_add(1, Ordering::AcqRel);
     if index >= SLEEP_LOG_CAPACITY {
         return Err(SchedError::TraceOverflow);
@@ -2029,6 +1976,7 @@ pub fn qualify_sleep(
         counter.store(0, Ordering::Release);
     }
     SLEEP_LOG_LEN.store(0, Ordering::Release);
+    SLEEP_LOG_ON.store(true, Ordering::Release);
     RUNNING_MAX.store(0, Ordering::Release);
     RAN_WHILE_SLEEPING.store(false, Ordering::Release);
     ZERO_STAYED_AWAKE.store(false, Ordering::Release);
@@ -2078,7 +2026,7 @@ pub fn qualify_sleep(
     wait_ticks_until(SLEEP_PHASE_TICKS, || {
         timer::ticks() >= asleep_at + EXPLICIT_AFTER_TICKS
     })?;
-    wake(explicit_id)?;
+    wake(explicit_id)?.ok_or(SchedError::Trace)?;
     wait_ticks_until(SLEEP_PHASE_TICKS, || {
         SLEEP_DONE.load(Ordering::Acquire) == 6
     })?;
@@ -2105,6 +2053,7 @@ pub fn qualify_sleep(
     let settled_from = timer::ticks();
     wait_ticks_until(SLEEP_PHASE_TICKS, || timer::ticks() >= settled_from + 2)?;
     timer::stop()?;
+    SLEEP_LOG_ON.store(false, Ordering::Release);
 
     let timers_empty = timers().is_empty();
     if !timers_empty {
@@ -2285,5 +2234,420 @@ extern "C" fn elyon_sleep_task_entry(arg: u64) -> ! {
         _ => fail(SchedError::ArgMismatch),
     }
     SLEEP_DONE.fetch_add(1, Ordering::AcqRel);
+    exit_now()
+}
+
+// --- K004-10 : qualification de la synchronisation --------------------------------
+//
+// Les AP sont dans leur idle task, le timer du BSP tourne :
+// a. compteur partagé : deux tâches par AP l'incrémentent par lecture puis
+//    écriture non atomiques, sous un verrou de classe Data, en cédant le CPU et
+//    en dormant régulièrement ; le total doit être exact ;
+// b. PMM concurrent : une tâche par AP alloue une page, y écrit sa marque, cède
+//    le CPU, la relit et la libère ; en même temps que (a) ;
+// c. ping-pong : deux tâches sur deux AP se réveillent mutuellement depuis leur
+//    AP, chacune se bloquant après avoir réveillé l'autre ;
+// d. course au réveil : trois réveils simultanés (deux AP et le BSP) d'une même
+//    tâche bloquée ; un seul gagne, la tâche ne reprend qu'une fois.
+// Pendant tout ce temps, chaque prise de verrou vérifie l'ordre des classes et
+// chaque switch l'absence de verrou tenu (`crate::sync`, fail-closed).
+
+const SYNC_ARG_BASE: u64 = 0xE1_0410_0000_0000;
+const SYNC_ROLE_COUNTER: u64 = 1;
+const SYNC_ROLE_PMM: u64 = 2;
+const SYNC_ROLE_PING: u64 = 3;
+const SYNC_ROLE_PONG: u64 = 4;
+const SYNC_ROLE_TARGET: u64 = 5;
+const SYNC_ROLE_WAKER: u64 = 6;
+const COUNTER_TASKS_PER_AP: usize = 2;
+pub const COUNTER_ROUNDS: u64 = 20_000;
+pub const PMM_ROUNDS: u64 = 64;
+pub const PING_ROUNDS: u64 = 50;
+const SYNC_MAX_TASKS: usize = 16;
+/// Attente maximale d'une phase : 10 s à 100 Hz.
+const SYNC_PHASE_TICKS: u64 = 1_000;
+
+/// Compteur partagé : volontairement mis à jour par load puis store ; seul
+/// COUNTER_LOCK empêche les mises à jour perdues.
+static SHARED_COUNTER: AtomicU64 = AtomicU64::new(0);
+static COUNTER_LOCK: IrqSpinLock<()> = IrqSpinLock::new(LockClass::Data, ());
+static SYNC_DONE: AtomicU64 = AtomicU64::new(0);
+static PMM_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+static PMM_DUPLICATES: AtomicU64 = AtomicU64::new(0);
+static PMM_FAILURES: AtomicU64 = AtomicU64::new(0);
+static PING_ID: AtomicU64 = AtomicU64::new(0);
+static PONG_ID: AtomicU64 = AtomicU64::new(0);
+static PINGPONG_WAKES: AtomicU64 = AtomicU64::new(0);
+static PINGPONG_RETRIES: AtomicU64 = AtomicU64::new(0);
+static WAKE_TARGET: AtomicU64 = AtomicU64::new(0);
+static WAKE_GO: AtomicBool = AtomicBool::new(false);
+static WAKERS_READY: AtomicU64 = AtomicU64::new(0);
+static WAKE_WINS: AtomicU64 = AtomicU64::new(0);
+static WAKE_LOSSES: AtomicU64 = AtomicU64::new(0);
+static TARGET_RUNS: AtomicU64 = AtomicU64::new(0);
+
+pub struct SyncQualification {
+    pub cpus: usize,
+    pub counter_tasks: u64,
+    pub counter_total: u64,
+    pub pmm_tasks: u64,
+    pub pmm_allocations: u64,
+    pub pmm_duplicates: u64,
+    pub pmm_failures: u64,
+    pub free_before: usize,
+    pub free_after: usize,
+    pub ping_cpu: usize,
+    pub pong_cpu: usize,
+    pub pingpong_wakes: u64,
+    pub pingpong_retries: u64,
+    pub wake_target: u64,
+    pub wake_wins: u64,
+    pub wake_losses: u64,
+    pub target_runs: u64,
+    pub acquisitions: [u64; 4],
+    pub contention: [u64; 4],
+    pub switch_checks: u64,
+    pub ipi_sent: u64,
+    pub ipi_received: u64,
+    pub idle_running_aps: usize,
+    pub running_max: usize,
+    pub canaries_ok: usize,
+}
+
+/// `Ok(None)` sur une machine sans AP.
+pub fn qualify_sync(
+    bsp_stack_start: u64,
+    bsp_stack_end: u64,
+    identity_limit: u64,
+    timer_initial_count: u32,
+) -> Result<Option<SyncQualification>, SchedError> {
+    cpu::disable_interrupts();
+    if this_cpu() != 0 {
+        return Err(SchedError::UnknownCpu);
+    }
+    let cpus = online_mask().count_ones() as usize;
+    if cpus < 2 {
+        return Ok(None);
+    }
+    let aps = cpus - 1;
+    let bsp = StackRegion {
+        start: bsp_stack_start,
+        end: bsp_stack_end,
+    };
+    let ap = |index: usize| 1 + index % aps;
+    let entry = elyon_sync_task_entry as *const () as usize as u64;
+    let arg = |role: u64| SYNC_ARG_BASE | (role << 16);
+
+    for counter in [
+        &SHARED_COUNTER,
+        &SYNC_DONE,
+        &PMM_ALLOCATIONS,
+        &PMM_DUPLICATES,
+        &PMM_FAILURES,
+        &PINGPONG_WAKES,
+        &PINGPONG_RETRIES,
+        &WAKERS_READY,
+        &WAKE_WINS,
+        &WAKE_LOSSES,
+        &TARGET_RUNS,
+        &RESCHED_SENT,
+        &RESCHED_RECEIVED,
+    ] {
+        counter.store(0, Ordering::Release);
+    }
+    WAKE_GO.store(false, Ordering::Release);
+    RUNNING_MAX.store(0, Ordering::Release);
+    let switch_checks_before = crate::sync::switch_checks();
+    let acquisitions_before = LockClass::ALL.map(crate::sync::acquisitions);
+    let contention_before = LockClass::ALL.map(crate::sync::contention);
+
+    let mut regions = [StackRegion { start: 0, end: 0 }; SYNC_MAX_TASKS];
+    let mut ids = [0u64; SYNC_MAX_TASKS];
+    let mut spawned = 0usize;
+    let mut spawn = |cpu: usize, role: u64| -> Result<u64, SchedError> {
+        if spawned == SYNC_MAX_TASKS {
+            return Err(SchedError::TraceOverflow);
+        }
+        let (id, region) = spawn_on(1 << cpu, entry, arg(role), bsp, identity_limit)?;
+        regions[spawned] = region;
+        ids[spawned] = id;
+        spawned += 1;
+        Ok(id)
+    };
+
+    timer::restart_periodic(timer_initial_count)?;
+
+    // a + b. Compteur et PMM, en même temps sur tous les AP. Les piles sont
+    // allouées avant la mesure de référence du PMM.
+    let counter_tasks = (aps * COUNTER_TASKS_PER_AP) as u64;
+    let mut phase_one = [0u64; SYNC_MAX_TASKS];
+    let mut phase_one_len = 0;
+    for index in 0..aps {
+        for _ in 0..COUNTER_TASKS_PER_AP {
+            phase_one[phase_one_len] = spawn(ap(index), SYNC_ROLE_COUNTER)?;
+            phase_one_len += 1;
+        }
+        phase_one[phase_one_len] = spawn(ap(index), SYNC_ROLE_PMM)?;
+        phase_one_len += 1;
+    }
+    let free_before = crate::memory::free_frame_count();
+    for &id in &phase_one[..phase_one_len] {
+        enqueue(id, true)?;
+    }
+    let phase_one_tasks = phase_one_len as u64;
+    wait_ticks_until(SYNC_PHASE_TICKS, || {
+        SYNC_DONE.load(Ordering::Acquire) == phase_one_tasks
+    })?;
+    let free_after = crate::memory::free_frame_count();
+
+    // c. Ping-pong entre deux AP (le même s'il n'y en a qu'un).
+    let ping_cpu = ap(0);
+    let pong_cpu = ap(1);
+    let pong = spawn(pong_cpu, SYNC_ROLE_PONG)?;
+    let ping = spawn(ping_cpu, SYNC_ROLE_PING)?;
+    PING_ID.store(ping, Ordering::Release);
+    PONG_ID.store(pong, Ordering::Release);
+    enqueue(pong, true)?;
+    enqueue(ping, true)?;
+    wait_ticks_until(SYNC_PHASE_TICKS, || {
+        SYNC_DONE.load(Ordering::Acquire) == phase_one_tasks + 2
+    })?;
+
+    // d. Course au réveil : la cible se bloque, deux réveilleurs attendent le
+    // signal sur deux AP, le BSP donne le signal et réveille aussi.
+    let target = spawn(ap(0), SYNC_ROLE_TARGET)?;
+    WAKE_TARGET.store(target, Ordering::Release);
+    let wakers = [
+        spawn(ap(1), SYNC_ROLE_WAKER)?,
+        spawn(ap(2), SYNC_ROLE_WAKER)?,
+    ];
+    enqueue(target, true)?;
+    for waker in wakers {
+        enqueue(waker, true)?;
+    }
+    wait_ticks_until(SYNC_PHASE_TICKS, || {
+        WAKERS_READY.load(Ordering::Acquire) == 2
+            && task::lookup(target)
+                .and_then(task::snapshot)
+                .is_ok_and(|snapshot| snapshot.state == TaskState::Blocked)
+    })?;
+    WAKE_GO.store(true, Ordering::Release);
+    match wake(target)? {
+        Some(_) => WAKE_WINS.fetch_add(1, Ordering::AcqRel),
+        None => WAKE_LOSSES.fetch_add(1, Ordering::AcqRel),
+    };
+    wait_ticks_until(SYNC_PHASE_TICKS, || {
+        SYNC_DONE.load(Ordering::Acquire) == phase_one_tasks + 5
+    })?;
+
+    // Les AP reviennent dans leur idle task, puis marge pour un IPI en vol.
+    let idles: [u64; MAX_SCHED_CPUS] =
+        core::array::from_fn(|index| IDLE_IDS[index].load(Ordering::Acquire));
+    wait_ticks_until(SYNC_PHASE_TICKS, || {
+        (1..cpus).all(|index| CURRENT[index].load(Ordering::Acquire) == idles[index])
+    })?;
+    let settled_from = timer::ticks();
+    wait_ticks_until(SYNC_PHASE_TICKS, || timer::ticks() >= settled_from + 2)?;
+    timer::stop()?;
+
+    let counter_total = SHARED_COUNTER.load(Ordering::Acquire);
+    let pmm_allocations = PMM_ALLOCATIONS.load(Ordering::Acquire);
+    let pmm_duplicates = PMM_DUPLICATES.load(Ordering::Acquire);
+    let pmm_failures = PMM_FAILURES.load(Ordering::Acquire);
+    let pingpong_wakes = PINGPONG_WAKES.load(Ordering::Acquire);
+    let wake_wins = WAKE_WINS.load(Ordering::Acquire);
+    let wake_losses = WAKE_LOSSES.load(Ordering::Acquire);
+    let target_runs = TARGET_RUNS.load(Ordering::Acquire);
+    let ipi_sent = RESCHED_SENT.load(Ordering::Acquire);
+    let ipi_received = RESCHED_RECEIVED.load(Ordering::Acquire);
+    let pmm_tasks = aps as u64;
+    let consistent = counter_total == counter_tasks * COUNTER_ROUNDS
+        && pmm_allocations == pmm_tasks * PMM_ROUNDS
+        && pmm_duplicates == 0
+        && pmm_failures == 0
+        && free_after == free_before
+        && pingpong_wakes == 2 * PING_ROUNDS
+        && wake_wins == 1
+        && wake_losses == 2
+        && target_runs == 1
+        && ipi_sent >= 1
+        && (1..=ipi_sent).contains(&ipi_received);
+    if !consistent {
+        kprintln!(
+            "[sched-sync] counts counter={} pmm={} dup={} fail={} free={}->{} pingpong={} wins={} losses={} runs={} ipi={}/{}",
+            counter_total,
+            pmm_allocations,
+            pmm_duplicates,
+            pmm_failures,
+            free_before,
+            free_after,
+            pingpong_wakes,
+            wake_wins,
+            wake_losses,
+            target_runs,
+            ipi_received,
+            ipi_sent
+        );
+        return Err(SchedError::CountMismatch);
+    }
+
+    for &id in &ids[..spawned] {
+        if task::snapshot(task::lookup(id)?)?.state != TaskState::Dead {
+            return Err(SchedError::TaskNotDead);
+        }
+    }
+    let mut idle_running_aps = 0;
+    for (index, &idle) in idles.iter().enumerate().take(cpus).skip(1) {
+        let snapshot = task::snapshot(task::lookup(idle)?)?;
+        if snapshot.state != TaskState::Running || snapshot.current_cpu != index as u32 {
+            return Err(SchedError::IdleState);
+        }
+        idle_running_aps += 1;
+    }
+    let mut canaries_ok = 0;
+    for region in regions.iter().take(spawned) {
+        if !stacks::canary_intact_at(*region) {
+            return Err(SchedError::CanaryCorrupted);
+        }
+        canaries_ok += 1;
+    }
+
+    let mut acquisitions = [0u64; 4];
+    let mut contention = [0u64; 4];
+    for (index, class) in LockClass::ALL.iter().enumerate() {
+        acquisitions[index] = crate::sync::acquisitions(*class) - acquisitions_before[index];
+        contention[index] = crate::sync::contention(*class) - contention_before[index];
+    }
+
+    Ok(Some(SyncQualification {
+        cpus,
+        counter_tasks,
+        counter_total,
+        pmm_tasks,
+        pmm_allocations,
+        pmm_duplicates,
+        pmm_failures,
+        free_before,
+        free_after,
+        ping_cpu,
+        pong_cpu,
+        pingpong_wakes,
+        pingpong_retries: PINGPONG_RETRIES.load(Ordering::Acquire),
+        wake_target: target,
+        wake_wins,
+        wake_losses,
+        target_runs,
+        acquisitions,
+        contention,
+        switch_checks: crate::sync::switch_checks() - switch_checks_before,
+        ipi_sent,
+        ipi_received,
+        idle_running_aps,
+        running_max: RUNNING_MAX.load(Ordering::Acquire),
+        canaries_ok,
+    }))
+}
+
+/// Réveille `task_id` dès qu'elle est bloquée : un réveil arrivé avant que la
+/// tâche ne se bloque ne la trouve pas endormie et serait perdu.
+fn wake_when_blocked(task_id: u64) {
+    loop {
+        match wake(task_id) {
+            Ok(Some(_)) => {
+                PINGPONG_WAKES.fetch_add(1, Ordering::AcqRel);
+                return;
+            }
+            Ok(None) => {
+                PINGPONG_RETRIES.fetch_add(1, Ordering::Relaxed);
+                yield_now();
+            }
+            Err(error) => fail(error),
+        }
+    }
+}
+
+fn counter_task() {
+    for round in 0..COUNTER_ROUNDS {
+        {
+            let _guard = COUNTER_LOCK.lock();
+            let value = SHARED_COUNTER.load(Ordering::Relaxed);
+            core::hint::spin_loop();
+            SHARED_COUNTER.store(value + 1, Ordering::Relaxed);
+        }
+        if round % 1_000 == 999 {
+            yield_now();
+        }
+        if round % 5_000 == 4_999 {
+            sleep_ms(10);
+        }
+    }
+}
+
+fn pmm_task(current: u64) {
+    for round in 0..PMM_ROUNDS {
+        let Some(frame) = crate::memory::allocate_frame() else {
+            PMM_FAILURES.fetch_add(1, Ordering::AcqRel);
+            continue;
+        };
+        PMM_ALLOCATIONS.fetch_add(1, Ordering::AcqRel);
+        let tag = (current << 32) | round;
+        // SAFETY: page identity-mappée que cette tâche vient d'obtenir du PMM ;
+        // si un autre CPU l'avait aussi obtenue, la marque serait écrasée.
+        unsafe { write_volatile(frame as *mut u64, tag) };
+        yield_now();
+        // SAFETY: même page, toujours détenue par cette tâche.
+        if unsafe { read_volatile(frame as *const u64) } != tag {
+            PMM_DUPLICATES.fetch_add(1, Ordering::AcqRel);
+        }
+        if !crate::memory::free_frame(frame) {
+            PMM_FAILURES.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn elyon_sync_task_entry(arg: u64) -> ! {
+    let current = CURRENT[this_cpu()].load(Ordering::Acquire);
+    if arg & !0xFFFF_FFFF != SYNC_ARG_BASE {
+        fail(SchedError::ArgMismatch);
+    }
+    match (arg >> 16) & 0xFFFF {
+        SYNC_ROLE_COUNTER => counter_task(),
+        SYNC_ROLE_PMM => pmm_task(current),
+        SYNC_ROLE_PING => {
+            let pong = PONG_ID.load(Ordering::Acquire);
+            for _ in 0..PING_ROUNDS {
+                wake_when_blocked(pong);
+                block_now();
+            }
+        }
+        SYNC_ROLE_PONG => {
+            let ping = PING_ID.load(Ordering::Acquire);
+            block_now();
+            for round in 0..PING_ROUNDS {
+                wake_when_blocked(ping);
+                if round + 1 < PING_ROUNDS {
+                    block_now();
+                }
+            }
+        }
+        SYNC_ROLE_TARGET => {
+            block_now();
+            TARGET_RUNS.fetch_add(1, Ordering::AcqRel);
+        }
+        SYNC_ROLE_WAKER => {
+            WAKERS_READY.fetch_add(1, Ordering::AcqRel);
+            while !WAKE_GO.load(Ordering::Acquire) {
+                yield_now();
+            }
+            match wake(WAKE_TARGET.load(Ordering::Acquire)) {
+                Ok(Some(_)) => WAKE_WINS.fetch_add(1, Ordering::AcqRel),
+                Ok(None) => WAKE_LOSSES.fetch_add(1, Ordering::AcqRel),
+                Err(error) => fail(error),
+            };
+        }
+        _ => fail(SchedError::ArgMismatch),
+    }
+    SYNC_DONE.fetch_add(1, Ordering::AcqRel);
     exit_now()
 }

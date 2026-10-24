@@ -2,7 +2,10 @@ use core::ptr::{addr_of_mut, write_bytes};
 
 use elyon_abi::{BootInfo, MemoryRegionKind, PAGE_SIZE};
 
+use elyon_core::lock_order::LockClass;
+
 use crate::arch::x86_64::paging;
+use crate::sync::IrqSpinLock;
 
 const MAX_PHYSICAL_MEMORY: u64 = 32 * 1024 * 1024 * 1024;
 const MAX_FRAMES: usize = (MAX_PHYSICAL_MEMORY / PAGE_SIZE) as usize;
@@ -14,6 +17,10 @@ const LOW_MEMORY_RESERVE_END: u64 = 1024 * 1024;
 static mut FRAME_BITMAP: [u8; BITMAP_BYTES] = [0; BITMAP_BYTES];
 static mut FREE_FRAMES: usize = 0;
 static mut MANAGED_FRAMES: usize = 0;
+/// Sérialise tout accès au bitmap et aux compteurs ci-dessus (K004-10) : les AP
+/// peuvent allouer et libérer. Le bitmap reste un `static mut` pour rester en
+/// `.bss`, et n'est touché que verrou tenu.
+static PMM_LOCK: IrqSpinLock<()> = IrqSpinLock::new(LockClass::Pmm, ());
 
 pub struct PmmStats {
     pub managed_frames: usize,
@@ -22,6 +29,7 @@ pub struct PmmStats {
 }
 
 pub fn init(info: &BootInfo) -> PmmStats {
+    let _pmm = PMM_LOCK.lock();
     unsafe {
         write_bytes(addr_of_mut!(FRAME_BITMAP).cast::<u8>(), 0xFF, BITMAP_BYTES);
         FREE_FRAMES = 0;
@@ -76,6 +84,7 @@ pub fn allocate_frame() -> Option<u64> {
 }
 
 pub fn allocate_contiguous_frames(count: usize) -> Option<u64> {
+    let _pmm = PMM_LOCK.lock();
     let managed_frames = unsafe { MANAGED_FRAMES };
     if count == 0 || count > managed_frames {
         return None;
@@ -98,6 +107,38 @@ pub fn allocate_contiguous_frames(count: usize) -> Option<u64> {
     }
 
     None
+}
+
+/// Rend `count` pages contiguës commençant à `start`. Refuse, sans rien
+/// modifier, une plage hors du domaine géré ou contenant une page déjà libre :
+/// une double libération serait sinon rendue deux fois.
+pub fn free_contiguous_frames(start: u64, count: usize) -> bool {
+    let _pmm = PMM_LOCK.lock();
+    let managed_frames = unsafe { MANAGED_FRAMES };
+    if count == 0 || !start.is_multiple_of(PAGE_SIZE) {
+        return false;
+    }
+    let first = (start / PAGE_SIZE) as usize;
+    let first_allocatable = (LOW_MEMORY_RESERVE_END / PAGE_SIZE) as usize;
+    if first < first_allocatable || first.saturating_add(count) > managed_frames {
+        return false;
+    }
+    if (first..first + count).any(is_free) {
+        return false;
+    }
+    for frame in first..first + count {
+        mark_free(frame);
+    }
+    true
+}
+
+pub fn free_frame(start: u64) -> bool {
+    free_contiguous_frames(start, 1)
+}
+
+pub fn free_frame_count() -> usize {
+    let _pmm = PMM_LOCK.lock();
+    unsafe { FREE_FRAMES }
 }
 
 fn reserve_range(start: u64, end: u64) {

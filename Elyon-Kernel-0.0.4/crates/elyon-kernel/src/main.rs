@@ -11,6 +11,7 @@ mod framebuffer;
 mod memory;
 mod sched;
 mod serial;
+mod sync;
 mod task;
 mod task_stack;
 mod timer;
@@ -981,6 +982,80 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         Err(error) => {
             kprintln!(
                 "[sched-sleep] FAILED reason={} ticks={}",
+                error.as_str(),
+                timer::ticks()
+            );
+            cpu::halt_forever();
+        }
+    }
+
+    match sched::qualify_sync(
+        info.kernel_stack_start,
+        info.kernel_stack_end,
+        paging::identity_limit(),
+        timer_calibration.initial_count,
+    ) {
+        Ok(Some(sync)) => {
+            kprintln!(
+                "[sched-sync] counter tasks={} rounds={} total={} expected={}",
+                sync.counter_tasks,
+                sched::COUNTER_ROUNDS,
+                sync.counter_total,
+                sync.counter_tasks * sched::COUNTER_ROUNDS
+            );
+            kprintln!(
+                "[sched-sync] pmm tasks={} rounds={} allocations={} duplicates={} failures={} free_before={} free_after={}",
+                sync.pmm_tasks,
+                sched::PMM_ROUNDS,
+                sync.pmm_allocations,
+                sync.pmm_duplicates,
+                sync.pmm_failures,
+                sync.free_before,
+                sync.free_after
+            );
+            kprintln!(
+                "[sched-sync] pingpong ping_cpu={} pong_cpu={} rounds={} wakes={} retries={}",
+                sync.ping_cpu,
+                sync.pong_cpu,
+                sched::PING_ROUNDS,
+                sync.pingpong_wakes,
+                sync.pingpong_retries
+            );
+            kprintln!(
+                "[sched-sync] wake_race target={} wakers=3 wins={} losses={} target_runs={}",
+                sync.wake_target,
+                sync.wake_wins,
+                sync.wake_losses,
+                sync.target_runs
+            );
+            kprintln!(
+                "[sched-sync] locks acquisitions={},{},{},{} contention={},{},{},{} classes=pmm,run_queue,timer_queue,data switch_checks={}",
+                sync.acquisitions[0],
+                sync.acquisitions[1],
+                sync.acquisitions[2],
+                sync.acquisitions[3],
+                sync.contention[0],
+                sync.contention[1],
+                sync.contention[2],
+                sync.contention[3],
+                sync.switch_checks
+            );
+            kprintln!(
+                "[sched-sync] cpus={} ipi_sent={} ipi_received={} ipi_coalesced={} idle_running_aps={} running_max={} canaries_ok={}",
+                sync.cpus,
+                sync.ipi_sent,
+                sync.ipi_received,
+                sync.ipi_sent - sync.ipi_received,
+                sync.idle_running_aps,
+                sync.running_max,
+                sync.canaries_ok
+            );
+            kprintln!("ELYON_SCHED_SYNC_READY");
+        }
+        Ok(None) => kprintln!("[sched-sync] skipped single_cpu=1"),
+        Err(error) => {
+            kprintln!(
+                "[sched-sync] FAILED reason={} ticks={}",
                 error.as_str(),
                 timer::ticks()
             );
