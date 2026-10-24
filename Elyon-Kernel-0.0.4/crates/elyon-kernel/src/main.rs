@@ -40,8 +40,10 @@ const TEST_DF: bool = option_env!("ELYON_TEST_DF").is_some();
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text._start")]
 pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
-    serial::init();
     cpu::disable_interrupts();
+    // Avant toute prise de verrou : l'index du CPU est lu via GS (K004-10).
+    arch::x86_64::cpu_local::init(0);
+    serial::init();
 
     kprintln!("ELYON KERNEL 0.0.4");
     kprintln!("[kernel] build_id={}", BUILD_ID);

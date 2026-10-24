@@ -9,32 +9,24 @@
 //! même si ce boot ne l'a pas produit.
 
 use core::cell::UnsafeCell;
+use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use elyon_core::lock_order::{self, HeldLocks, LockClass, LockOrderError, SwitchError};
 use elyon_core::sync::RawSpinLock;
 
-use crate::arch::x86_64::{apic, cpu, percpu};
+use crate::arch::x86_64::cpu;
+use crate::arch::x86_64::cpu_local::{self, LOCK_CLASSES};
 use crate::kprintln;
-use crate::sched::MAX_SCHED_CPUS;
 
-const CLASSES: usize = LockClass::ALL.len();
-
-/// Classes tenues, par CPU logique.
-static HELD: [AtomicU32; MAX_SCHED_CPUS] = [const { AtomicU32::new(0) }; MAX_SCHED_CPUS];
-static ACQUISITIONS: [AtomicU64; CLASSES] = [const { AtomicU64::new(0) }; CLASSES];
-static CONTENTION: [AtomicU64; CLASSES] = [const { AtomicU64::new(0) }; CLASSES];
+const _: () = assert!(LockClass::ALL.len() == LOCK_CLASSES);
 static SWITCH_CHECKS: AtomicU64 = AtomicU64::new(0);
 
-/// CPU logique courant. Avant l'initialisation du LAPIC et des slots per-CPU,
-/// seul le BSP s'exécute : son slot est 0.
-fn cpu_slot() -> usize {
-    apic::current_id()
-        .ok()
-        .and_then(percpu::index_of_apic)
-        .filter(|&cpu| cpu < MAX_SCHED_CPUS)
-        .unwrap_or(0)
+/// Compteur à écrivain unique (le CPU propriétaire de la zone) : pas besoin
+/// d'instruction `lock`.
+fn bump(counter: &AtomicU64, by: u64) {
+    counter.store(counter.load(Ordering::Relaxed) + by, Ordering::Relaxed);
 }
 
 pub struct IrqSpinLock<T> {
@@ -59,28 +51,34 @@ impl<T> IrqSpinLock<T> {
     pub fn lock(&self) -> IrqGuard<'_, T> {
         let interrupts = cpu::interrupts_enabled();
         cpu::disable_interrupts();
-        let slot = cpu_slot();
-        let held = HeldLocks::from_bits(HELD[slot].load(Ordering::Relaxed));
-        match lock_order::check_acquire(held, self.class) {
-            Ok(next) => HELD[slot].store(next.bits(), Ordering::Relaxed),
+        let local = cpu_local::current();
+        let held = HeldLocks::from_bits(local.held_locks.load(Ordering::Relaxed));
+        let next = match lock_order::check_acquire(held, self.class) {
+            Ok(next) => next,
             Err(error) => order_violation(error),
+        };
+        // Seul le premier verrou pris retient l'état d'IF : il ne sera restauré
+        // qu'au relâchement du dernier, quel que soit l'ordre des libérations.
+        if held == HeldLocks::NONE {
+            local.irq_before_locks.store(interrupts, Ordering::Relaxed);
         }
+        local.held_locks.store(next.bits(), Ordering::Relaxed);
         let spins = self.raw.lock();
         let class = self.class as usize;
-        ACQUISITIONS[class].fetch_add(1, Ordering::Relaxed);
-        CONTENTION[class].fetch_add(spins, Ordering::Relaxed);
+        bump(&local.lock_acquisitions[class], 1);
+        bump(&local.lock_contention[class], spins);
         IrqGuard {
             lock: self,
-            slot,
-            interrupts,
+            _not_send: PhantomData,
         }
     }
 }
 
+/// Garde de verrou. `!Send` : relâché sur le CPU qui l'a pris, dont il met à
+/// jour l'état ; il ne traverse jamais un switch (`assert_switch_allowed`).
 pub struct IrqGuard<'a, T> {
     lock: &'a IrqSpinLock<T>,
-    slot: usize,
-    interrupts: bool,
+    _not_send: PhantomData<*mut ()>,
 }
 
 impl<T> Deref for IrqGuard<'_, T> {
@@ -102,12 +100,14 @@ impl<T> DerefMut for IrqGuard<'_, T> {
 impl<T> Drop for IrqGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.raw.unlock();
-        let held = HeldLocks::from_bits(HELD[self.slot].load(Ordering::Relaxed));
-        match lock_order::release(held, self.lock.class) {
-            Ok(next) => HELD[self.slot].store(next.bits(), Ordering::Relaxed),
+        let local = cpu_local::current();
+        let held = HeldLocks::from_bits(local.held_locks.load(Ordering::Relaxed));
+        let next = match lock_order::release(held, self.lock.class) {
+            Ok(next) => next,
             Err(error) => order_violation(error),
-        }
-        if self.interrupts {
+        };
+        local.held_locks.store(next.bits(), Ordering::Relaxed);
+        if next == HeldLocks::NONE && local.irq_before_locks.load(Ordering::Relaxed) {
             cpu::enable_interrupts();
         }
     }
@@ -116,35 +116,36 @@ impl<T> Drop for IrqGuard<'_, T> {
 /// Appelé juste avant chaque changement de contexte.
 pub fn assert_switch_allowed() {
     SWITCH_CHECKS.fetch_add(1, Ordering::Relaxed);
-    let held = HeldLocks::from_bits(HELD[cpu_slot()].load(Ordering::Relaxed));
+    let held = HeldLocks::from_bits(cpu_local::current().held_locks.load(Ordering::Relaxed));
     if let Err(error) = lock_order::check_switch(held, cpu::interrupts_enabled()) {
         switch_violation(error);
     }
 }
 
 fn order_violation(error: LockOrderError) -> ! {
-    kprintln!("[lock] FAILED cpu={} order={:?}", cpu_slot(), error);
+    kprintln!("[lock] FAILED cpu={} order={:?}", cpu_local::index(), error);
     cpu::halt_forever()
 }
 
 fn switch_violation(error: SwitchError) -> ! {
-    kprintln!("[lock] FAILED cpu={} switch={:?}", cpu_slot(), error);
+    kprintln!(
+        "[lock] FAILED cpu={} switch={:?}",
+        cpu_local::index(),
+        error
+    );
     cpu::halt_forever()
 }
 
 pub fn acquisitions(class: LockClass) -> u64 {
-    ACQUISITIONS[class as usize].load(Ordering::Relaxed)
+    cpu_local::sum(|area| &area.lock_acquisitions[class as usize])
 }
 
 pub fn contention(class: LockClass) -> u64 {
-    CONTENTION[class as usize].load(Ordering::Relaxed)
+    cpu_local::sum(|area| &area.lock_contention[class as usize])
 }
 
 pub fn total_contention() -> u64 {
-    CONTENTION
-        .iter()
-        .map(|counter| counter.load(Ordering::Relaxed))
-        .sum()
+    LockClass::ALL.iter().map(|&class| contention(class)).sum()
 }
 
 pub fn switch_checks() -> u64 {

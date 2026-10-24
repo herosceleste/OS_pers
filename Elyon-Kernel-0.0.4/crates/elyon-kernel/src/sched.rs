@@ -484,13 +484,25 @@ fn boot_rsp_slot(cpu: usize) -> *mut u64 {
 /// Index logique du CPU courant, retrouvé par son APIC ID. Fail-closed si le
 /// CPU est inconnu ou au-delà de `MAX_SCHED_CPUS`.
 pub fn this_cpu() -> usize {
-    match crate::arch::x86_64::apic::current_id()
-        .ok()
-        .and_then(crate::arch::x86_64::percpu::index_of_apic)
-    {
-        Some(cpu) if cpu < MAX_SCHED_CPUS => cpu,
+    // Index lu via GS, réglé avant tout usage du scheduler sur ce CPU.
+    match crate::arch::x86_64::cpu_local::index() {
+        cpu if cpu < MAX_SCHED_CPUS => cpu,
         _ => fail(SchedError::UnknownCpu),
     }
+}
+
+/// L'index lu via GS doit désigner le slot dont l'APIC ID est celui de ce CPU :
+/// sinon les verrous et les files seraient attribués à un autre CPU.
+fn verify_cpu_index(expected: usize) -> Result<(), SchedError> {
+    use crate::arch::x86_64::{apic, cpu_local, percpu};
+    let by_apic = apic::current_id()
+        .ok()
+        .and_then(percpu::index_of_apic)
+        .ok_or(SchedError::UnknownCpu)?;
+    if by_apic != expected || cpu_local::index() != expected {
+        return Err(SchedError::UnknownCpu);
+    }
+    Ok(())
 }
 
 fn record(current: u64) -> Result<(), SchedError> {
@@ -948,6 +960,9 @@ pub fn ap_enter(cpu: usize) -> ! {
     if cpu >= MAX_SCHED_CPUS {
         cpu::idle_forever();
     }
+    if let Err(error) = verify_cpu_index(cpu) {
+        fail(error);
+    }
     while !PERCPU_ARMED[cpu].load(Ordering::Acquire) {
         // SAFETY: attente passive ; une IRQ (IPI de réveil) fait sortir du hlt.
         unsafe { core::arch::asm!("sti", "hlt", options(nomem, nostack)) };
@@ -990,6 +1005,7 @@ pub fn qualify_percpu(
     if this_cpu() != 0 {
         return Err(SchedError::UnknownCpu);
     }
+    verify_cpu_index(0)?;
     let bsp = StackRegion {
         start: bsp_stack_start,
         end: bsp_stack_end,
