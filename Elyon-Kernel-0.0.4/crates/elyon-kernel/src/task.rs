@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 pub const MAX_TASKS: usize = 256;
 pub const NO_CPU: u32 = u32::MAX;
@@ -78,6 +78,13 @@ struct TaskSlot {
     stack_end: AtomicU64,
     saved_rsp: AtomicU64,
     fpu_area: AtomicU64,
+    /// Vrai de l'entrée de la tâche sur un CPU jusqu'à ce que le contexte
+    /// suivant ait fini de sauvegarder le sien (K004-10).
+    on_cpu: AtomicBool,
+    /// Ticket de l'attente en cours, sommeil ou blocage (0 : aucune). Armé
+    /// avant l'entrée en attente ; seul celui qui le réclame (le tick à
+    /// l'échéance, ou un réveil explicite) réveille la tâche (K004-10).
+    wait_ticket: AtomicU64,
 }
 
 impl TaskSlot {
@@ -91,6 +98,8 @@ impl TaskSlot {
             stack_end: AtomicU64::new(0),
             saved_rsp: AtomicU64::new(0),
             fpu_area: AtomicU64::new(0),
+            on_cpu: AtomicBool::new(false),
+            wait_ticket: AtomicU64::new(0),
         }
     }
 }
@@ -118,6 +127,7 @@ pub enum TaskError {
     CpuOutsideAffinity,
     StackAlreadyAttached,
     StackInUse,
+    WaitAlreadyArmed,
 }
 
 impl TaskError {
@@ -130,6 +140,7 @@ impl TaskError {
             Self::CpuOutsideAffinity => "CPU is outside task affinity mask",
             Self::StackAlreadyAttached => "task already owns a stack",
             Self::StackInUse => "stack overlaps the stack of another active task",
+            Self::WaitAlreadyArmed => "task already holds a wait ticket",
         }
     }
 }
@@ -209,6 +220,20 @@ pub fn start(id: TaskId, cpu_id: u32) -> Result<(), TaskError> {
         return Err(TaskError::CpuOutsideAffinity);
     }
 
+    transition(slot, TaskState::Ready, TaskState::Running)?;
+    slot.current_cpu.store(cpu_id, Ordering::Release);
+    Ok(())
+}
+
+/// Lancement par le scheduler (K004-10) : même transition que `start`, mais le
+/// masque n'est pas relu. Le scheduler l'a vérifié sous le verrou de la file
+/// d'où il a retiré la tâche ; un changement d'affinité concurrent s'applique
+/// au `yield` suivant, par migration différée.
+pub fn dispatch(id: TaskId, cpu_id: u32) -> Result<(), TaskError> {
+    if cpu_id >= 64 {
+        return Err(TaskError::CpuOutsideAffinity);
+    }
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
     transition(slot, TaskState::Ready, TaskState::Running)?;
     slot.current_cpu.store(cpu_id, Ordering::Release);
     Ok(())
@@ -317,6 +342,58 @@ pub fn lookup(raw: u64) -> Result<TaskId, TaskError> {
 
 /// Emplacement du RSP sauvegardé de la tâche, écrit et relu par le switch de
 /// contexte. Le pointeur reste valide tant que le registre statique existe.
+/// Marque la tâche comme occupant (ou n'occupant plus) un CPU. Le passage à
+/// faux est publié en Release après la sauvegarde complète de son contexte.
+pub fn set_on_cpu(id: TaskId, on_cpu: bool) -> Result<(), TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    slot.on_cpu.store(on_cpu, Ordering::Release);
+    Ok(())
+}
+
+/// Réclame la tâche pour un CPU : faux si elle occupe encore un autre CPU.
+pub fn claim_on_cpu(id: TaskId) -> Result<bool, TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    Ok(slot
+        .on_cpu
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok())
+}
+
+static NEXT_WAIT_TICKET: AtomicU64 = AtomicU64::new(1);
+
+/// Arme un nouveau ticket d'attente, avant l'entrée en BLOCKED ou SLEEPING.
+/// Une tâche qui tourne n'en détient aucun : sinon un réveil destiné à une
+/// attente passée pourrait réveiller celle-ci.
+pub fn arm_wait(id: TaskId) -> Result<u64, TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    let ticket = NEXT_WAIT_TICKET.fetch_add(1, Ordering::Relaxed);
+    slot.wait_ticket
+        .compare_exchange(0, ticket, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| TaskError::WaitAlreadyArmed)?;
+    Ok(ticket)
+}
+
+/// Réclame l'attente `ticket` (tick à l'échéance) : faux si elle a déjà été
+/// réclamée ou remplacée par une attente plus récente.
+pub fn claim_wait(id: TaskId, ticket: u64) -> Result<bool, TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    Ok(slot
+        .wait_ticket
+        .compare_exchange(ticket, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok())
+}
+
+/// Réclame l'attente en cours quelle qu'elle soit (réveil explicite) ; 0 : aucune.
+pub fn take_wait(id: TaskId) -> Result<u64, TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    Ok(slot.wait_ticket.swap(0, Ordering::AcqRel))
+}
+
+pub fn is_on_cpu(id: TaskId) -> Result<bool, TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    Ok(slot.on_cpu.load(Ordering::Acquire))
+}
+
 pub fn saved_rsp_ptr(id: TaskId) -> Result<*mut u64, TaskError> {
     let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
     Ok(slot.saved_rsp.as_ptr())

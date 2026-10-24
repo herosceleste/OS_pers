@@ -361,6 +361,18 @@ pub fn init_secondary() -> Result<u32, ApicError> {
     }
 }
 
+const ICR_DELIVERY_NMI: u32 = 0b100 << 8;
+const ICR_SHORTHAND_ALL_BUT_SELF: u32 = 0b11 << 18;
+
+/// NMI à tous les CPU sauf l'émetteur (arrêt système, K004-10). Le champ
+/// destination est ignoré avec ce raccourci.
+pub fn send_nmi_to_others() -> Result<(), ApicError> {
+    send_icr(
+        0,
+        ICR_DELIVERY_NMI | ICR_LEVEL_ASSERT | ICR_SHORTHAND_ALL_BUT_SELF,
+    )
+}
+
 pub fn send_init(apic_id: u32) -> Result<(), ApicError> {
     send_icr(
         apic_id,

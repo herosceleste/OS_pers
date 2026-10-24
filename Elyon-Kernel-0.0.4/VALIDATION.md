@@ -1,6 +1,6 @@
 # Elyon Kernel 0.0.4 — Validation
 
-**EN COURS — K004-01 à K004-09 sont validés. K004-10 à K004-12 restent à qualifier.**
+**EN COURS — K004-01 à K004-10 sont validés. K004-11 et K004-12 restent à qualifier.**
 
 ## Baseline héritée
 
@@ -19,7 +19,7 @@ La 0.0.4 est dérivée de la Release `v0.0.3`, dont les critères K003-01 à K00
 | K004-07 | Scheduler per-CPU + idle task | **PASS** |
 | K004-08 | Reschedule IPI + affinité | **PASS** |
 | K004-09 | Sleep/wakeup | **PASS** |
-| K004-10 | Synchronisation scheduler/IRQ/SMP | À faire |
+| K004-10 | Synchronisation scheduler/IRQ/SMP | **PASS** |
 | K004-11 | Stress SMP | À faire |
 | K004-12 | Qualification finale 0.0.4 | À faire |
 
@@ -492,3 +492,71 @@ Limites : la résolution est celle du tick à 100 Hz, soit 10 ms ; seul le timer
 **K004-09 : PASS.**
 
 Le prochain critère est **K004-10 : synchronisation scheduler/IRQ/SMP.**
+
+## K004-10 — Spinlocks irq-save et synchronisation scheduler/IRQ/SMP
+
+Les quatre CPU partagent désormais le scheduler, la file temporelle et le PMM sous des verrous qui masquent les interruptions et respectent un ordre fixe ; un AP peut allouer.
+
+La logique pure est dans `elyon_core::lock_order`, testée sur l'hôte :
+
+- rangs `Pmm < RunQueue < TimerQueue < Data` : `check_acquire()` refuse une inversion ou une double prise, `release()` refuse de relâcher un verrou non tenu ;
+- `check_switch()` : un changement de contexte n'est permis qu'avec aucun verrou tenu et les interruptions masquées ;
+- 9 tests, dont 4 threads réels × 20 000 tours sans interblocage.
+
+Côté noyau :
+
+- `IrqSpinLock<T>` (`sync.rs`) masque les IRQ, contrôle l'ordre des classes tenues par le CPU, et seul le dernier verrou relâché restaure IF ; le garde est `!Send` ;
+- l'index du CPU est lu via GS dans une zone per-CPU, recoupé avec l'APIC ID, sans repli sur le slot 0 ;
+- `transfer()` vérifie `check_switch()` et réclame l'indicateur `on_cpu` de la tâche suivante par `compare_exchange` ; le contexte suivant l'efface (`finish_switch`). Une tâche ne peut plus tourner sur deux CPU ; un réveil, un déplacement d'affinité ou une remise en file d'une tâche mal placée attend d'abord, de façon bornée, que l'indicateur retombe ;
+- invariant d'affinité : une tâche dans la file du CPU c a toujours c dans son masque ; chaque mise en file relit le masque sous le verrou de la file cible, et une tâche qui cède un CPU exclu de son masque migre après le switch ;
+- `wake()` est transactionnel et typé : `Woken` ou `NotAsleep`, et l'erreur `WakeDead` pour une tâche terminée. Chaque attente, sommeil ou blocage, arme un ticket avant le changement d'état ; seul celui qui le réclame, réveil explicite ou tick à l'échéance, réveille la tâche, après qu'elle a quitté son CPU. Un réveil tardif ne peut donc atteindre l'attente suivante, ni une échéance périmée réveiller la tâche ;
+- PMM : jeton `FrameRange` qui interdit à la compilation la double libération, bitmap des pages libérables, effacement de chaque page allouée, recherche next-fit ;
+- toute violation de verrou, tout `fail()` et toute exception CPU arrêtent tous les CPU par NMI (`fatal::halt_system`).
+
+La qualification, exécutée après K004-09 sur les 4 CPU en même temps, enchaîne cinq scénarios :
+
+1. six tâches incrémentent un compteur partagé 20 000 fois chacune sous le verrou `Data` ;
+2. trois tâches sur trois AP allouent 64 pages chacune : aucun doublon, chaque page effacée, toutes rendues ;
+3. ping-pong de réveils entre les AP 1 et 2, 50 allers-retours ;
+4. trois tâches réveillent la même tâche bloquée : une seule gagne, la cible ne tourne qu'une fois puis, les trois tentatives rendues, se bloque à nouveau ; elle doit rester bloquée, aucun réveil de la course ni ticket résiduel n'atteignant cette seconde attente, et seul le BSP la libère ;
+5. tempête : six tâches font 300 tours, cèdent le CPU deux tours sur trois et se bloquent au troisième, pendant que le BSP change en boucle leur affinité d'un AP à l'autre et les réveille ; elles doivent toutes terminer et changer réellement de CPU.
+
+Le BSP vérifie le total du compteur, les 192 allocations sans doublon ni page non effacée et le retour du nombre de pages libres, les 100 réveils du ping-pong, 1 gagnant et 2 perdants avec la seconde attente intacte, des migrations effectives, une prise du verrou `Data` par incrément, les tâches `DEAD`, le retour des AP en idle, une seule tâche en cours par CPU et les canaris ; le script recalcule ces valeurs à partir du nombre d'AP.
+
+Quatre injections de faute ont été détectées : ordre des verrous inversé (`Inversion`, puis arrêt des 3 autres CPU), verrou de file tenu pendant un switch (`LockHeld`), compteur sans verrou (36 à 61 % de mises à jour perdues) et retrait de l'attente `on_cpu` (« switching into a task still running on another CPU », 3 boots sur 3). Le script `test-sched-sync-qemu.sh` refuse 29 copies altérées d'un log réel et accepte 2 variantes légitimes. Sur le commit `0670a6e`, 12 boots sous charge, à 2 et 4 vCPU avec l'hôte à 100 %, ont tous réussi K004-08, K004-09 et K004-10, et K004-02 à K004-09 ont été rejoués après chaque lot de corrections. Sur le commit `0c2911c`, après le correctif du ticket d'attente : suite CI locale de 23 tests QEMU réussie, puis 36 boots répétés de K004-08, K004-09 et K004-10 à 4 et 2 vCPU, dont 16 avec l'hôte à 100 % ; 35 ont réussi. Les 11 boots qui ont atteint K004-10 l'ont tous validé, avec un seul gagnant à chaque course au réveil. Le seul échec, `[smp] STABILITY FAILED reason=AP stability heartbeat missing`, est survenu avant le scheduler, dans le contrôle de stabilité de K003, après la fin de la charge synthétique.
+
+Le code a été relu par les agents ECC rust-reviewer, security-reviewer, silent-failure-hunter et performance-optimizer, puis par une seconde passe rust et sécurité. Une troisième passe indépendante (rust-reviewer, architect, security-reviewer) a trouvé la course au réveil corrigée par le ticket d'attente : un réveil explicite pouvait lire le ticket avant qu'il soit armé et laisser une échéance périmée, et un réveilleur tardif pouvait atteindre l'attente suivante. Le correctif a été relu une quatrième fois sans point bloquant. Toutes les corrections figurent dans la PR #20.
+
+La qualification a été exécutée sur le commit `0c2911c70ccd`, GitHub Actions run **#61** du workflow Elyon 0.0.4, et en local sous QEMU 8.2.2 / OVMF, 4 vCPU, hôte chargé.
+
+Preuves :
+
+```text
+[sched-sync] counter tasks=6 rounds=20000 total=120000 expected=120000
+[sched-sync] pmm tasks=3 rounds=64 allocations=192 duplicates=0 failures=0 dirty=0 free_before=249258 free_after=249258
+[sched-sync] pingpong ping_cpu=1 pong_cpu=2 rounds=50 wakes=100 retries=1
+[sched-sync] wake_race target=51 wakers=3 wins=1 losses=2 target_runs=1
+[sched-sync] storm tasks=6 rounds=300 migrations=675 moves=877 deferred=139 misplaced=11 forced=114 wakes=600 on_cpu_waits=77
+[sched-sync] locks acquisitions=426,17712,117,120000 contention=3,16213,0,204797 classes=pmm,run_queue,timer_queue,data switch_checks=1975
+[sched-sync] cpus=4 ipi_sent=1921 ipi_received=991 ipi_coalesced=930 idle_running_aps=3 running_max=1 canaries_ok=20
+ELYON_SCHED_SYNC_READY
+[PASS] K004-10 synchronisation: 4 CPU, compteur 120000/120000 sous verrou (contention 204797), PMM 192 allocations sans doublon, ping-pong 100 réveils, course au réveil 1 gagnant, tempête 675 migrations (77 attentes on_cpu), 1975 switchs contrôlés, aucune violation d'ordre
+```
+
+Validation croisée sous VMware® Workstation 17 Pro 17.0.2 build-21581411, UEFI, 4 vCPU, même build :
+
+```text
+[sched-sync] storm tasks=6 rounds=300 migrations=592 moves=29 deferred=7 misplaced=0 forced=7 wakes=600 on_cpu_waits=0
+[sched-sync] locks acquisitions=426,25643,73,120000 contention=0,1,0,272774 classes=pmm,run_queue,timer_queue,data switch_checks=1625
+[sched-sync] cpus=4 ipi_sent=789 ipi_received=774 ipi_coalesced=15 idle_running_aps=3 running_max=1 canaries_ok=20
+[PASS] K004-10 synchronisation: 4 CPU, compteur 120000/120000 sous verrou (contention 272774), PMM 192 allocations sans doublon, ping-pong 100 réveils, course au réveil 1 gagnant, tempête 592 migrations (0 attentes on_cpu), 1625 switchs contrôlés, aucune violation d'ordre
+[PASS] VMware 4 vCPU: Elyon 0.0.4 K003-01..12 et K004-01..10 validés sur build_id=0c2911c70ccd
+```
+
+`misplaced` compte les tâches qu'un CPU a trouvées dans sa file alors que leur affinité venait de l'exclure : `pop_allowed()` les écarte et les remet dans la file d'un CPU autorisé, si bien qu'aucune ne démarre sur un CPU exclu. Les IPI envoyés et non reçus sont tous fusionnés (`991 + 930 = 1921`, `774 + 15 = 789`), comme admis depuis K004-08.
+
+Limites : sous VMware, la tempête n'a déclenché aucune attente `on_cpu` ; ce chemin n'est prouvé que sous QEMU et par l'injection de faute ; les spinlocks ne sont pas équitables, un ticket lock ne sera ajouté que si K004-11 révèle une famine ; `swapgs`, l'entrée NMI/#DF/#MC « paranoïaque » et le RSP0 par tâche, nécessaires au ring 3, sont reportés à la 0.0.5 (`ROADMAP.md` à la racine du dépôt, section Sécurité, exigées avant la qualification des 0.0.5 et 0.0.6) ; une panique Rust et l'échec de la qualification de K004-10 n'arrêtent encore que le CPU concerné, et non tous les CPU par `halt_system` ; le contrôle de stabilité SMP de K003 attend chaque heartbeat d'AP pendant un délai PIT fixe, en temps réel, et peut échouer quand l'hôte retarde un vCPU, ce que K004-11 devra prendre en compte.
+
+**K004-10 : PASS.**
+
+Le prochain critère est **K004-11 : stress SMP.**

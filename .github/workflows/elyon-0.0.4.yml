@@ -159,6 +159,10 @@ jobs:
         working-directory: Elyon-Kernel-0.0.4
         run: bash scripts/test-sched-sleep-qemu.sh
 
+      - name: K004-10 spinlocks, lock order and SMP synchronisation test
+        working-directory: Elyon-Kernel-0.0.4
+        run: bash scripts/test-sched-sync-qemu.sh
+
       - name: IOAPIC regression
         working-directory: Elyon-Kernel-0.0.4
         run: bash scripts/test-ioapic-qemu.sh

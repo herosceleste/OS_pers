@@ -34,6 +34,7 @@ global_asm!(
 
 .global elyon_task_trampoline
 elyon_task_trampoline:
+    call elyon_finish_switch
     mov rdi, rbx
     call r12
     ud2

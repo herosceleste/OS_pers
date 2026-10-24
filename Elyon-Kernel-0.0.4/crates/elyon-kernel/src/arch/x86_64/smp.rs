@@ -373,6 +373,9 @@ extern "sysv64" fn elyon_ap_entry(cpu_index: u64, expected_apic_id: u64) -> ! {
     cpu::disable_interrupts();
 
     let index = cpu_index as usize;
+    // Avant toute prise de verrou ; l'index est confirmé plus bas par l'APIC ID
+    // observé, vérifié contre celui attendu pour ce slot.
+    super::cpu_local::init(index);
     let code_selector = gdt::load_for_cpu(index);
     idt::load();
 

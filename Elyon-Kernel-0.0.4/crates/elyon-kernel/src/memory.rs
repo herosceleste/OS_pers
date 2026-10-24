@@ -2,7 +2,10 @@ use core::ptr::{addr_of_mut, write_bytes};
 
 use elyon_abi::{BootInfo, MemoryRegionKind, PAGE_SIZE};
 
+use elyon_core::lock_order::LockClass;
+
 use crate::arch::x86_64::paging;
+use crate::sync::IrqSpinLock;
 
 const MAX_PHYSICAL_MEMORY: u64 = 32 * 1024 * 1024 * 1024;
 const MAX_FRAMES: usize = (MAX_PHYSICAL_MEMORY / PAGE_SIZE) as usize;
@@ -14,6 +17,14 @@ const LOW_MEMORY_RESERVE_END: u64 = 1024 * 1024;
 static mut FRAME_BITMAP: [u8; BITMAP_BYTES] = [0; BITMAP_BYTES];
 static mut FREE_FRAMES: usize = 0;
 static mut MANAGED_FRAMES: usize = 0;
+/// Pages allouées par `allocate_owned`, seules rendables par `free` (K004-10).
+static mut FREEABLE_BITMAP: [u8; BITMAP_BYTES] = [0; BITMAP_BYTES];
+/// Point de départ de la prochaine recherche (next-fit).
+static mut NEXT_HINT: usize = 0;
+/// Sérialise tout accès au bitmap et aux compteurs ci-dessus (K004-10) : les AP
+/// peuvent allouer et libérer. Le bitmap reste un `static mut` pour rester en
+/// `.bss`, et n'est touché que verrou tenu.
+static PMM_LOCK: IrqSpinLock<()> = IrqSpinLock::new(LockClass::Pmm, ());
 
 pub struct PmmStats {
     pub managed_frames: usize,
@@ -22,9 +33,12 @@ pub struct PmmStats {
 }
 
 pub fn init(info: &BootInfo) -> PmmStats {
+    let _pmm = PMM_LOCK.lock();
     unsafe {
         write_bytes(addr_of_mut!(FRAME_BITMAP).cast::<u8>(), 0xFF, BITMAP_BYTES);
+        write_bytes(addr_of_mut!(FREEABLE_BITMAP).cast::<u8>(), 0, BITMAP_BYTES);
         FREE_FRAMES = 0;
+        NEXT_HINT = 0;
     }
 
     // Manage only RAM the firmware reports as usable, and only what the
@@ -75,29 +89,147 @@ pub fn allocate_frame() -> Option<u64> {
     allocate_contiguous_frames(1)
 }
 
+/// Allocation permanente, jamais rendue (piles, zones FPU, structures
+/// per-CPU) : aucun jeton n'existe pour elle, elle ne peut donc pas être libérée.
+/// Les pages sont effacées.
 pub fn allocate_contiguous_frames(count: usize) -> Option<u64> {
-    let managed_frames = unsafe { MANAGED_FRAMES };
+    let first = {
+        let _pmm = PMM_LOCK.lock();
+        find_and_mark(count, false)?
+    };
+    Some(zeroed(first, count))
+}
+
+/// Plage de pages rendable, obtenue par `allocate_owned`. Ses champs sont
+/// privés : seul le PMM en fabrique, et `free` la consomme, ce qui interdit à la
+/// compilation de libérer deux fois ou de libérer une plage arbitraire.
+#[must_use = "une plage non rendue reste allouée : la passer à memory::free"]
+pub struct FrameRange {
+    first: usize,
+    count: usize,
+}
+
+impl FrameRange {
+    pub fn start(&self) -> u64 {
+        self.first as u64 * PAGE_SIZE
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PmmError {
+    /// Une page de la plage n'est pas marquée libérable : l'état du PMM est
+    /// incohérent avec le jeton.
+    NotFreeable,
+}
+
+/// Allocation rendable par `free`. Les pages sont effacées.
+pub fn allocate_owned(count: usize) -> Option<FrameRange> {
+    let first = {
+        let _pmm = PMM_LOCK.lock();
+        find_and_mark(count, true)?
+    };
+    zeroed(first, count);
+    Some(FrameRange { first, count })
+}
+
+/// Rend une plage obtenue par `allocate_owned`. Le bitmap des pages libérables
+/// est vérifié en défense en profondeur : le noyau, les zones réservées et les
+/// allocations permanentes n'y figurent jamais.
+pub fn free(range: FrameRange) -> Result<(), PmmError> {
+    let _pmm = PMM_LOCK.lock();
+    let frames = range.first..range.first + range.count;
+    if !frames
+        .clone()
+        .all(|frame| is_freeable(frame) && !is_free(frame))
+    {
+        return Err(PmmError::NotFreeable);
+    }
+    for frame in frames {
+        set_freeable(frame, false);
+        mark_free(frame);
+    }
+    // SAFETY: état du PMM, sous PMM_LOCK.
+    unsafe {
+        if range.first < NEXT_HINT {
+            NEXT_HINT = range.first;
+        }
+    }
+    Ok(())
+}
+
+/// Efface `count` pages à partir de la page `first` et retourne son adresse.
+/// Appelé verrou relâché : les pages appartiennent déjà à l'appelant.
+fn zeroed(first: usize, count: usize) -> u64 {
+    let start = first as u64 * PAGE_SIZE;
+    // SAFETY: pages gérées par le PMM, donc sous la limite de l'identity map,
+    // et que personne d'autre ne détient.
+    unsafe { write_bytes(start as *mut u8, 0, count * PAGE_SIZE as usize) };
+    start
+}
+
+/// Recherche next-fit de `count` pages libres contiguës, puis marquage, sous
+/// PMM_LOCK. Une page occupée fait repartir la recherche juste après elle.
+fn find_and_mark(count: usize, freeable: bool) -> Option<usize> {
+    // SAFETY: état du PMM, sous PMM_LOCK (appelants).
+    let (managed_frames, hint) = unsafe { (MANAGED_FRAMES, NEXT_HINT) };
     if count == 0 || count > managed_frames {
         return None;
     }
-
     let first_allocatable = (LOW_MEMORY_RESERVE_END / PAGE_SIZE) as usize;
     let last_start = managed_frames.checked_sub(count)?;
-
-    'candidate: for start in first_allocatable..=last_start {
-        for frame in start..start + count {
-            if !is_free(frame) {
-                continue 'candidate;
-            }
-        }
-
-        for frame in start..start + count {
-            mark_used(frame);
-        }
-        return Some(start as u64 * PAGE_SIZE);
+    if first_allocatable > last_start {
+        return None;
     }
+    let hint = hint.clamp(first_allocatable, last_start);
+    let first = scan(hint, last_start, count).or_else(|| scan(first_allocatable, hint, count))?;
+    for frame in first..first + count {
+        mark_used(frame);
+        set_freeable(frame, freeable);
+    }
+    // SAFETY: état du PMM, sous PMM_LOCK.
+    unsafe { NEXT_HINT = first + count };
+    Some(first)
+}
 
+fn scan(from: usize, to: usize, count: usize) -> Option<usize> {
+    let mut start = from;
+    while start <= to {
+        match (start..start + count).find(|&frame| !is_free(frame)) {
+            // Toute fenêtre contenant cette page occupée échoue aussi.
+            Some(used) => start = used + 1,
+            None => return Some(start),
+        }
+    }
     None
+}
+
+fn is_freeable(frame: usize) -> bool {
+    if frame >= MAX_FRAMES {
+        return false;
+    }
+    unsafe {
+        let ptr = addr_of_mut!(FREEABLE_BITMAP).cast::<u8>().add(frame / 8);
+        (*ptr & (1 << (frame % 8))) != 0
+    }
+}
+
+fn set_freeable(frame: usize, freeable: bool) {
+    if frame >= MAX_FRAMES {
+        return;
+    }
+    unsafe {
+        let ptr = addr_of_mut!(FREEABLE_BITMAP).cast::<u8>().add(frame / 8);
+        if freeable {
+            *ptr |= 1 << (frame % 8);
+        } else {
+            *ptr &= !(1 << (frame % 8));
+        }
+    }
+}
+
+pub fn free_frame_count() -> usize {
+    let _pmm = PMM_LOCK.lock();
+    unsafe { FREE_FRAMES }
 }
 
 fn reserve_range(start: u64, end: u64) {
