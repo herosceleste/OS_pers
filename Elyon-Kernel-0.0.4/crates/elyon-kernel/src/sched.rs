@@ -1612,31 +1612,42 @@ pub enum WakeOutcome {
 /// terminée est une erreur, jamais un simple `NotAsleep`.
 pub fn wake(task_id: u64) -> Result<WakeOutcome, SchedError> {
     irq_save(|| {
-        // Un réveil explicite annule d'abord l'échéance en attente : le tick ne
-        // pourra plus réveiller la tâche une seconde fois (K004-09). Une erreur
-        // ensuite est fatale pour l'appelant.
-        let ticket = task::take_sleep(task::lookup(task_id)?)?;
-        let cancelled = ticket != 0 && timers().cancel(timer_key(task_id, ticket)?);
-        let outcome = wake_task(task_id)?;
-        if cancelled && matches!(outcome, WakeOutcome::Woken(_)) {
+        // Seul le détenteur du ticket d'attente réveille la tâche : entre
+        // réveils concurrents, et contre l'échéance, la décision est atomique,
+        // et un réveil tardif ne peut plus atteindre l'attente suivante.
+        let id = task::lookup(task_id)?;
+        let ticket = task::take_wait(id)?;
+        if ticket == 0 {
+            return match task::snapshot(id)?.state {
+                TaskState::Dead => Err(SchedError::WakeDead),
+                _ => Ok(WakeOutcome::NotAsleep),
+            };
+        }
+        // Le ticket est armé avant l'entrée en attente : une fois la tâche hors
+        // de son CPU, elle est BLOCKED ou SLEEPING et son échéance est inscrite.
+        // L'annuler empêche le tick de la réveiller une seconde fois (K004-09) ;
+        // si le tick l'a déjà retirée, il ne peut plus réclamer le ticket.
+        wait_off_cpu(task_id)?;
+        let sleeping = task::snapshot(id)?.state == TaskState::Sleeping;
+        if sleeping {
+            timers().cancel(timer_key(task_id, ticket)?);
+        }
+        // Le ticket est consommé : une erreur ensuite est fatale pour l'appelant.
+        let cpu = wake_owned(task_id)?;
+        if sleeping {
             log_wake(task_id, timer::ticks(), true);
             EXPLICIT_WAKES.fetch_add(1, Ordering::AcqRel);
         }
-        Ok(outcome)
+        Ok(WakeOutcome::Woken(cpu))
     })
 }
 
-/// Remet en file une tâche BLOCKED ou SLEEPING et prévient son CPU, IRQ
-/// masquées. Transactionnel : l'état ne change que si la mise en file est
-/// assurée, et jamais avant que la tâche ait quitté son ancien CPU.
-fn wake_task(task_id: u64) -> Result<WakeOutcome, SchedError> {
+/// Remet en file une tâche BLOCKED ou SLEEPING dont l'appelant détient le
+/// ticket d'attente, et prévient son CPU, IRQ masquées. Transactionnel : l'état
+/// ne change que si la mise en file est assurée, et jamais avant que la tâche
+/// ait quitté son ancien CPU.
+fn wake_owned(task_id: u64) -> Result<usize, SchedError> {
     let id = task::lookup(task_id)?;
-    let snapshot = task::snapshot(id)?;
-    match snapshot.state {
-        TaskState::Blocked | TaskState::Sleeping => {}
-        TaskState::Dead => return Err(SchedError::WakeDead),
-        _ => return Ok(WakeOutcome::NotAsleep),
-    }
     wait_off_cpu(task_id)?;
     for _ in 0..PLACE_RETRIES {
         let cpu = percpu_sched::place(task::snapshot(id)?.affinity_mask, online_mask())
@@ -1649,16 +1660,22 @@ fn wake_task(task_id: u64) -> Result<WakeOutcome, SchedError> {
             if queue.len() == RunQueue::<QUEUE_CAPACITY>::capacity() {
                 return Err(SchedError::Queue(QueueError::Full));
             }
+            // Le ticket garantit qu'aucun autre réveil n'a eu lieu : un échec
+            // ici trahit une tâche terminée pendant son attente.
             match task::wake(id) {
                 Ok(()) => {}
-                Err(TaskError::InvalidTransition) => return Ok(WakeOutcome::NotAsleep),
+                Err(TaskError::InvalidTransition)
+                    if task::snapshot(id)?.state == TaskState::Dead =>
+                {
+                    return Err(SchedError::WakeDead);
+                }
                 Err(error) => return Err(SchedError::Task(error)),
             }
             // Place vérifiée, et une tâche endormie n'est dans aucune file.
             queue.push_back(task_id)?;
         }
         send_resched(cpu)?;
-        return Ok(WakeOutcome::Woken(cpu));
+        return Ok(cpu);
     }
     Err(SchedError::AffinityUnstable)
 }
@@ -1731,6 +1748,9 @@ fn try_block() -> Result<(), SchedError> {
     let mut misplaced = Misplaced::new();
     let next = {
         let mut guard = queue();
+        // Ticket armé avant le passage à BLOCKED : un réveil qui le prend
+        // attend que la tâche ait quitté ce CPU.
+        task::arm_wait(task::lookup(current)?)?;
         task::block(task::lookup(current)?)?;
         pop_allowed(&mut guard, cpu, &mut misplaced)?
     };
@@ -2139,18 +2159,19 @@ fn try_sleep(start: u64, deadline: u64) -> Result<(), SchedError> {
     if current == BSP_CONTEXT {
         return Err(SchedError::NotInTaskContext);
     }
-    // Passage à SLEEPING, inscription de l'échéance et choix de la suivante sous
-    // le verrou de la file. Un réveil concurrent attend `on_cpu` : la tâche ne
-    // reprend nulle part avant que ce CPU ait sauvegardé son contexte.
+    // Ticket, échéance, passage à SLEEPING et choix de la suivante sous le
+    // verrou de la file. Le ticket est armé en premier : un réveil qui le prend
+    // attend `on_cpu`, et la tâche ne reprend nulle part avant que ce CPU ait
+    // sauvegardé son contexte.
     let mut misplaced = Misplaced::new();
     let next = {
         let mut guard = queue();
-        task::sleep(task::lookup(current)?)?;
         log_sleep(current, start, deadline)?;
-        let ticket = task::arm_sleep(task::lookup(current)?)?;
+        let ticket = task::arm_wait(task::lookup(current)?)?;
         timers()
             .insert(timer_key(current, ticket)?, deadline)
             .map_err(SchedError::Timers)?;
+        task::sleep(task::lookup(current)?)?;
         pop_allowed(&mut guard, cpu, &mut misplaced)?
     };
     misplaced.requeue()?;
@@ -2171,7 +2192,7 @@ fn expire_sleepers(now: u64) {
         // pris, ou si la tâche s'est rendormie (nouveau ticket), cette échéance
         // ne réveille rien. Sans cela, un tick en retard réveillerait trop tôt
         // le sommeil suivant.
-        let claimed = task::lookup(task_id).and_then(|id| task::claim_sleep(id, ticket));
+        let claimed = task::lookup(task_id).and_then(|id| task::claim_wait(id, ticket));
         match claimed {
             Ok(true) => {}
             Ok(false) => {
@@ -2180,16 +2201,10 @@ fn expire_sleepers(now: u64) {
             }
             Err(error) => fail(SchedError::Task(error)),
         }
-        match wake_task(task_id) {
-            Ok(WakeOutcome::Woken(_)) => {
+        match wake_owned(task_id) {
+            Ok(_) => {
                 log_wake(task_id, now, false);
                 TIMER_WAKES.fetch_add(1, Ordering::AcqRel);
-            }
-            // Échéance d'une tâche qui ne dort plus : un réveil explicite
-            // concurrent l'a emporté. Toute qualification exige 0 hors course
-            // construite.
-            Ok(WakeOutcome::NotAsleep) => {
-                STALE_EXPIRIES.fetch_add(1, Ordering::AcqRel);
             }
             Err(error) => fail(error),
         }
@@ -2815,6 +2830,23 @@ pub fn qualify_sync(
         }
         Err(error) => return Err(error),
     };
+    // La cible réveillée se bloque une seconde fois, après les trois tentatives.
+    // Aucun réveil de la course, ni ticket ou échéance résiduels, ne doit
+    // atteindre cette nouvelle attente : elle reste BLOCKED jusqu'au BSP.
+    let target_state = || {
+        task::lookup(target)
+            .and_then(task::snapshot)
+            .map(|s| s.state)
+    };
+    wait_ticks_until(SYNC_PHASE_TICKS, || {
+        SYNC_DONE.load(Ordering::Acquire) >= phase_one_tasks + 4
+            && TARGET_RUNS.load(Ordering::Acquire) >= 1
+            && matches!(target_state(), Ok(TaskState::Blocked | TaskState::Dead))
+    })?;
+    let second_block_held = target_state()? == TaskState::Blocked;
+    if second_block_held && wake(target)? == WakeOutcome::NotAsleep {
+        return Err(SchedError::CountMismatch);
+    }
     wait_ticks_until(SYNC_PHASE_TICKS, || {
         SYNC_DONE.load(Ordering::Acquire) == phase_one_tasks + 5
     })?;
@@ -2899,13 +2931,14 @@ pub fn qualify_sync(
         && wake_wins == 1
         && wake_losses == 2
         && target_runs == 1
+        && second_block_held
         && STORM_WAKES.load(Ordering::Acquire) > 0
         && (aps < 2 || STORM_MIGRATIONS.load(Ordering::Acquire) > 0)
         && ipi_sent >= 1
         && (1..=ipi_sent).contains(&ipi_received);
     if !consistent {
         kprintln!(
-            "[sched-sync] counts counter={} pmm={} dup={} fail={} free={}->{} pingpong={} wins={} losses={} runs={} ipi={}/{}",
+            "[sched-sync] counts counter={} pmm={} dup={} fail={} free={}->{} pingpong={} wins={} losses={} runs={} second_block={} ipi={}/{}",
             counter_total,
             pmm_allocations,
             pmm_duplicates,
@@ -2916,6 +2949,7 @@ pub fn qualify_sync(
             wake_wins,
             wake_losses,
             target_runs,
+            second_block_held,
             ipi_received,
             ipi_sent
         );
@@ -3097,6 +3131,13 @@ extern "C" fn elyon_sync_task_entry(arg: u64) -> ! {
         SYNC_ROLE_TARGET => {
             block_now();
             TARGET_RUNS.fetch_add(1, Ordering::AcqRel);
+            // Seconde attente, une fois les trois tentatives de réveil rendues :
+            // aucun réveil de la course ne doit l'atteindre, seul le BSP la lève.
+            // Bornée par l'attente du BSP sur `SYNC_DONE`.
+            while WAKE_WINS.load(Ordering::Acquire) + WAKE_LOSSES.load(Ordering::Acquire) < 3 {
+                yield_now();
+            }
+            block_now();
         }
         SYNC_ROLE_WAKER => {
             WAKERS_READY.fetch_add(1, Ordering::AcqRel);

@@ -81,9 +81,10 @@ struct TaskSlot {
     /// Vrai de l'entrée de la tâche sur un CPU jusqu'à ce que le contexte
     /// suivant ait fini de sauvegarder le sien (K004-10).
     on_cpu: AtomicBool,
-    /// Ticket du sommeil en cours (0 : aucun). Seul celui qui le réclame (le
-    /// tick à l'échéance, ou un réveil explicite) réveille la tâche (K004-10).
-    sleep_ticket: AtomicU64,
+    /// Ticket de l'attente en cours, sommeil ou blocage (0 : aucune). Armé
+    /// avant l'entrée en attente ; seul celui qui le réclame (le tick à
+    /// l'échéance, ou un réveil explicite) réveille la tâche (K004-10).
+    wait_ticket: AtomicU64,
 }
 
 impl TaskSlot {
@@ -98,7 +99,7 @@ impl TaskSlot {
             saved_rsp: AtomicU64::new(0),
             fpu_area: AtomicU64::new(0),
             on_cpu: AtomicBool::new(false),
-            sleep_ticket: AtomicU64::new(0),
+            wait_ticket: AtomicU64::new(0),
         }
     }
 }
@@ -126,6 +127,7 @@ pub enum TaskError {
     CpuOutsideAffinity,
     StackAlreadyAttached,
     StackInUse,
+    WaitAlreadyArmed,
 }
 
 impl TaskError {
@@ -138,6 +140,7 @@ impl TaskError {
             Self::CpuOutsideAffinity => "CPU is outside task affinity mask",
             Self::StackAlreadyAttached => "task already owns a stack",
             Self::StackInUse => "stack overlaps the stack of another active task",
+            Self::WaitAlreadyArmed => "task already holds a wait ticket",
         }
     }
 }
@@ -356,30 +359,34 @@ pub fn claim_on_cpu(id: TaskId) -> Result<bool, TaskError> {
         .is_ok())
 }
 
-static NEXT_SLEEP_TICKET: AtomicU64 = AtomicU64::new(1);
+static NEXT_WAIT_TICKET: AtomicU64 = AtomicU64::new(1);
 
-/// Arme un nouveau sommeil et retourne son ticket, jamais nul ni réutilisé.
-pub fn arm_sleep(id: TaskId) -> Result<u64, TaskError> {
+/// Arme un nouveau ticket d'attente, avant l'entrée en BLOCKED ou SLEEPING.
+/// Une tâche qui tourne n'en détient aucun : sinon un réveil destiné à une
+/// attente passée pourrait réveiller celle-ci.
+pub fn arm_wait(id: TaskId) -> Result<u64, TaskError> {
     let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
-    let ticket = NEXT_SLEEP_TICKET.fetch_add(1, Ordering::Relaxed);
-    slot.sleep_ticket.store(ticket, Ordering::Release);
+    let ticket = NEXT_WAIT_TICKET.fetch_add(1, Ordering::Relaxed);
+    slot.wait_ticket
+        .compare_exchange(0, ticket, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| TaskError::WaitAlreadyArmed)?;
     Ok(ticket)
 }
 
-/// Réclame le sommeil `ticket` (tick à l'échéance) : faux s'il a déjà été
-/// réclamé ou remplacé par un sommeil plus récent.
-pub fn claim_sleep(id: TaskId, ticket: u64) -> Result<bool, TaskError> {
+/// Réclame l'attente `ticket` (tick à l'échéance) : faux si elle a déjà été
+/// réclamée ou remplacée par une attente plus récente.
+pub fn claim_wait(id: TaskId, ticket: u64) -> Result<bool, TaskError> {
     let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
     Ok(slot
-        .sleep_ticket
+        .wait_ticket
         .compare_exchange(ticket, 0, Ordering::AcqRel, Ordering::Acquire)
         .is_ok())
 }
 
-/// Réclame le sommeil en cours quel qu'il soit (réveil explicite) ; 0 : aucun.
-pub fn take_sleep(id: TaskId) -> Result<u64, TaskError> {
+/// Réclame l'attente en cours quelle qu'elle soit (réveil explicite) ; 0 : aucune.
+pub fn take_wait(id: TaskId) -> Result<u64, TaskError> {
     let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
-    Ok(slot.sleep_ticket.swap(0, Ordering::AcqRel))
+    Ok(slot.wait_ticket.swap(0, Ordering::AcqRel))
 }
 
 pub fn is_on_cpu(id: TaskId) -> Result<bool, TaskError> {
