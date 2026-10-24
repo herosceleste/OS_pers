@@ -392,6 +392,10 @@ pub fn load() {
 #[unsafe(no_mangle)]
 extern "C" fn elyon_exception_dispatch(context: *const ExceptionContext) -> ! {
     let context = unsafe { &*context };
+    // NMI d'arrêt système envoyé par un autre CPU : arrêt silencieux.
+    if context.vector == 2 {
+        crate::fatal::on_nmi();
+    }
     let name = exception_name(context.vector);
 
     kprintln!("");

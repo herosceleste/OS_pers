@@ -124,7 +124,7 @@ pub fn assert_switch_allowed() {
 
 fn order_violation(error: LockOrderError) -> ! {
     kprintln!("[lock] FAILED cpu={} order={:?}", cpu_local::index(), error);
-    cpu::halt_forever()
+    crate::fatal::halt_system()
 }
 
 fn switch_violation(error: SwitchError) -> ! {
@@ -133,7 +133,7 @@ fn switch_violation(error: SwitchError) -> ! {
         cpu_local::index(),
         error
     );
-    cpu::halt_forever()
+    crate::fatal::halt_system()
 }
 
 pub fn acquisitions(class: LockClass) -> u64 {

@@ -730,7 +730,7 @@ fn check_arg(current: u64, arg: u64) -> Result<(), SchedError> {
 
 fn fail(error: SchedError) -> ! {
     kprintln!("[sched] FAILED reason={}", error.as_str());
-    cpu::halt_forever()
+    crate::fatal::halt_system()
 }
 
 #[unsafe(no_mangle)]

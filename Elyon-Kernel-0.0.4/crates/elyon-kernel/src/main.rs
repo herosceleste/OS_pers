@@ -5,6 +5,7 @@ mod acpi;
 mod arch;
 mod context;
 mod context_integrity;
+mod fatal;
 mod fpu;
 mod fpu_integrity;
 mod framebuffer;
