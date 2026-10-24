@@ -117,6 +117,11 @@ pub enum SchedError {
     ApTimeout,
     Trace,
     IdleState,
+    TaskStillOnCpu,
+    WakeDead,
+    WakeRetriesExhausted,
+    IpiFailed,
+    EoiFailed,
     Timers(TimerQueueError),
     SleepTimeout,
     TimerQueueNotEmpty,
@@ -158,6 +163,11 @@ impl SchedError {
             Self::Timers(error) => error.as_str(),
             Self::SleepTimeout => "a sleep phase did not complete in time",
             Self::TimerQueueNotEmpty => "deadlines left in the timer queue",
+            Self::TaskStillOnCpu => "switching into a task still running on another CPU",
+            Self::WakeDead => "wake of a terminated task",
+            Self::WakeRetriesExhausted => "task never blocked while waiting to wake it",
+            Self::IpiFailed => "resched IPI could not be sent",
+            Self::EoiFailed => "EOI of the resched IPI failed",
         }
     }
 }
@@ -427,10 +437,58 @@ fn transfer(current: u64, next: u64) -> Result<(), SchedError> {
         }
     }
 
+    // K004-10 : jamais entrer dans une tâche dont un autre CPU n'a pas fini de
+    // sauvegarder le contexte. Ceux qui la remettent en file attendent que
+    // `on_cpu` retombe ; ce contrôle fail-closed en est la garantie finale.
+    if next != BSP_CONTEXT {
+        let next_id = task::lookup(next)?;
+        if task::is_on_cpu(next_id)? {
+            return Err(SchedError::TaskStillOnCpu);
+        }
+        task::set_on_cpu(next_id, true)?;
+    }
+    crate::arch::x86_64::cpu_local::current()
+        .switched_from
+        .store(current, Ordering::Relaxed);
     CURRENT[this_cpu()].store(next, Ordering::Release);
     // SAFETY: `new_rsp` désigne le frame initial ou celui laissé par le dernier
     // switch de ce contexte, sur sa propre pile ; aucun verrou n'est tenu.
     unsafe { context::switch(old_rsp, new_rsp) };
+    finish_switch();
+    Ok(())
+}
+
+/// Exécuté par le contexte qui vient d'entrer sur ce CPU (au retour de son
+/// switch, ou par le trampoline d'une tâche neuve) : le contexte quitté est
+/// entièrement sauvegardé, il peut reprendre sur un autre CPU.
+fn finish_switch() {
+    let local = crate::arch::x86_64::cpu_local::current();
+    let previous = local.switched_from.swap(BSP_CONTEXT, Ordering::Relaxed);
+    if previous != BSP_CONTEXT {
+        let cleared = task::lookup(previous).and_then(|id| task::set_on_cpu(id, false));
+        if let Err(error) = cleared {
+            fail(SchedError::Task(error));
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn elyon_finish_switch() {
+    finish_switch();
+}
+
+/// Attentes observées d'une tâche encore en cours de sortie d'un autre CPU.
+static ON_CPU_WAITS: AtomicU64 = AtomicU64::new(0);
+
+/// Attend que `task_id` ait quitté tout CPU avant de la remettre en file.
+fn wait_off_cpu(task_id: u64) -> Result<(), SchedError> {
+    let id = task::lookup(task_id)?;
+    if task::is_on_cpu(id)? {
+        ON_CPU_WAITS.fetch_add(1, Ordering::Relaxed);
+        while task::is_on_cpu(id)? {
+            core::hint::spin_loop();
+        }
+    }
     Ok(())
 }
 
@@ -1278,7 +1336,9 @@ static RESCHED_RECEIVED: AtomicU64 = AtomicU64::new(0);
 /// reprend la main sur sa file.
 pub fn on_resched_ipi() {
     RESCHED_RECEIVED.fetch_add(1, Ordering::AcqRel);
-    let _ = crate::arch::x86_64::apic::eoi();
+    if !crate::arch::x86_64::apic::eoi() {
+        fail(SchedError::EoiFailed);
+    }
     if let Err(error) = leave_idle_if_work() {
         fail(error);
     }
@@ -1319,9 +1379,10 @@ fn send_resched(target: usize) -> Result<(), SchedError> {
     let apic_id = crate::arch::x86_64::percpu::snapshot(target)
         .ok_or(SchedError::UnknownCpu)?
         .apic_id;
-    RESCHED_SENT.fetch_add(1, Ordering::AcqRel);
     crate::arch::x86_64::apic::send_fixed(apic_id, RESCHED_VECTOR)
-        .map_err(|_| SchedError::ApTimeout)
+        .map_err(|_| SchedError::IpiFailed)?;
+    RESCHED_SENT.fetch_add(1, Ordering::AcqRel);
+    Ok(())
 }
 
 /// Exécute `body` IRQ locales masquées, puis restaure IF (irq-save).
@@ -1355,34 +1416,62 @@ pub fn enqueue(task_id: u64, notify: bool) -> Result<usize, SchedError> {
 
 /// Réveille une tâche BLOCKED ou SLEEPING : la transition vers READY est
 /// atomique ; seul le gagnant la remet en file et prévient son CPU.
-/// Réveille une tâche BLOCKED ou SLEEPING. `Ok(None)` : la tâche n'était pas
-/// endormie (déjà réveillée par un autre CPU ou par son échéance, ou pas encore
-/// bloquée) ; entre réveils concurrents, un seul obtient `Some(cpu)` (K004-10).
-pub fn wake(task_id: u64) -> Result<Option<usize>, SchedError> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WakeOutcome {
+    /// La tâche est remise dans la file de ce CPU.
+    Woken(usize),
+    /// Elle n'était pas endormie : déjà réveillée par un autre CPU ou par son
+    /// échéance, ou pas encore bloquée. Entre réveils concurrents, un seul
+    /// obtient `Woken`.
+    NotAsleep,
+}
+
+/// Réveille une tâche BLOCKED ou SLEEPING (K004-10). Réveiller une tâche
+/// terminée est une erreur, jamais un simple `NotAsleep`.
+pub fn wake(task_id: u64) -> Result<WakeOutcome, SchedError> {
     irq_save(|| {
-        // Un réveil explicite annule l'échéance en attente : le tick ne pourra
-        // plus réveiller la tâche une seconde fois (K004-09).
-        if timers().cancel(task_id) {
+        // Un réveil explicite annule d'abord l'échéance en attente : le tick ne
+        // pourra plus réveiller la tâche une seconde fois (K004-09). Une erreur
+        // ensuite est fatale pour l'appelant.
+        let cancelled = timers().cancel(task_id);
+        let outcome = wake_task(task_id)?;
+        if cancelled && matches!(outcome, WakeOutcome::Woken(_)) {
             log_wake(task_id, timer::ticks(), true);
             EXPLICIT_WAKES.fetch_add(1, Ordering::AcqRel);
         }
-        match wake_task(task_id) {
-            Ok(cpu) => Ok(Some(cpu)),
-            Err(SchedError::Task(TaskError::InvalidTransition)) => Ok(None),
-            Err(error) => Err(error),
-        }
+        Ok(outcome)
     })
 }
 
-/// Remet en file une tâche BLOCKED ou SLEEPING et prévient son CPU, IRQ masquées.
-fn wake_task(task_id: u64) -> Result<usize, SchedError> {
-    task::wake(task::lookup(task_id)?)?;
-    let snapshot = task::snapshot(task::lookup(task_id)?)?;
+/// Remet en file une tâche BLOCKED ou SLEEPING et prévient son CPU, IRQ
+/// masquées. Transactionnel : l'état ne change que si la mise en file est
+/// assurée, et jamais avant que la tâche ait quitté son ancien CPU.
+fn wake_task(task_id: u64) -> Result<WakeOutcome, SchedError> {
+    let id = task::lookup(task_id)?;
+    let snapshot = task::snapshot(id)?;
+    match snapshot.state {
+        TaskState::Blocked | TaskState::Sleeping => {}
+        TaskState::Dead => return Err(SchedError::WakeDead),
+        _ => return Ok(WakeOutcome::NotAsleep),
+    }
+    wait_off_cpu(task_id)?;
     let cpu = percpu_sched::place(snapshot.affinity_mask, online_mask())
         .map_err(SchedError::Placement)?;
-    queue_of(cpu).push_back(task_id)?;
+    {
+        let mut queue = queue_of(cpu);
+        if queue.len() == RunQueue::<QUEUE_CAPACITY>::capacity() {
+            return Err(SchedError::Queue(QueueError::Full));
+        }
+        match task::wake(id) {
+            Ok(()) => {}
+            Err(TaskError::InvalidTransition) => return Ok(WakeOutcome::NotAsleep),
+            Err(error) => return Err(SchedError::Task(error)),
+        }
+        // Place vérifiée, et une tâche endormie n'est dans aucune file.
+        queue.push_back(task_id)?;
+    }
     send_resched(cpu)?;
-    Ok(cpu)
+    Ok(WakeOutcome::Woken(cpu))
 }
 
 /// Change l'affinité d'une tâche READY en file et la migre si son CPU actuel
@@ -1397,17 +1486,22 @@ pub fn set_affinity(task_id: u64, affinity: u64) -> Result<Migration, SchedError
         match decision {
             Migration::Stay(_) => {}
             Migration::Move { from, to } => {
-                // Jamais deux verrous de file à la fois : retrait puis ajout.
+                // Jamais deux verrous de file à la fois : retrait puis ajout. Si
+                // `from` l'a déjà prise entre-temps, elle tourne là-bas et suivra
+                // son nouveau masque au prochain réveil.
                 if !queue_of(from).remove(task_id) {
-                    return Err(SchedError::Task(TaskError::UnknownTask));
+                    return Ok(Migration::Stay(from));
                 }
+                // Une tâche qui vient de céder son CPU peut être encore en train
+                // d'y sauvegarder son contexte.
+                wait_off_cpu(task_id)?;
                 queue_of(to).push_back(task_id)?;
                 send_resched(to)?;
             }
-            Migration::Place(to) => {
-                queue_of(to).push_back(task_id)?;
-                send_resched(to)?;
-            }
+            // Dans aucune file : RUNNING, BLOCKED ou SLEEPING. Le nouveau masque
+            // s'applique à son prochain placement ; la mettre en file ici la
+            // ferait tourner deux fois.
+            Migration::Place(_) => {}
         }
         Ok(decision)
     })
@@ -1588,7 +1682,7 @@ pub fn qualify_remote(
             .and_then(task::snapshot)
             .is_ok_and(|snapshot| snapshot.state == TaskState::Blocked)
     })?;
-    if wake(blocked.0)? != Some(block_cpu) {
+    if wake(blocked.0)? != WakeOutcome::Woken(block_cpu) {
         return Err(SchedError::WrongCpu);
     }
 
@@ -1800,10 +1894,14 @@ fn sleep_record_of(task_id: u64) -> Option<usize> {
 }
 
 fn log_wake(task_id: u64, now: u64, explicit: bool) {
-    if let Some(index) = sleep_record_of(task_id) {
-        SLEEP_WOKE_AT[index].store(now, Ordering::Release);
-        SLEEP_EXPLICIT[index].store(explicit, Ordering::Release);
-        SLEEP_WAKES[index].fetch_add(1, Ordering::AcqRel);
+    match sleep_record_of(task_id) {
+        Some(index) => {
+            SLEEP_WOKE_AT[index].store(now, Ordering::Release);
+            SLEEP_EXPLICIT[index].store(explicit, Ordering::Release);
+            SLEEP_WAKES[index].fetch_add(1, Ordering::AcqRel);
+        }
+        None if SLEEP_LOG_ON.load(Ordering::Acquire) => fail(SchedError::Trace),
+        None => {}
     }
 }
 
@@ -1860,14 +1958,15 @@ fn expire_sleepers(now: u64) {
         let Some(task_id) = expired else {
             return;
         };
-        log_wake(task_id, now, false);
         match wake_task(task_id) {
-            Ok(_) => {
+            Ok(WakeOutcome::Woken(_)) => {
+                log_wake(task_id, now, false);
                 TIMER_WAKES.fetch_add(1, Ordering::AcqRel);
             }
-            // Échéance d'une tâche qui n'est plus endormie : elle aurait dû être
-            // annulée par son réveil explicite.
-            Err(SchedError::Task(TaskError::InvalidTransition)) => {
+            // Échéance d'une tâche qui ne dort plus : un réveil explicite
+            // concurrent l'a emporté. Toute qualification exige 0 hors course
+            // construite.
+            Ok(WakeOutcome::NotAsleep) => {
                 STALE_EXPIRIES.fetch_add(1, Ordering::AcqRel);
             }
             Err(error) => fail(error),
@@ -2042,7 +2141,9 @@ pub fn qualify_sleep(
     wait_ticks_until(SLEEP_PHASE_TICKS, || {
         timer::ticks() >= asleep_at + EXPLICIT_AFTER_TICKS
     })?;
-    wake(explicit_id)?.ok_or(SchedError::Trace)?;
+    if !matches!(wake(explicit_id)?, WakeOutcome::Woken(_)) {
+        return Err(SchedError::Trace);
+    }
     wait_ticks_until(SLEEP_PHASE_TICKS, || {
         SLEEP_DONE.load(Ordering::Acquire) == 6
     })?;
@@ -2279,7 +2380,8 @@ const COUNTER_TASKS_PER_AP: usize = 2;
 pub const COUNTER_ROUNDS: u64 = 20_000;
 pub const PMM_ROUNDS: u64 = 64;
 pub const PING_ROUNDS: u64 = 50;
-const SYNC_MAX_TASKS: usize = 16;
+/// 3 tâches par AP (jusqu'à 7 AP), plus le ping-pong et la course au réveil.
+const SYNC_MAX_TASKS: usize = 32;
 /// Attente maximale d'une phase : 10 s à 100 Hz.
 const SYNC_PHASE_TICKS: u64 = 1_000;
 
@@ -2449,8 +2551,8 @@ pub fn qualify_sync(
     })?;
     WAKE_GO.store(true, Ordering::Release);
     match wake(target)? {
-        Some(_) => WAKE_WINS.fetch_add(1, Ordering::AcqRel),
-        None => WAKE_LOSSES.fetch_add(1, Ordering::AcqRel),
+        WakeOutcome::Woken(_) => WAKE_WINS.fetch_add(1, Ordering::AcqRel),
+        WakeOutcome::NotAsleep => WAKE_LOSSES.fetch_add(1, Ordering::AcqRel),
     };
     wait_ticks_until(SYNC_PHASE_TICKS, || {
         SYNC_DONE.load(Ordering::Acquire) == phase_one_tasks + 5
@@ -2566,20 +2668,23 @@ pub fn qualify_sync(
 
 /// Réveille `task_id` dès qu'elle est bloquée : un réveil arrivé avant que la
 /// tâche ne se bloque ne la trouve pas endormie et serait perdu.
+const WAKE_RETRY_LIMIT: u64 = 1_000_000;
+
 fn wake_when_blocked(task_id: u64) {
-    loop {
+    for _ in 0..WAKE_RETRY_LIMIT {
         match wake(task_id) {
-            Ok(Some(_)) => {
+            Ok(WakeOutcome::Woken(_)) => {
                 PINGPONG_WAKES.fetch_add(1, Ordering::AcqRel);
                 return;
             }
-            Ok(None) => {
+            Ok(WakeOutcome::NotAsleep) => {
                 PINGPONG_RETRIES.fetch_add(1, Ordering::Relaxed);
                 yield_now();
             }
             Err(error) => fail(error),
         }
     }
+    fail(SchedError::WakeRetriesExhausted)
 }
 
 fn counter_task() {
@@ -2657,8 +2762,8 @@ extern "C" fn elyon_sync_task_entry(arg: u64) -> ! {
                 yield_now();
             }
             match wake(WAKE_TARGET.load(Ordering::Acquire)) {
-                Ok(Some(_)) => WAKE_WINS.fetch_add(1, Ordering::AcqRel),
-                Ok(None) => WAKE_LOSSES.fetch_add(1, Ordering::AcqRel),
+                Ok(WakeOutcome::Woken(_)) => WAKE_WINS.fetch_add(1, Ordering::AcqRel),
+                Ok(WakeOutcome::NotAsleep) => WAKE_LOSSES.fetch_add(1, Ordering::AcqRel),
                 Err(error) => fail(error),
             };
         }

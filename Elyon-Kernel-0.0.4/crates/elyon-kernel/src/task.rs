@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 pub const MAX_TASKS: usize = 256;
 pub const NO_CPU: u32 = u32::MAX;
@@ -78,6 +78,9 @@ struct TaskSlot {
     stack_end: AtomicU64,
     saved_rsp: AtomicU64,
     fpu_area: AtomicU64,
+    /// Vrai de l'entrée de la tâche sur un CPU jusqu'à ce que le contexte
+    /// suivant ait fini de sauvegarder le sien (K004-10).
+    on_cpu: AtomicBool,
 }
 
 impl TaskSlot {
@@ -91,6 +94,7 @@ impl TaskSlot {
             stack_end: AtomicU64::new(0),
             saved_rsp: AtomicU64::new(0),
             fpu_area: AtomicU64::new(0),
+            on_cpu: AtomicBool::new(false),
         }
     }
 }
@@ -317,6 +321,19 @@ pub fn lookup(raw: u64) -> Result<TaskId, TaskError> {
 
 /// Emplacement du RSP sauvegardé de la tâche, écrit et relu par le switch de
 /// contexte. Le pointeur reste valide tant que le registre statique existe.
+/// Marque la tâche comme occupant (ou n'occupant plus) un CPU. Le passage à
+/// faux est publié en Release après la sauvegarde complète de son contexte.
+pub fn set_on_cpu(id: TaskId, on_cpu: bool) -> Result<(), TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    slot.on_cpu.store(on_cpu, Ordering::Release);
+    Ok(())
+}
+
+pub fn is_on_cpu(id: TaskId) -> Result<bool, TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    Ok(slot.on_cpu.load(Ordering::Acquire))
+}
+
 pub fn saved_rsp_ptr(id: TaskId) -> Result<*mut u64, TaskError> {
     let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
     Ok(slot.saved_rsp.as_ptr())
