@@ -163,6 +163,13 @@ pub fn read_tr() -> u16 {
     selector
 }
 
+/// Attend la prochaine interruption IRQ actives, puis remasque les IRQ. `sti`
+/// ne prend effet qu'après `hlt` : aucune interruption ne peut se glisser entre
+/// le test de l'appelant et l'arrêt.
+pub fn wait_for_interrupt() {
+    unsafe { asm!("sti; hlt; cli", options(nomem, nostack)) }
+}
+
 pub fn idle_forever() -> ! {
     loop {
         unsafe { asm!("sti; hlt", options(nomem, nostack)) }

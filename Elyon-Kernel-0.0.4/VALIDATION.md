@@ -1,6 +1,6 @@
 # Elyon Kernel 0.0.4 — Validation
 
-**EN COURS — K004-01 à K004-08 sont validés. K004-09 à K004-12 restent à qualifier.**
+**EN COURS — K004-01 à K004-09 sont validés. K004-10 à K004-12 restent à qualifier.**
 
 ## Baseline héritée
 
@@ -18,7 +18,7 @@ La 0.0.4 est dérivée de la Release `v0.0.3`, dont les critères K003-01 à K00
 | K004-06 | Sauvegarde FPU/SSE/AVX | **PASS** |
 | K004-07 | Scheduler per-CPU + idle task | **PASS** |
 | K004-08 | Reschedule IPI + affinité | **PASS** |
-| K004-09 | Sleep/wakeup | À faire |
+| K004-09 | Sleep/wakeup | **PASS** |
 | K004-10 | Synchronisation scheduler/IRQ/SMP | À faire |
 | K004-11 | Stress SMP | À faire |
 | K004-12 | Qualification finale 0.0.4 | À faire |
@@ -430,4 +430,65 @@ Limites : seules les tâches `READY` en file migrent, pas une tâche en cours d'
 
 **K004-08 : PASS.**
 
+Correction apportée pendant K004-09 : la qualification exigeait autant d'IPI reçus que d'envoyés. Or le LAPIC ne garde qu'une interruption en attente par vecteur, et un IPI de rescheduling envoyé pendant qu'un autre attend est absorbé par lui ; le premier boot local à 2 vCPU après le passage de K004-08 a échoué ainsi, toutes les tâches ayant pourtant terminé. Depuis le commit `44fb34e14b58`, le critère est : 3 IPI envoyés exactement, `1 ≤ reçus ≤ envoyés`, avec `ipi_coalesced` affiché ; l'achèvement de toutes les tâches prouve qu'aucun réveil n'est perdu. Les résultats ci-dessus, sans fusion, restent valables.
+
 Le prochain critère est **K004-09 : sleep/wakeup.**
+
+## K004-09 — Sleep/wakeup et file temporelle
+
+Une tâche peut désormais s'endormir pour une durée donnée, sur n'importe quel CPU, et être réveillée à son échéance par le timer, ou plus tôt par un réveil explicite.
+
+La logique pure est dans `elyon_core::timer_queue`, testée sur l'hôte :
+
+- `TimerQueue<N>` : échéances triées ; à échéance égale, l'ordre d'arrivée est conservé ; `cancel()` retire l'échéance d'une tâche réveillée explicitement ;
+- `deadline_for()` : arrondi au tick supérieur, plus un tick, parce que le tick courant est déjà entamé ; sans cette marge, une tâche pourrait se réveiller jusqu'à une période trop tôt ;
+- `check_sleep()` : un seul réveil par sommeil ; réveils par le timer jamais en avance, au plus N ticks en retard et dans l'ordre des échéances ; réveil explicite strictement avant l'échéance.
+
+Côté noyau :
+
+- une file temporelle globale, protégée par son propre verrou, est vidée par le tick du BSP, seul timer programmé ; une échéance atteinte réveille la tâche par le chemin de K004-08 : retour dans la file de son CPU, puis IPI ;
+- `sleep_ms()` passe la tâche à `SLEEPING`, inscrit son échéance et choisit la suivante sous le verrou de la file du CPU ; ordre des verrous : file du CPU puis file temporelle, et le tick relâche la file temporelle avant chaque réveil ; `sleep_ms(0)` cède seulement le CPU ;
+- `wake()` annule d'abord l'échéance en attente : le timer ne peut plus réveiller la tâche une seconde fois ; une échéance dont la tâche ne dort plus est comptée comme périmée.
+
+La qualification, exécutée après K004-08 avec le timer du BSP relancé à 100 Hz, enchaîne quatre scénarios :
+
+1. trois tâches dorment 30, 10 et 20 ms sur trois AP et se réveillent dans l'ordre des échéances ;
+2. deux tâches partagent l'AP 1 : la seconde tourne pendant que la première dort, puis l'AP repasse en idle quand les deux dorment ;
+3. une tâche endormie pour 300 ms est réveillée par le BSP au bout de 5 ticks ; le BSP attend ensuite au-delà de l'échéance annulée pour vérifier qu'elle n'expire pas ;
+4. `sleep_ms(0)` laisse la tâche éveillée.
+
+Le BSP vérifie la trace avec `check_sleep()` (retard maximal de 2 ticks), 6 sommeils, 5 réveils par le timer et 1 explicite, aucune échéance périmée, une file temporelle vide, 12 IPI envoyés, les tâches `DEAD`, le retour des AP en idle et les canaris.
+
+Deux injections de faute ont été rejetées : une expiration un tick trop tôt (`Early`) et un réveil explicite qui n'annule pas l'échéance (`WakeCount`, la tâche étant réveillée deux fois). Le script `test-sched-sleep-qemu.sh` recalcule chaque échéance à partir du début du sommeil, de la durée et de la fréquence du timer ; 21 copies altérées d'un log réel sont toutes refusées, et un log avec des IPI fusionnés est accepté.
+
+La suite CI locale a révélé, à 2 vCPU, la fusion d'IPI décrite dans la correction de K004-08. Après correction, 12 boots à 2 vCPU, avec l'hôte chargé à 100 %, ont tous réussi, dont 5 avec 1 ou 2 IPI fusionnés.
+
+La qualification a été exécutée sur le commit `44fb34e14b58`, GitHub Actions run **#56** du workflow Elyon 0.0.4, et en local sous QEMU 8.2.2 / OVMF, 4 vCPU.
+
+Preuves :
+
+```text
+[sched-sleep] timed task=33 cpu=1 ms=30 start=190 deadline=194 woke_at=194 resumed_at=194
+[sched-sleep] timed task=34 cpu=2 ms=10 start=190 deadline=192 woke_at=192 resumed_at=192
+[sched-sleep] timed task=35 cpu=3 ms=20 start=190 deadline=193 woke_at=193 resumed_at=193
+[sched-sleep] shared cpu=1 sleeper=36 runner=37 ran_while_sleeping=1 idle_entries=1
+[sched-sleep] explicit task=38 cpu=2 ms=300 start=203 deadline=234 woke_at=209 stale_expiries=0
+[sched-sleep] zero task=39 stayed_awake=1
+[sched-sleep] cpus=4 hz=100 sleeps=6 timer_wakes=5 explicit_wakes=1 order_ok=1 never_early=1 max_late=0 ipi_sent=12 ipi_received=12 ipi_coalesced=0 timer_queue_empty=1 idle_running_aps=3 running_max=1 canaries_ok=7
+ELYON_SCHED_SLEEP_READY
+[PASS] K004-09 sleep/wakeup: 4 CPU, sommeils de 30/10/20 ms réveillés dans l'ordre jamais en avance (retard max 0 tick), CPU partagé, réveil explicite sans échéance périmée, sleep(0), IPI envoyés=12 reçus=12 (fusionnés=0)
+```
+
+Validation croisée sous VMware® Workstation 17 Pro 17.0.2 build-21581411, UEFI, 4 vCPU, même build :
+
+```text
+[PASS] VMware 4 vCPU: Elyon 0.0.4 K003-01..12 et K004-01..09 validés sur build_id=44fb34e14b58
+```
+
+Les lignes `[sched-sleep]` relevées sous VMware sont identiques à celles de QEMU, ticks compris.
+
+Limites : la résolution est celle du tick à 100 Hz, soit 10 ms ; seul le timer du BSP est programmé, donc tous les réveils partent du BSP ; la file temporelle est limitée à 16 échéances ; un réveil explicite lancé depuis un AP pendant que le tick du BSP expire la même échéance renverrait une erreur à l'un des deux appelants, ce cas n'étant pas exercé ; seul le BSP alloue, le PMM n'étant pas verrouillé.
+
+**K004-09 : PASS.**
+
+Le prochain critère est **K004-10 : synchronisation scheduler/IRQ/SMP.**

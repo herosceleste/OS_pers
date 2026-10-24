@@ -155,6 +155,10 @@ jobs:
         working-directory: Elyon-Kernel-0.0.4
         run: bash scripts/test-sched-ipi-qemu.sh
 
+      - name: K004-09 sleep/wakeup and timer queue test
+        working-directory: Elyon-Kernel-0.0.4
+        run: bash scripts/test-sched-sleep-qemu.sh
+
       - name: IOAPIC regression
         working-directory: Elyon-Kernel-0.0.4
         run: bash scripts/test-ioapic-qemu.sh
