@@ -36,7 +36,9 @@ pub fn init(info: &BootInfo) -> PmmStats {
     let _pmm = PMM_LOCK.lock();
     unsafe {
         write_bytes(addr_of_mut!(FRAME_BITMAP).cast::<u8>(), 0xFF, BITMAP_BYTES);
+        write_bytes(addr_of_mut!(FREEABLE_BITMAP).cast::<u8>(), 0, BITMAP_BYTES);
         FREE_FRAMES = 0;
+        NEXT_HINT = 0;
     }
 
     // Manage only RAM the firmware reports as usable, and only what the

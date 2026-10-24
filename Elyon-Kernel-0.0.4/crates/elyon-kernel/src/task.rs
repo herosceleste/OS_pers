@@ -81,6 +81,9 @@ struct TaskSlot {
     /// Vrai de l'entrée de la tâche sur un CPU jusqu'à ce que le contexte
     /// suivant ait fini de sauvegarder le sien (K004-10).
     on_cpu: AtomicBool,
+    /// Ticket du sommeil en cours (0 : aucun). Seul celui qui le réclame (le
+    /// tick à l'échéance, ou un réveil explicite) réveille la tâche (K004-10).
+    sleep_ticket: AtomicU64,
 }
 
 impl TaskSlot {
@@ -95,6 +98,7 @@ impl TaskSlot {
             saved_rsp: AtomicU64::new(0),
             fpu_area: AtomicU64::new(0),
             on_cpu: AtomicBool::new(false),
+            sleep_ticket: AtomicU64::new(0),
         }
     }
 }
@@ -341,6 +345,41 @@ pub fn set_on_cpu(id: TaskId, on_cpu: bool) -> Result<(), TaskError> {
     let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
     slot.on_cpu.store(on_cpu, Ordering::Release);
     Ok(())
+}
+
+/// Réclame la tâche pour un CPU : faux si elle occupe encore un autre CPU.
+pub fn claim_on_cpu(id: TaskId) -> Result<bool, TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    Ok(slot
+        .on_cpu
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok())
+}
+
+static NEXT_SLEEP_TICKET: AtomicU64 = AtomicU64::new(1);
+
+/// Arme un nouveau sommeil et retourne son ticket, jamais nul ni réutilisé.
+pub fn arm_sleep(id: TaskId) -> Result<u64, TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    let ticket = NEXT_SLEEP_TICKET.fetch_add(1, Ordering::Relaxed);
+    slot.sleep_ticket.store(ticket, Ordering::Release);
+    Ok(ticket)
+}
+
+/// Réclame le sommeil `ticket` (tick à l'échéance) : faux s'il a déjà été
+/// réclamé ou remplacé par un sommeil plus récent.
+pub fn claim_sleep(id: TaskId, ticket: u64) -> Result<bool, TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    Ok(slot
+        .sleep_ticket
+        .compare_exchange(ticket, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok())
+}
+
+/// Réclame le sommeil en cours quel qu'il soit (réveil explicite) ; 0 : aucun.
+pub fn take_sleep(id: TaskId) -> Result<u64, TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    Ok(slot.sleep_ticket.swap(0, Ordering::AcqRel))
 }
 
 pub fn is_on_cpu(id: TaskId) -> Result<bool, TaskError> {

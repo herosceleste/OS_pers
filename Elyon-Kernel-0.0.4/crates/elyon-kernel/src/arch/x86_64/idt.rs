@@ -436,7 +436,9 @@ extern "C" fn elyon_exception_dispatch(context: *const ExceptionContext) -> ! {
     }
 
     kprintln!("[EXCEPTION] fail-closed halt");
-    cpu::halt_forever()
+    // Tous les CPU : un CPU arrêté seul pourrait tenir un verrou que les autres
+    // attendraient sans fin. Un NMI inattendu passe aussi par ici.
+    crate::fatal::halt_system()
 }
 
 fn exception_name(vector: u64) -> &'static str {

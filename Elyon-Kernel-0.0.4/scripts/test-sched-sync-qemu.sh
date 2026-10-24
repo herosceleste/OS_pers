@@ -59,7 +59,7 @@ one() {
 aps=$((CPUS - 1))
 counter="$(one 'counter tasks=[0-9]+ rounds=[0-9]+ total=[0-9]+ expected=[0-9]+$' counter)"
 pmm="$(one 'pmm tasks=[0-9]+ rounds=[0-9]+ allocations=[0-9]+ duplicates=[0-9]+ failures=[0-9]+ dirty=[0-9]+ free_before=[0-9]+ free_after=[0-9]+$' pmm)"
-storm="$(one 'storm tasks=[0-9]+ rounds=[0-9]+ migrations=[0-9]+ moves=[0-9]+ deferred=[0-9]+ misplaced=[0-9]+ wakes=[0-9]+ on_cpu_waits=[0-9]+$' storm)"
+storm="$(one 'storm tasks=[0-9]+ rounds=[0-9]+ migrations=[0-9]+ moves=[0-9]+ deferred=[0-9]+ misplaced=[0-9]+ forced=[0-9]+ wakes=[0-9]+ on_cpu_waits=[0-9]+$' storm)"
 pingpong="$(one 'pingpong ping_cpu=[0-9]+ pong_cpu=[0-9]+ rounds=[0-9]+ wakes=[0-9]+ retries=[0-9]+$' pingpong)"
 race="$(one 'wake_race target=[0-9]+ wakers=3 wins=[0-9]+ losses=[0-9]+ target_runs=[0-9]+$' wake_race)"
 locks="$(one 'locks acquisitions=[0-9]+,[0-9]+,[0-9]+,[0-9]+ contention=[0-9]+,[0-9]+,[0-9]+,[0-9]+ classes=pmm,run_queue,timer_queue,data switch_checks=[0-9]+$' locks)"
