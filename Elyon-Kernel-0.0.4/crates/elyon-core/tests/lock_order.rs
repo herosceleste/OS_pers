@@ -21,6 +21,19 @@ fn locks_taken_in_rank_order_are_accepted() {
 }
 
 #[test]
+fn no_kernel_lock_may_be_taken_under_task_data() {
+    let held = lock_order::check_acquire(HeldLocks::NONE, LockClass::Data).unwrap();
+    assert_eq!(
+        lock_order::check_acquire(held, LockClass::RunQueue),
+        Err(LockOrderError::Inversion {
+            held: LockClass::Data,
+            acquiring: LockClass::RunQueue,
+        })
+    );
+    assert_eq!(LockClass::ALL.len(), 4);
+}
+
+#[test]
 fn skipping_a_rank_is_allowed() {
     let held = lock_order::check_acquire(HeldLocks::NONE, LockClass::RunQueue).unwrap();
     assert!(lock_order::check_acquire(held, LockClass::TimerQueue).is_ok());

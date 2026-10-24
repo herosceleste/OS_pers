@@ -16,16 +16,19 @@ pub enum LockClass {
     RunQueue = 1,
     /// File temporelle des tâches endormies.
     TimerQueue = 2,
+    /// Données partagées entre tâches ; aucun verrou noyau n'est pris dessous.
+    Data = 3,
 }
 
 impl LockClass {
-    const ALL: [Self; 3] = [Self::Pmm, Self::RunQueue, Self::TimerQueue];
+    pub const ALL: [Self; 4] = [Self::Pmm, Self::RunQueue, Self::TimerQueue, Self::Data];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Pmm => "pmm",
             Self::RunQueue => "run_queue",
             Self::TimerQueue => "timer_queue",
+            Self::Data => "data",
         }
     }
 
