@@ -3274,6 +3274,10 @@ pub const STRESS_MAX_WAIT_SWITCHES: u64 = QUEUE_CAPACITY as u64;
 
 static STRESS_PROGRESS: [AtomicU64; STRESS_MAX_WAVE] =
     [const { AtomicU64::new(0) }; STRESS_MAX_WAVE];
+/// Switchs du CPU de la tâche au moment de sa mise en file : sa première
+/// exécution mesure son attente initiale, qu'aucun yield ne couvre.
+static STRESS_ENQUEUED_AT: [AtomicU64; STRESS_MAX_WAVE] =
+    [const { AtomicU64::new(0) }; STRESS_MAX_WAVE];
 static STRESS_EXITED: AtomicU64 = AtomicU64::new(0);
 static STRESS_MAX_WAIT: AtomicU64 = AtomicU64::new(0);
 static STRESS_CORRUPTIONS: AtomicU64 = AtomicU64::new(0);
@@ -3425,7 +3429,11 @@ pub fn qualify_stress(
             ids[index] = id;
             created += 1;
         }
-        for &id in &ids[..tasks_per_wave] {
+        for (index, &id) in ids.iter().enumerate().take(tasks_per_wave) {
+            STRESS_ENQUEUED_AT[index].store(
+                CPU_SWITCHES[ap(index)].load(Ordering::Acquire),
+                Ordering::Release,
+            );
             enqueue(id, true)?;
         }
 
@@ -3598,6 +3606,13 @@ extern "C" fn elyon_stress_task_entry(arg: u64) -> ! {
     let index = (arg & 0xFFFF) as usize;
     if role >= STRESS_ROLES || index >= STRESS_MAX_WAVE {
         fail(SchedError::ArgMismatch);
+    }
+    // Attente initiale : seules les tâches « block » changent de CPU, les
+    // autres démarrent sur celui de leur mise en file.
+    if role != STRESS_ROLE_BLOCK {
+        let waited = CPU_SWITCHES[this_cpu()].load(Ordering::Relaxed)
+            - STRESS_ENQUEUED_AT[index].load(Ordering::Acquire);
+        STRESS_MAX_WAIT.fetch_max(waited, Ordering::AcqRel);
     }
     for round in 0..STRESS_ROUNDS {
         match role {
