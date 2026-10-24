@@ -27,6 +27,7 @@ use crate::arch::x86_64::cpu;
 use crate::fpu::{self, FpuSetupError};
 use crate::sync::{IrqGuard, IrqSpinLock};
 use crate::task::{self, TaskError, TaskState};
+use crate::task_frames::{self, FramesError};
 use crate::task_stack::{self as stacks, TaskStackError};
 use crate::timer::{self, TimerError};
 use crate::{context, kprintln};
@@ -35,7 +36,7 @@ pub const QUALIFY_TASKS: usize = 3;
 pub const ITERATIONS: u64 = 4;
 pub const TRACE_CAPACITY: usize = QUALIFY_TASKS * ITERATIONS as usize;
 
-const QUEUE_CAPACITY: usize = 8;
+const QUEUE_CAPACITY: usize = 64;
 const ARG_BASE: u64 = 0xE1_0403_0000;
 const BSP_CPU: u32 = 0;
 const BSP_AFFINITY: u64 = 1 << BSP_CPU;
@@ -89,6 +90,9 @@ pub struct SchedQualification {
 pub enum SchedError {
     Task(TaskError),
     Stack(TaskStackError),
+    Frames(FramesError),
+    /// Une tâche à récupérer est encore dans une file ou la file temporelle.
+    ReapQueued,
     Queue(QueueError),
     Timer(TimerError),
     Fpu(FpuSetupError),
@@ -136,6 +140,8 @@ impl SchedError {
         match self {
             Self::Task(error) => error.as_str(),
             Self::Stack(error) => error.as_str(),
+            Self::Frames(error) => error.as_str(),
+            Self::ReapQueued => "a dead task is still queued or has a pending deadline",
             Self::Queue(error) => error.as_str(),
             Self::Timer(error) => error.as_str(),
             Self::Fpu(error) => error.as_str(),
@@ -186,6 +192,12 @@ impl From<TaskError> for SchedError {
     }
 }
 
+impl From<FramesError> for SchedError {
+    fn from(error: FramesError) -> Self {
+        Self::Frames(error)
+    }
+}
+
 impl From<QueueError> for SchedError {
     fn from(error: QueueError) -> Self {
         Self::Queue(error)
@@ -228,9 +240,7 @@ pub fn qualify(
     let mut regions = [StackRegion { start: 0, end: 0 }; QUALIFY_TASKS];
     for (index, region) in regions.iter_mut().enumerate() {
         let id = task::create_kernel(BSP_AFFINITY)?;
-        if fpu::enabled() {
-            task::set_fpu_area(id, fpu::new_task_area()?)?;
-        }
+        attach_fpu(id)?;
         let prepared = stacks::prepare(id, entry, ARG_BASE + index as u64, bsp, identity_limit)?;
         // SAFETY: l'emplacement appartient au slot statique de la tâche, qui n'a
         // encore jamais été exécutée ; seul le switch le relira.
@@ -459,6 +469,7 @@ fn transfer(current: u64, next: u64) -> Result<(), SchedError> {
     crate::arch::x86_64::cpu_local::current()
         .switched_from
         .store(current, Ordering::Relaxed);
+    CPU_SWITCHES[this_cpu()].fetch_add(1, Ordering::Relaxed);
     CURRENT[this_cpu()].store(next, Ordering::Release);
     // SAFETY: `new_rsp` désigne le frame initial ou celui laissé par le dernier
     // switch de ce contexte, sur sa propre pile ; aucun verrou n'est tenu.
@@ -490,6 +501,9 @@ fn finish_switch() {
         DEFERRED_MIGRATIONS.fetch_add(1, Ordering::Relaxed);
     }
 }
+
+/// Changements de contexte de chaque CPU, compteur local à son CPU (K004-11).
+static CPU_SWITCHES: [AtomicU64; MAX_SCHED_CPUS] = [const { AtomicU64::new(0) }; MAX_SCHED_CPUS];
 
 /// Migrations différées réalisées par `finish_switch`.
 static DEFERRED_MIGRATIONS: AtomicU64 = AtomicU64::new(0);
@@ -909,9 +923,7 @@ pub fn run_preemptive(
     let mut regions = [StackRegion { start: 0, end: 0 }; PREEMPT_TASKS];
     for (index, region) in regions.iter_mut().enumerate() {
         let id = task::create_kernel(BSP_AFFINITY)?;
-        if fpu::enabled() {
-            task::set_fpu_area(id, fpu::new_task_area()?)?;
-        }
+        attach_fpu(id)?;
         let prepared = stacks::prepare(id, entry, arg_base + index as u64, bsp, identity_limit)?;
         // SAFETY: l'emplacement appartient au slot statique de la tâche, qui n'a
         // encore jamais été exécutée ; seul le switch le relira.
@@ -1399,6 +1411,66 @@ pub fn qualify_percpu(
     })
 }
 
+/// Résultat d'une tentative de récupération (K004-11).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReapOutcome {
+    /// Pile et zone FPU rendues au PMM, slot libre.
+    Reaped,
+    /// La tâche occupe encore son CPU : le contexte suivant n'a pas fini de
+    /// sauvegarder le sien. À retenter.
+    NotYet,
+}
+
+/// Récupère une tâche DEAD : rend sa pile et sa zone FPU, libère son slot.
+/// Tout ce qui pourrait encore la désigner est d'abord vérifié, et chaque
+/// incohérence est une erreur fatale : file d'un CPU, échéance, ticket
+/// d'attente, pile absente ou canaris abîmés. Après une erreur, le slot reste
+/// DEAD ou REAPING sans être rendu : l'appelant arrête le système.
+pub fn reap(task_id: u64) -> Result<ReapOutcome, SchedError> {
+    irq_save(|| {
+        let id = task::lookup(task_id)?;
+        if task::snapshot(id)?.state != TaskState::Dead {
+            return Err(SchedError::Task(TaskError::InvalidTransition));
+        }
+        // Une tâche morte n'est dans aucune file et n'a plus d'échéance : la
+        // sortie a lieu RUNNING, donc sans attente armée (K004-10). Plus rien
+        // ne la remet en file ni ne l'endort : le constat reste vrai ensuite.
+        for cpu in 0..MAX_SCHED_CPUS {
+            if queue_of(cpu).contains(task_id) {
+                return Err(SchedError::ReapQueued);
+            }
+        }
+        if timers().any(|key| split_timer_key(key).0 == task_id) {
+            return Err(SchedError::ReapQueued);
+        }
+        let Some((start, end)) = task::stack_of(id)? else {
+            return Err(SchedError::Stack(TaskStackError::NotOwned));
+        };
+        if !task::begin_reap(id)? {
+            return Ok(ReapOutcome::NotYet);
+        }
+        if !stacks::canary_intact_at(StackRegion { start, end }) {
+            return Err(SchedError::Stack(TaskStackError::CanaryCorrupted));
+        }
+        task::release_stack(id)?;
+        task_frames::release(id)?;
+        task::finish_reap(id)?;
+        Ok(ReapOutcome::Reaped)
+    })
+}
+
+/// Zone FPU propre, rendable avec le slot de la tâche (K004-11).
+fn attach_fpu(id: task::TaskId) -> Result<(), SchedError> {
+    if !fpu::enabled() {
+        return Ok(());
+    }
+    let area = fpu::new_task_area_owned()?;
+    let start = area.start();
+    task_frames::keep_fpu(id, area)?;
+    task::set_fpu_area(id, start)?;
+    Ok(())
+}
+
 fn spawn_on(
     affinity: u64,
     entry: u64,
@@ -1407,9 +1479,7 @@ fn spawn_on(
     identity_limit: u64,
 ) -> Result<(u64, StackRegion), SchedError> {
     let id = task::create_kernel(affinity)?;
-    if fpu::enabled() {
-        task::set_fpu_area(id, fpu::new_task_area()?)?;
-    }
+    attach_fpu(id)?;
     let prepared = stacks::prepare(id, entry, arg, bsp, identity_limit)?;
     // SAFETY: l'emplacement appartient au slot statique de la tâche, qui n'a
     // encore jamais été exécutée ; seul le switch le relira.
@@ -2054,7 +2124,7 @@ extern "C" fn elyon_remote_task_entry(arg: u64) -> ! {
 // Ordre des verrous : file du CPU puis file temporelle (sleep) ; le tick relâche
 // la file temporelle avant de prendre une file de CPU.
 
-const TIMER_CAPACITY: usize = 16;
+const TIMER_CAPACITY: usize = 64;
 static TIMERS: IrqSpinLock<TimerQueue<TIMER_CAPACITY>> =
     IrqSpinLock::new(LockClass::TimerQueue, TimerQueue::new());
 
@@ -2196,6 +2266,12 @@ fn expire_sleepers(now: u64) {
         match claimed {
             Ok(true) => {}
             Ok(false) => {
+                STALE_EXPIRIES.fetch_add(1, Ordering::AcqRel);
+                continue;
+            }
+            // Tâche réveillée, terminée puis récupérée entre le retrait de
+            // l'échéance et cette recherche (K004-11) : l'échéance est périmée.
+            Err(TaskError::UnknownTask) => {
                 STALE_EXPIRIES.fetch_add(1, Ordering::AcqRel);
                 continue;
             }
@@ -3155,5 +3231,390 @@ extern "C" fn elyon_sync_task_entry(arg: u64) -> ! {
         _ => fail(SchedError::ArgMismatch),
     }
     SYNC_DONE.fetch_add(1, Ordering::AcqRel);
+    exit_now()
+}
+
+// --- K004-11 : stress SMP ---------------------------------------------------------
+//
+// Les AP sont dans leur idle task, le timer du BSP tourne à TIMER_HZ. Le BSP
+// lance des vagues successives de tâches réparties sur les AP, attend leur fin
+// et les récupère avant la vague suivante : les slots et les pages sont
+// réutilisés, et doivent revenir exactement à leur valeur de départ. Chaque
+// tâche fait STRESS_ROUNDS tours selon son rôle :
+// - yield : cède le CPU et mesure combien de switchs son CPU a faits avant de
+//   la reprendre (famine) ;
+// - simd : charge XMM0..15 et MXCSR propres à la tâche, cède le CPU, relit ;
+// - sleep : dort STRESS_SLEEP_MS un tour sur dix, cède le CPU sinon ;
+// - block : se bloque un tour sur cinq ; le BSP la réveille et déplace son
+//   affinité d'un AP à l'autre.
+
+const STRESS_ARG_BASE: u64 = 0xE1_0411_0000_0000;
+/// Rôle 0 : yield, le cas par défaut.
+const STRESS_ROLE_SIMD: u64 = 1;
+const STRESS_ROLE_SLEEP: u64 = 2;
+const STRESS_ROLE_BLOCK: u64 = 3;
+const STRESS_ROLES: u64 = 4;
+pub const STRESS_WAVES: usize = 9;
+pub const STRESS_TASKS_PER_AP: usize = 40;
+pub const STRESS_ROUNDS: u64 = 100;
+const STRESS_SLEEP_MS: u64 = 10;
+/// Vague la plus large (3 AP) ; une file de CPU en contient au plus 40.
+const STRESS_MAX_WAVE: usize = 3 * STRESS_TASKS_PER_AP;
+/// Durée maximale d'une vague, en ticks.
+const STRESS_WAVE_TICKS: u64 = 3_000;
+/// Tours d'attente maximaux d'une tâche qui n'a pas encore quitté son CPU.
+const STRESS_REAP_SPINS: u64 = 50_000_000;
+/// Le BSP déplace l'affinité des tâches « block » tous les N tours de sa boucle.
+const STRESS_MOVE_EVERY: u64 = 16;
+/// Attente maximale en Round-Robin : entre deux exécutions d'une tâche, chaque
+/// tâche placée devant elle dans la file passe une fois, puis la reprise ; une
+/// file contient au plus QUEUE_CAPACITY tâches. Une vague en met au plus 50 par
+/// AP : 30 tâches fixes, 10 « block » et 10 en cours de déplacement.
+pub const STRESS_MAX_WAIT_SWITCHES: u64 = QUEUE_CAPACITY as u64;
+
+static STRESS_PROGRESS: [AtomicU64; STRESS_MAX_WAVE] =
+    [const { AtomicU64::new(0) }; STRESS_MAX_WAVE];
+static STRESS_EXITED: AtomicU64 = AtomicU64::new(0);
+static STRESS_MAX_WAIT: AtomicU64 = AtomicU64::new(0);
+static STRESS_CORRUPTIONS: AtomicU64 = AtomicU64::new(0);
+static STRESS_SIMD_ROUNDS: AtomicU64 = AtomicU64::new(0);
+static STRESS_SLEEPS: AtomicU64 = AtomicU64::new(0);
+static STRESS_BLOCKS: AtomicU64 = AtomicU64::new(0);
+
+core::arch::global_asm!(
+    r#"
+.section .text.sched_stress,"ax"
+.balign 16
+
+// void elyon_stress_simd_round(const u8 *expected, u8 *observed, void (*yield)(void))
+//
+// Charge MXCSR et XMM0..15 depuis `expected`, appelle `yield`, puis recopie
+// XMM0..15 et MXCSR dans `observed`. Le code Rust du noyau est compilé sans
+// SSE : seul un état SIMD mal sauvegardé ou restauré peut les changer.
+// Tampons : xmm[16] à +0, mxcsr à +256.
+.global elyon_stress_simd_round
+elyon_stress_simd_round:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi
+    mov r12, rsi
+    mov r13, rdx
+    ldmxcsr dword ptr [rbx + 256]
+    movdqu xmm0, xmmword ptr [rbx + 0]
+    movdqu xmm1, xmmword ptr [rbx + 16]
+    movdqu xmm2, xmmword ptr [rbx + 32]
+    movdqu xmm3, xmmword ptr [rbx + 48]
+    movdqu xmm4, xmmword ptr [rbx + 64]
+    movdqu xmm5, xmmword ptr [rbx + 80]
+    movdqu xmm6, xmmword ptr [rbx + 96]
+    movdqu xmm7, xmmword ptr [rbx + 112]
+    movdqu xmm8, xmmword ptr [rbx + 128]
+    movdqu xmm9, xmmword ptr [rbx + 144]
+    movdqu xmm10, xmmword ptr [rbx + 160]
+    movdqu xmm11, xmmword ptr [rbx + 176]
+    movdqu xmm12, xmmword ptr [rbx + 192]
+    movdqu xmm13, xmmword ptr [rbx + 208]
+    movdqu xmm14, xmmword ptr [rbx + 224]
+    movdqu xmm15, xmmword ptr [rbx + 240]
+    call r13
+    movdqu xmmword ptr [r12 + 0], xmm0
+    movdqu xmmword ptr [r12 + 16], xmm1
+    movdqu xmmword ptr [r12 + 32], xmm2
+    movdqu xmmword ptr [r12 + 48], xmm3
+    movdqu xmmword ptr [r12 + 64], xmm4
+    movdqu xmmword ptr [r12 + 80], xmm5
+    movdqu xmmword ptr [r12 + 96], xmm6
+    movdqu xmmword ptr [r12 + 112], xmm7
+    movdqu xmmword ptr [r12 + 128], xmm8
+    movdqu xmmword ptr [r12 + 144], xmm9
+    movdqu xmmword ptr [r12 + 160], xmm10
+    movdqu xmmword ptr [r12 + 176], xmm11
+    movdqu xmmword ptr [r12 + 192], xmm12
+    movdqu xmmword ptr [r12 + 208], xmm13
+    movdqu xmmword ptr [r12 + 224], xmm14
+    movdqu xmmword ptr [r12 + 240], xmm15
+    stmxcsr dword ptr [r12 + 256]
+    pop r13
+    pop r12
+    pop rbx
+    ret
+"#
+);
+
+unsafe extern "C" {
+    fn elyon_stress_simd_round(expected: *const u8, observed: *mut u8, yield_fn: extern "C" fn());
+}
+
+/// Image SIMD d'un tour : 16 registres XMM puis MXCSR (le reste est du remplissage).
+const SIMD_IMAGE_QWORDS: usize = 33;
+
+extern "C" fn elyon_stress_yield() {
+    yield_now();
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct StressQualification {
+    pub report: elyon_core::stress::StressReport,
+    pub limits: elyon_core::stress::StressLimits,
+    pub waves: usize,
+    pub tasks_per_wave: usize,
+    pub simd_rounds: u64,
+    pub sleeps: u64,
+    pub blocks: u64,
+    pub wakes: u64,
+    pub moves: u64,
+}
+
+pub fn qualify_stress(
+    bsp_stack_start: u64,
+    bsp_stack_end: u64,
+    identity_limit: u64,
+    timer_initial_count: u32,
+) -> Result<Option<StressQualification>, SchedError> {
+    cpu::disable_interrupts();
+    if this_cpu() != 0 {
+        return Err(SchedError::UnknownCpu);
+    }
+    let cpus = online_mask().count_ones() as usize;
+    if cpus < 2 {
+        return Ok(None);
+    }
+    let aps = cpus - 1;
+    let tasks_per_wave = aps * STRESS_TASKS_PER_AP;
+    if tasks_per_wave > STRESS_MAX_WAVE {
+        return Err(SchedError::TraceOverflow);
+    }
+    let bsp = StackRegion {
+        start: bsp_stack_start,
+        end: bsp_stack_end,
+    };
+    let ap = |index: usize| 1 + index % aps;
+    let entry = elyon_stress_task_entry as *const () as usize as u64;
+
+    for counter in [
+        &STRESS_EXITED,
+        &STRESS_MAX_WAIT,
+        &STRESS_CORRUPTIONS,
+        &STRESS_SIMD_ROUNDS,
+        &STRESS_SLEEPS,
+        &STRESS_BLOCKS,
+    ] {
+        counter.store(0, Ordering::Release);
+    }
+    RUNNING_MAX.store(0, Ordering::Release);
+    timer::restart_periodic(timer_initial_count)?;
+
+    let free_frames_before = crate::memory::free_frame_count() as u64;
+    let free_slots_before = task::free_slot_count() as u64;
+    let switches_before: [u64; MAX_SCHED_CPUS] =
+        core::array::from_fn(|cpu| CPU_SWITCHES[cpu].load(Ordering::Acquire));
+    let mut created = 0u64;
+    let mut reaped = 0u64;
+    let mut min_progress = u64::MAX;
+    let mut wakes = 0u64;
+    let mut moves = 0u64;
+
+    for wave in 0..STRESS_WAVES {
+        let mut ids = [0u64; STRESS_MAX_WAVE];
+        for index in 0..tasks_per_wave {
+            STRESS_PROGRESS[index].store(0, Ordering::Release);
+            let role = index as u64 % STRESS_ROLES;
+            let arg = STRESS_ARG_BASE | (role << 16) | index as u64;
+            let (id, _region) = spawn_on(1 << ap(index), entry, arg, bsp, identity_limit)?;
+            ids[index] = id;
+            created += 1;
+        }
+        for &id in &ids[..tasks_per_wave] {
+            enqueue(id, true)?;
+        }
+
+        let target = ((wave + 1) * tasks_per_wave) as u64;
+        let limit = timer::ticks().saturating_add(STRESS_WAVE_TICKS);
+        let mut turn = 0u64;
+        while STRESS_EXITED.load(Ordering::Acquire) < target {
+            if timer::ticks() > limit {
+                kprintln!(
+                    "[stress] wave={} exited={} target={}",
+                    wave,
+                    STRESS_EXITED.load(Ordering::Acquire),
+                    target
+                );
+                return Err(SchedError::SleepTimeout);
+            }
+            for index in (STRESS_ROLE_BLOCK as usize..tasks_per_wave).step_by(STRESS_ROLES as usize)
+            {
+                let id = ids[index];
+                if turn.is_multiple_of(STRESS_MOVE_EVERY) {
+                    let shift = (turn / STRESS_MOVE_EVERY) as usize;
+                    if let Some(Migration::Move { .. }) = set_affinity(id, 1 << ap(index + shift))?
+                    {
+                        moves += 1;
+                    }
+                }
+                // Une tâche peut se terminer entre deux tours : son réveil est
+                // alors refusé, ce qui est attendu ici et seulement ici.
+                match wake(id) {
+                    Ok(WakeOutcome::Woken(_)) => wakes += 1,
+                    Ok(WakeOutcome::NotAsleep) | Err(SchedError::WakeDead) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            turn += 1;
+            // Laisse passer le tick : il porte la file temporelle des « sleep ».
+            cpu::enable_interrupts();
+            core::hint::spin_loop();
+            cpu::disable_interrupts();
+        }
+
+        for index in 0..tasks_per_wave {
+            min_progress = min_progress.min(STRESS_PROGRESS[index].load(Ordering::Acquire));
+            let mut spins = 0u64;
+            // Une tâche compte sa sortie juste avant `exit_now` : elle peut être
+            // encore RUNNING. `reap` refuserait une tâche vivante ; on attend,
+            // de façon bornée, qu'elle soit DEAD puis hors de son CPU.
+            let id = task::lookup(ids[index])?;
+            while task::snapshot(id)?.state != TaskState::Dead {
+                spins += 1;
+                if spins > STRESS_REAP_SPINS {
+                    return Err(SchedError::OnCpuWaitTimeout);
+                }
+                core::hint::spin_loop();
+            }
+            // `reap` vérifie les canaris et s'arrête au premier défaut.
+            while reap(ids[index])? == ReapOutcome::NotYet {
+                spins += 1;
+                if spins > STRESS_REAP_SPINS {
+                    return Err(SchedError::OnCpuWaitTimeout);
+                }
+                core::hint::spin_loop();
+            }
+            reaped += 1;
+        }
+    }
+
+    // Les AP reviennent dans leur idle task après la dernière sortie.
+    let idles: [u64; MAX_SCHED_CPUS] =
+        core::array::from_fn(|index| IDLE_IDS[index].load(Ordering::Acquire));
+    wait_until(|| (1..cpus).all(|index| CURRENT[index].load(Ordering::Acquire) == idles[index]))?;
+    let mut idle_running_aps = 0u64;
+    for (index, &idle) in idles.iter().enumerate().take(cpus).skip(1) {
+        let snapshot = task::snapshot(task::lookup(idle)?)?;
+        if snapshot.state != TaskState::Running || snapshot.current_cpu != index as u32 {
+            return Err(SchedError::IdleState);
+        }
+        idle_running_aps += 1;
+    }
+    let switches = (0..cpus)
+        .map(|cpu| CPU_SWITCHES[cpu].load(Ordering::Acquire) - switches_before[cpu])
+        .sum();
+
+    let report = elyon_core::stress::StressReport {
+        cpus: cpus as u32,
+        created,
+        exited: STRESS_EXITED.load(Ordering::Acquire),
+        reaped,
+        switches,
+        running_max: RUNNING_MAX.load(Ordering::Acquire) as u64,
+        corruptions: STRESS_CORRUPTIONS.load(Ordering::Acquire),
+        // Un canari abîmé arrête `reap`, donc la qualification, avant ce rapport.
+        canary_failures: 0,
+        free_frames_before,
+        free_frames_after: crate::memory::free_frame_count() as u64,
+        free_slots_before,
+        free_slots_after: task::free_slot_count() as u64,
+        min_progress,
+        max_wait_switches: STRESS_MAX_WAIT.load(Ordering::Acquire),
+        idle_running_aps,
+    };
+    let limits = elyon_core::stress::StressLimits {
+        cpus: cpus as u32,
+        expected_tasks: (STRESS_WAVES * tasks_per_wave) as u64,
+        min_switches: (STRESS_WAVES * tasks_per_wave) as u64 * STRESS_ROUNDS / 2,
+        min_progress: STRESS_ROUNDS,
+        max_wait_switches: STRESS_MAX_WAIT_SWITCHES,
+    };
+    Ok(Some(StressQualification {
+        report,
+        limits,
+        waves: STRESS_WAVES,
+        tasks_per_wave,
+        simd_rounds: STRESS_SIMD_ROUNDS.load(Ordering::Acquire),
+        sleeps: STRESS_SLEEPS.load(Ordering::Acquire),
+        blocks: STRESS_BLOCKS.load(Ordering::Acquire),
+        wakes,
+        moves,
+    }))
+}
+
+/// Cède le CPU et mesure, si la tâche reprend sur le même CPU, combien de
+/// switchs ce CPU a faits entre-temps. Réservé aux rôles dont l'affinité ne
+/// change pas : une tâche déplacée puis revenue compterait les switchs d'une
+/// absence plus longue qu'un tour de file.
+fn stress_yield(round: impl FnOnce()) {
+    let cpu = this_cpu();
+    let before = CPU_SWITCHES[cpu].load(Ordering::Relaxed);
+    round();
+    if this_cpu() == cpu {
+        let waited = CPU_SWITCHES[cpu].load(Ordering::Relaxed) - before;
+        STRESS_MAX_WAIT.fetch_max(waited, Ordering::AcqRel);
+    }
+}
+
+fn stress_simd_round(index: usize, round: u64) {
+    let mut expected = [0u64; SIMD_IMAGE_QWORDS];
+    for (qword, value) in expected.iter_mut().take(32).enumerate() {
+        *value = ((index as u64) << 40) | ((qword as u64) << 24) | (round << 8) | 0xA5;
+    }
+    // Masques par défaut, arrondi propre à la tâche (bits 13-14).
+    let mxcsr = 0x1F80 | ((index as u64 & 3) << 13);
+    expected[32] = mxcsr;
+    let mut observed = [0u64; SIMD_IMAGE_QWORDS];
+    stress_yield(|| {
+        // SAFETY: deux tampons de SIMD_IMAGE_QWORDS qwords sur la pile de la
+        // tâche (264 octets lus ou écrits au plus) ; `elyon_stress_yield` suit
+        // l'ABI C et ne touche pas aux registres SIMD.
+        unsafe {
+            elyon_stress_simd_round(
+                expected.as_ptr().cast(),
+                observed.as_mut_ptr().cast(),
+                elyon_stress_yield,
+            )
+        };
+    });
+    // Seuls les 32 bits bas du dernier qword portent MXCSR.
+    if observed[..32] != expected[..32] || observed[32] & 0xFFFF_FFFF != mxcsr {
+        STRESS_CORRUPTIONS.fetch_add(1, Ordering::AcqRel);
+    }
+    STRESS_SIMD_ROUNDS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn elyon_stress_task_entry(arg: u64) -> ! {
+    if arg & !0xFFFF_FFFF != STRESS_ARG_BASE {
+        fail(SchedError::ArgMismatch);
+    }
+    let role = (arg >> 16) & 0xFFFF;
+    let index = (arg & 0xFFFF) as usize;
+    if role >= STRESS_ROLES || index >= STRESS_MAX_WAVE {
+        fail(SchedError::ArgMismatch);
+    }
+    for round in 0..STRESS_ROUNDS {
+        match role {
+            STRESS_ROLE_SIMD if fpu::enabled() => stress_simd_round(index, round),
+            STRESS_ROLE_SLEEP if round % 10 == 9 => {
+                sleep_ms(STRESS_SLEEP_MS);
+                STRESS_SLEEPS.fetch_add(1, Ordering::Relaxed);
+            }
+            STRESS_ROLE_BLOCK if round % 5 == 4 => {
+                block_now();
+                STRESS_BLOCKS.fetch_add(1, Ordering::Relaxed);
+            }
+            STRESS_ROLE_BLOCK => yield_now(),
+            _ => stress_yield(yield_now),
+        }
+        STRESS_PROGRESS[index].store(round + 1, Ordering::Release);
+    }
+    STRESS_EXITED.fetch_add(1, Ordering::AcqRel);
     exit_now()
 }

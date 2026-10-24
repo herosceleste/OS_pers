@@ -14,6 +14,7 @@ mod sched;
 mod serial;
 mod sync;
 mod task;
+mod task_frames;
 mod task_stack;
 mod timer;
 
@@ -362,7 +363,7 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
             Ok(summary) => summary,
             Err(error) => {
                 kprintln!("[smp] FAILED reason={}", error.as_str());
-                cpu::halt_forever();
+                fatal::halt_system();
             }
         };
 
@@ -374,7 +375,7 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
                 smp_summary.prepared_count,
                 percpu_summary.cpu_count
             );
-            cpu::halt_forever();
+            fatal::halt_system();
         }
 
         kprintln!(
@@ -393,7 +394,7 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
             Ok(summary) => summary,
             Err(error) => {
                 kprintln!("[smp] STABILITY FAILED reason={}", error.as_str());
-                cpu::halt_forever();
+                fatal::halt_system();
             }
         };
 
@@ -420,7 +421,7 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         Ok(summary) => summary,
         Err(error) => {
             kprintln!("[context] FAILED reason={}", error.as_str());
-            cpu::halt_forever();
+            fatal::halt_system();
         }
     };
 
@@ -450,7 +451,7 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         Ok(summary) => summary,
         Err(error) => {
             kprintln!("[task] FAILED reason={}", error.as_str());
-            cpu::halt_forever();
+            fatal::halt_system();
         }
     };
 
@@ -460,7 +461,7 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
             task_model.states_seen_mask,
             task::required_states_mask()
         );
-        cpu::halt_forever();
+        fatal::halt_system();
     }
 
     kprintln!(
@@ -485,7 +486,7 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         Ok(summary) => summary,
         Err(error) => {
             kprintln!("[task-stack] FAILED reason={}", error.as_str());
-            cpu::halt_forever();
+            fatal::halt_system();
         }
     };
 
@@ -517,7 +518,7 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         Ok(setup) => setup,
         Err(error) => {
             kprintln!("[fpu] FAILED reason={}", error.as_str());
-            cpu::halt_forever();
+            fatal::halt_system();
         }
     };
     kprintln!(
@@ -548,7 +549,7 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         Ok(summary) => summary,
         Err(error) => {
             kprintln!("[sched] FAILED reason={}", error.as_str());
-            cpu::halt_forever();
+            fatal::halt_system();
         }
     };
 
@@ -587,7 +588,7 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
 
     if let Err(error) = ioapic::route_legacy(&mut ioapic, &topology, lapic.apic_id) {
         kprintln!("[ioapic] FAILED reason={}", error.as_str());
-        cpu::halt_forever();
+        fatal::halt_system();
     }
 
     kprintln!(
@@ -653,7 +654,7 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         Ok(calibration) => calibration,
         Err(error) => {
             kprintln!("[timer] FAILED reason={}", error.as_str());
-            cpu::halt_forever();
+            fatal::halt_system();
         }
     };
 
@@ -691,13 +692,13 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
                 error.as_str(),
                 timer::ticks()
             );
-            cpu::halt_forever();
+            fatal::halt_system();
         }
     };
 
     if let Err(error) = timer::stop() {
         kprintln!("[timer] FAILED reason={}", error.as_str());
-        cpu::halt_forever();
+        fatal::halt_system();
     }
 
     let bsp_percpu_ticks = percpu::bsp_ticks();
@@ -707,7 +708,7 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
             bsp_percpu_ticks,
             timer_ticks
         );
-        cpu::halt_forever();
+        fatal::halt_system();
     }
 
     kprintln!(
@@ -731,7 +732,7 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         Ok(summary) => summary,
         Err(error) => {
             kprintln!("[preempt] FAILED reason={}", error.as_str());
-            cpu::halt_forever();
+            fatal::halt_system();
         }
     };
 
@@ -775,7 +776,7 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         Ok(summary) => summary,
         Err(error) => {
             kprintln!("[context-integrity] FAILED reason={}", error.as_str());
-            cpu::halt_forever();
+            fatal::halt_system();
         }
     };
 
@@ -809,7 +810,7 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         Ok(summary) => summary,
         Err(error) => {
             kprintln!("[fpu-integrity] FAILED reason={}", error.as_str());
-            cpu::halt_forever();
+            fatal::halt_system();
         }
     };
 
@@ -844,7 +845,7 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         Ok(summary) => summary,
         Err(error) => {
             kprintln!("[percpu-sched] FAILED reason={}", error.as_str());
-            cpu::halt_forever();
+            fatal::halt_system();
         }
     };
 
@@ -923,7 +924,7 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         Ok(None) => kprintln!("[sched-ipi] skipped single_cpu=1"),
         Err(error) => {
             kprintln!("[sched-ipi] FAILED reason={}", error.as_str());
-            cpu::halt_forever();
+            fatal::halt_system();
         }
     }
 
@@ -988,7 +989,7 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
                 error.as_str(),
                 timer::ticks()
             );
-            cpu::halt_forever();
+            fatal::halt_system();
         }
     }
 
@@ -1075,7 +1076,68 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
                 error.as_str(),
                 timer::ticks()
             );
-            cpu::halt_forever();
+            fatal::halt_system();
+        }
+    }
+
+    match sched::qualify_stress(
+        info.kernel_stack_start,
+        info.kernel_stack_end,
+        paging::identity_limit(),
+        timer_calibration.initial_count,
+    ) {
+        Ok(Some(stress)) => {
+            let report = stress.report;
+            kprintln!(
+                "[stress] cpus={} waves={} tasks_per_wave={} rounds={} created={} exited={} reaped={} switches={}",
+                report.cpus,
+                stress.waves,
+                stress.tasks_per_wave,
+                sched::STRESS_ROUNDS,
+                report.created,
+                report.exited,
+                report.reaped,
+                report.switches
+            );
+            kprintln!(
+                "[stress] roles simd_rounds={} sleeps={} blocks={} wakes={} moves={} corruptions={} canary_failures={} running_max={}",
+                stress.simd_rounds,
+                stress.sleeps,
+                stress.blocks,
+                stress.wakes,
+                stress.moves,
+                report.corruptions,
+                report.canary_failures,
+                report.running_max
+            );
+            kprintln!(
+                "[stress] fairness min_progress={} max_wait_switches={} limit={} idle_running_aps={}",
+                report.min_progress,
+                report.max_wait_switches,
+                stress.limits.max_wait_switches,
+                report.idle_running_aps
+            );
+            kprintln!(
+                "[stress] reclaim frames_before={} frames_after={} slots_before={} slots_after={}",
+                report.free_frames_before,
+                report.free_frames_after,
+                report.free_slots_before,
+                report.free_slots_after
+            );
+            if let Err(error) = elyon_core::stress::check_stress(&report, &stress.limits) {
+                kprintln!("[stress] FAILED reason={}", error.as_str());
+                fatal::halt_system();
+            }
+            kprintln!("ELYON_SCHED_STRESS_READY");
+        }
+        Ok(None) => kprintln!("[stress] skipped single_cpu=1"),
+        Err(error) => {
+            kprintln!(
+                "[stress] FAILED reason={} ticks={}",
+                error.as_str(),
+                timer::ticks()
+            );
+            fatal::halt_system();
         }
     }
 
@@ -1133,5 +1195,6 @@ fn validate_boot_info(info: &BootInfo) {
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {
     kprintln!("[KERNEL PANIC] {}", info);
-    cpu::halt_forever()
+    // Une panique peut survenir verrou tenu : les autres CPU sont arrêtés aussi.
+    fatal::halt_system()
 }

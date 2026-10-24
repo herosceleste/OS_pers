@@ -13,7 +13,8 @@ pub struct StressReport {
     pub exited: u64,
     pub reaped: u64,
     pub switches: u64,
-    /// Plus grand nombre de CPU ayant exécuté la même tâche au même moment.
+    /// Plus grand nombre de tâches RUNNING vues sur un même CPU à un switch ;
+    /// la garde contre une tâche sur deux CPU est la réclamation de `on_cpu`.
     pub running_max: u64,
     /// Registres ou état FPU retrouvés altérés après une préemption.
     pub corruptions: u64,
@@ -24,8 +25,10 @@ pub struct StressReport {
     pub free_slots_after: u64,
     /// Plus petite progression d'une tâche, en tours achevés.
     pub min_progress: u64,
-    /// Plus longue attente d'une tâche prête entre deux exécutions, en ticks.
-    pub max_wait_ticks: u64,
+    /// Plus longue attente d'une tâche prête entre deux exécutions : nombre de
+    /// changements de contexte de son CPU entre les deux. En Round-Robin, il est
+    /// borné par la longueur de la file ; une tâche affamée en voit bien plus.
+    pub max_wait_switches: u64,
     pub idle_running_aps: u64,
 }
 
@@ -36,7 +39,7 @@ pub struct StressLimits {
     pub expected_tasks: u64,
     pub min_switches: u64,
     pub min_progress: u64,
-    pub max_wait_ticks: u64,
+    pub max_wait_switches: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,7 +111,9 @@ pub fn check_stress(report: &StressReport, limits: &StressLimits) -> Result<(), 
     if report.free_slots_after != report.free_slots_before {
         return Err(StressError::SlotLeak);
     }
-    if report.min_progress < limits.min_progress || report.max_wait_ticks > limits.max_wait_ticks {
+    if report.min_progress < limits.min_progress
+        || report.max_wait_switches > limits.max_wait_switches
+    {
         return Err(StressError::Starvation);
     }
     if report.idle_running_aps != u64::from(limits.cpus.saturating_sub(1)) {

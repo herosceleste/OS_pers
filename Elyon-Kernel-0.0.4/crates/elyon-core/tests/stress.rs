@@ -10,7 +10,7 @@ fn limits() -> StressLimits {
         expected_tasks: 1024,
         min_switches: 100_000,
         min_progress: 50,
-        max_wait_ticks: 64,
+        max_wait_switches: 64,
     }
 }
 
@@ -29,7 +29,7 @@ fn healthy() -> StressReport {
         free_slots_before: 190,
         free_slots_after: 190,
         min_progress: 60,
-        max_wait_ticks: 40,
+        max_wait_switches: 40,
         idle_running_aps: 3,
     }
 }
@@ -186,7 +186,7 @@ fn a_starved_task_is_refused_by_progress() {
 #[test]
 fn a_starved_task_is_refused_by_wait() {
     let report = StressReport {
-        max_wait_ticks: 65,
+        max_wait_switches: 65,
         ..healthy()
     };
     assert_eq!(
