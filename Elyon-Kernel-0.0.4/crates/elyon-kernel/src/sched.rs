@@ -121,6 +121,8 @@ pub enum SchedError {
     WakeDead,
     WakeRetriesExhausted,
     IpiFailed,
+    AffinityUnstable,
+    SelfOnCpuWait,
     EoiFailed,
     Timers(TimerQueueError),
     SleepTimeout,
@@ -167,6 +169,8 @@ impl SchedError {
             Self::WakeDead => "wake of a terminated task",
             Self::WakeRetriesExhausted => "task never blocked while waiting to wake it",
             Self::IpiFailed => "resched IPI could not be sent",
+            Self::AffinityUnstable => "task affinity kept changing while placing it",
+            Self::SelfOnCpuWait => "a CPU waited for the task it is running to leave it",
             Self::EoiFailed => "EOI of the resched IPI failed",
         }
     }
@@ -232,8 +236,11 @@ pub fn qualify(
         queue().push_back(id.raw())?;
     }
 
-    let first = run_queue::exit_next(&mut queue()).ok_or(SchedError::EmptyQueue)?;
-    task::start(task::lookup(first)?, BSP_CPU)?;
+    let mut misplaced = Misplaced::new();
+    let first =
+        pop_allowed(&mut queue(), this_cpu(), &mut misplaced)?.ok_or(SchedError::EmptyQueue)?;
+    misplaced.requeue()?;
+    task::dispatch(task::lookup(first)?, BSP_CPU)?;
     BSP_SWITCHES.fetch_add(1, Ordering::AcqRel);
     transfer(BSP_CONTEXT, first)?;
 
@@ -353,10 +360,9 @@ fn try_yield() -> Result<(), SchedError> {
         return Err(SchedError::NotInTaskContext);
     }
 
-    task::yield_ready(task::lookup(current)?)?;
-    let next = run_queue::yield_next(&mut queue(), current)?;
+    let next = yield_pick(current)?;
     YIELDS.fetch_add(1, Ordering::AcqRel);
-    task::start(task::lookup(next)?, this_cpu() as u32)?;
+    task::dispatch(task::lookup(next)?, this_cpu() as u32)?;
 
     if next != current {
         TASK_SWITCHES.fetch_add(1, Ordering::AcqRel);
@@ -376,10 +382,12 @@ fn try_exit() -> Result<(), SchedError> {
 
     // Le garde de file doit être relâché avant le switch : pas de temporaire
     // dans le scrutin du `match`, qui vivrait jusqu'à la fin du bloc.
-    let next = run_queue::exit_next(&mut queue());
+    let mut misplaced = Misplaced::new();
+    let next = pop_allowed(&mut queue(), this_cpu(), &mut misplaced)?;
+    misplaced.requeue()?;
     match next {
         Some(next) => {
-            task::start(task::lookup(next)?, this_cpu() as u32)?;
+            task::dispatch(task::lookup(next)?, this_cpu() as u32)?;
             TASK_SWITCHES.fetch_add(1, Ordering::AcqRel);
             transfer(current, next)
         }
@@ -388,7 +396,7 @@ fn try_exit() -> Result<(), SchedError> {
             // quand sa file se vide ; sinon il revient à son contexte de départ.
             let idle = IDLE_IDS[this_cpu()].load(Ordering::Acquire);
             if idle != 0 {
-                task::start(task::lookup(idle)?, this_cpu() as u32)?;
+                task::dispatch(task::lookup(idle)?, this_cpu() as u32)?;
                 TASK_SWITCHES.fetch_add(1, Ordering::AcqRel);
                 transfer(current, idle)
             } else {
@@ -470,6 +478,133 @@ fn finish_switch() {
             fail(SchedError::Task(error));
         }
     }
+    let pending = local.pending_migration.swap(0, Ordering::Relaxed);
+    if pending != 0 {
+        if pending != previous {
+            fail(SchedError::Trace);
+        }
+        if let Err(error) = push_by_affinity(pending, true) {
+            fail(error);
+        }
+        DEFERRED_MIGRATIONS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Migrations différées réalisées par `finish_switch`.
+static DEFERRED_MIGRATIONS: AtomicU64 = AtomicU64::new(0);
+const PLACE_RETRIES: usize = 8;
+
+fn allowed(mask: u64, cpu: usize) -> bool {
+    cpu < 64 && mask & (1 << cpu) != 0
+}
+
+/// Met en file une tâche READY sur un CPU de son affinité. Le masque est relu
+/// sous le verrou de la file cible : avec `set_affinity`, qui écrit le masque
+/// puis corrige les files sous ces mêmes verrous, une tâche n'est jamais laissée
+/// dans la file d'un CPU exclu.
+fn push_by_affinity(task_id: u64, notify: bool) -> Result<usize, SchedError> {
+    let id = task::lookup(task_id)?;
+    for _ in 0..PLACE_RETRIES {
+        let cpu = percpu_sched::place(task::snapshot(id)?.affinity_mask, online_mask())
+            .map_err(SchedError::Placement)?;
+        {
+            let mut queue = queue_of(cpu);
+            if !allowed(task::snapshot(id)?.affinity_mask, cpu) {
+                continue;
+            }
+            queue.push_back(task_id)?;
+        }
+        if notify {
+            send_resched(cpu)?;
+        }
+        return Ok(cpu);
+    }
+    Err(SchedError::AffinityUnstable)
+}
+
+/// Tâches retirées d'une file parce que leur masque exclut désormais ce CPU
+/// (fenêtre entre l'écriture du masque et la correction des files par
+/// `set_affinity`).
+struct Misplaced {
+    tasks: [u64; QUEUE_CAPACITY],
+    len: usize,
+}
+
+impl Misplaced {
+    const fn new() -> Self {
+        Self {
+            tasks: [0; QUEUE_CAPACITY],
+            len: 0,
+        }
+    }
+
+    /// Replace chaque tâche sur un CPU autorisé ; à appeler verrou relâché.
+    fn requeue(&self) -> Result<(), SchedError> {
+        for &task_id in &self.tasks[..self.len] {
+            wait_off_cpu(task_id)?;
+            push_by_affinity(task_id, true)?;
+            MISPLACED_REQUEUES.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+}
+
+static MISPLACED_REQUEUES: AtomicU64 = AtomicU64::new(0);
+
+/// Prochaine tâche de `queue` autorisée sur `cpu` ; les autres sont mises de
+/// côté dans `misplaced`. Ainsi `task::start` ne voit jamais un CPU exclu.
+fn pop_allowed(
+    queue: &mut RunQueue<QUEUE_CAPACITY>,
+    cpu: usize,
+    misplaced: &mut Misplaced,
+) -> Result<Option<u64>, SchedError> {
+    while let Some(task_id) = queue.pop_front() {
+        if allowed(task::snapshot(task::lookup(task_id)?)?.affinity_mask, cpu) {
+            return Ok(Some(task_id));
+        }
+        misplaced.tasks[misplaced.len] = task_id;
+        misplaced.len += 1;
+    }
+    Ok(None)
+}
+
+/// `current` cède le CPU : READY, puis remise en fin de file si ce CPU reste
+/// dans son affinité, lue sous le verrou de la file. Sinon elle n'est remise
+/// dans aucune file : `finish_switch` la migrera une fois son contexte
+/// sauvegardé, car un autre CPU ne doit pas la prendre avant.
+fn yield_pick(current: u64) -> Result<u64, SchedError> {
+    let cpu = this_cpu();
+    let id = task::lookup(current)?;
+    let mut misplaced = Misplaced::new();
+    let (next, stays) = {
+        let mut queue = queue();
+        task::yield_ready(id)?;
+        let stays = allowed(task::snapshot(id)?.affinity_mask, cpu);
+        // La suivante est choisie avant de remettre `current` en file : son
+        // masque peut changer à tout instant, et ce CPU ne doit jamais la classer
+        // « mal placée » alors qu'il l'exécute encore (il attendrait son propre
+        // `on_cpu`).
+        let next = pop_allowed(&mut queue, cpu, &mut misplaced)?;
+        if stays && next.is_some() {
+            queue.push_back(current)?;
+        }
+        (next, stays)
+    };
+    misplaced.requeue()?;
+    if stays {
+        // Aucune autre tâche autorisée : `current` reprend sans switch.
+        return Ok(next.unwrap_or(current));
+    }
+    crate::arch::x86_64::cpu_local::current()
+        .pending_migration
+        .store(current, Ordering::Relaxed);
+    match next {
+        Some(next) => Ok(next),
+        None => match IDLE_IDS[cpu].load(Ordering::Acquire) {
+            0 => Err(SchedError::IdleState),
+            idle => Ok(idle),
+        },
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -482,6 +617,10 @@ static ON_CPU_WAITS: AtomicU64 = AtomicU64::new(0);
 
 /// Attend que `task_id` ait quitté tout CPU avant de la remettre en file.
 fn wait_off_cpu(task_id: u64) -> Result<(), SchedError> {
+    // Attendre la tâche que ce CPU exécute ne finirait jamais.
+    if CURRENT[this_cpu()].load(Ordering::Acquire) == task_id {
+        return Err(SchedError::SelfOnCpuWait);
+    }
     let id = task::lookup(task_id)?;
     if task::is_on_cpu(id)? {
         ON_CPU_WAITS.fetch_add(1, Ordering::Relaxed);
@@ -696,9 +835,8 @@ fn preempt_current(current: u64) -> Result<(), SchedError> {
     {
         BUSY_PREEMPTIONS[index].fetch_add(1, Ordering::AcqRel);
     }
-    task::yield_ready(task::lookup(current)?)?;
-    let next = run_queue::yield_next(&mut queue(), current)?;
-    task::start(task::lookup(next)?, this_cpu() as u32)?;
+    let next = yield_pick(current)?;
+    task::dispatch(task::lookup(next)?, this_cpu() as u32)?;
     clock().reset();
     if next == current {
         return Ok(());
@@ -769,8 +907,11 @@ pub fn run_preemptive(
         queue().push_back(id.raw())?;
     }
 
-    let first = run_queue::exit_next(&mut queue()).ok_or(SchedError::EmptyQueue)?;
-    task::start(task::lookup(first)?, BSP_CPU)?;
+    let mut misplaced = Misplaced::new();
+    let first =
+        pop_allowed(&mut queue(), this_cpu(), &mut misplaced)?.ok_or(SchedError::EmptyQueue)?;
+    misplaced.requeue()?;
+    task::dispatch(task::lookup(first)?, BSP_CPU)?;
     record_slice(first)?;
     clock().reset();
     PREEMPT_ACTIVE.store(true, Ordering::Release);
@@ -1046,8 +1187,11 @@ pub fn ap_enter(cpu: usize) -> ! {
 }
 
 fn run_own_queue(cpu: usize) -> Result<(), SchedError> {
-    let first = run_queue::exit_next(&mut queue_of(cpu)).ok_or(SchedError::EmptyQueue)?;
-    task::start(task::lookup(first)?, cpu as u32)?;
+    let mut misplaced = Misplaced::new();
+    let first =
+        pop_allowed(&mut queue_of(cpu), cpu, &mut misplaced)?.ok_or(SchedError::EmptyQueue)?;
+    misplaced.requeue()?;
+    task::dispatch(task::lookup(first)?, cpu as u32)?;
     BSP_SWITCHES.fetch_add(1, Ordering::AcqRel);
     transfer(BSP_CONTEXT, first)
 }
@@ -1354,12 +1498,14 @@ fn leave_idle_if_work() -> Result<(), SchedError> {
     if idle == 0 || current != idle {
         return Ok(());
     }
-    let next = run_queue::exit_next(&mut queue());
+    let mut misplaced = Misplaced::new();
+    let next = pop_allowed(&mut queue(), this_cpu(), &mut misplaced)?;
+    misplaced.requeue()?;
     let Some(next) = next else {
         return Ok(());
     };
     task::yield_ready(task::lookup(idle)?)?;
-    task::start(task::lookup(next)?, cpu as u32)?;
+    task::dispatch(task::lookup(next)?, cpu as u32)?;
     TASK_SWITCHES.fetch_add(1, Ordering::AcqRel);
     transfer(idle, next)
 }
@@ -1404,13 +1550,7 @@ pub fn enqueue(task_id: u64, notify: bool) -> Result<usize, SchedError> {
         if snapshot.state != TaskState::Ready {
             return Err(SchedError::Task(TaskError::InvalidTransition));
         }
-        let cpu = percpu_sched::place(snapshot.affinity_mask, online_mask())
-            .map_err(SchedError::Placement)?;
-        queue_of(cpu).push_back(task_id)?;
-        if notify {
-            send_resched(cpu)?;
-        }
-        Ok(cpu)
+        push_by_affinity(task_id, notify)
     })
 }
 
@@ -1455,61 +1595,71 @@ fn wake_task(task_id: u64) -> Result<WakeOutcome, SchedError> {
         _ => return Ok(WakeOutcome::NotAsleep),
     }
     wait_off_cpu(task_id)?;
-    let cpu = percpu_sched::place(snapshot.affinity_mask, online_mask())
-        .map_err(SchedError::Placement)?;
-    {
-        let mut queue = queue_of(cpu);
-        if queue.len() == RunQueue::<QUEUE_CAPACITY>::capacity() {
-            return Err(SchedError::Queue(QueueError::Full));
+    for _ in 0..PLACE_RETRIES {
+        let cpu = percpu_sched::place(task::snapshot(id)?.affinity_mask, online_mask())
+            .map_err(SchedError::Placement)?;
+        {
+            let mut queue = queue_of(cpu);
+            if !allowed(task::snapshot(id)?.affinity_mask, cpu) {
+                continue;
+            }
+            if queue.len() == RunQueue::<QUEUE_CAPACITY>::capacity() {
+                return Err(SchedError::Queue(QueueError::Full));
+            }
+            match task::wake(id) {
+                Ok(()) => {}
+                Err(TaskError::InvalidTransition) => return Ok(WakeOutcome::NotAsleep),
+                Err(error) => return Err(SchedError::Task(error)),
+            }
+            // Place vérifiée, et une tâche endormie n'est dans aucune file.
+            queue.push_back(task_id)?;
         }
-        match task::wake(id) {
-            Ok(()) => {}
-            Err(TaskError::InvalidTransition) => return Ok(WakeOutcome::NotAsleep),
-            Err(error) => return Err(SchedError::Task(error)),
-        }
-        // Place vérifiée, et une tâche endormie n'est dans aucune file.
-        queue.push_back(task_id)?;
+        send_resched(cpu)?;
+        return Ok(WakeOutcome::Woken(cpu));
     }
-    send_resched(cpu)?;
-    Ok(WakeOutcome::Woken(cpu))
+    Err(SchedError::AffinityUnstable)
 }
 
-/// Change l'affinité d'une tâche READY en file et la migre si son CPU actuel
-/// sort du nouveau masque. Retourne la décision prise.
-pub fn set_affinity(task_id: u64, affinity: u64) -> Result<Migration, SchedError> {
+/// Change l'affinité d'une tâche. Le masque est écrit d'abord, puis chaque file
+/// est examinée sous son verrou : une tâche en file sur un CPU désormais exclu
+/// est déplacée (`Some(Move)`), une file encore autorisée la garde
+/// (`Some(Stay)`). `None` : la tâche n'est dans aucune file (RUNNING, BLOCKED ou
+/// SLEEPING) ; le masque s'applique à son prochain placement, ou à son prochain
+/// `yield` par migration différée.
+pub fn set_affinity(task_id: u64, affinity: u64) -> Result<Option<Migration>, SchedError> {
     irq_save(|| {
-        let mask = online_mask();
-        let current = (0..MAX_SCHED_CPUS).find(|&cpu| queue_of(cpu).contains(task_id));
-        let decision =
-            percpu_sched::migrate(current, affinity, mask).map_err(SchedError::Placement)?;
+        percpu_sched::migrate(None, affinity, online_mask()).map_err(SchedError::Placement)?;
         task::set_affinity(task::lookup(task_id)?, affinity)?;
-        match decision {
-            Migration::Stay(_) => {}
-            Migration::Move { from, to } => {
-                // Jamais deux verrous de file à la fois : retrait puis ajout. Si
-                // `from` l'a déjà prise entre-temps, elle tourne là-bas et suivra
-                // son nouveau masque au prochain réveil.
-                if !queue_of(from).remove(task_id) {
-                    return Ok(Migration::Stay(from));
+        for cpu in 0..MAX_SCHED_CPUS {
+            let (found, removed) = {
+                let mut queue = queue_of(cpu);
+                if !queue.contains(task_id) {
+                    (false, false)
+                } else if allowed(affinity, cpu) {
+                    (true, false)
+                } else {
+                    (true, queue.remove(task_id))
                 }
-                // Une tâche qui vient de céder son CPU peut être encore en train
-                // d'y sauvegarder son contexte.
-                wait_off_cpu(task_id)?;
-                queue_of(to).push_back(task_id)?;
-                send_resched(to)?;
+            };
+            if !found {
+                continue;
             }
-            // Dans aucune file : RUNNING, BLOCKED ou SLEEPING. Le nouveau masque
-            // s'applique à son prochain placement ; la mettre en file ici la
-            // ferait tourner deux fois.
-            Migration::Place(_) => {}
+            if !removed {
+                return Ok(Some(Migration::Stay(cpu)));
+            }
+            // Une tâche qui vient de céder ce CPU peut être encore en train d'y
+            // sauvegarder son contexte.
+            wait_off_cpu(task_id)?;
+            let to = push_by_affinity(task_id, true)?;
+            return Ok(Some(Migration::Move { from: cpu, to }));
         }
-        Ok(decision)
+        Ok(None)
     })
 }
 
 /// Bloque la tâche courante. Le passage à BLOCKED et le choix de la suivante se
-/// font sous le verrou de la file du CPU : un réveil concurrent, qui doit
-/// prendre ce verrou pour remettre la tâche en file, ne peut pas s'intercaler.
+/// font sous le verrou de la file du CPU ; un réveil concurrent attend `on_cpu`,
+/// la tâche ne reprend donc nulle part avant la sauvegarde de son contexte.
 pub fn block_now() {
     cpu::disable_interrupts();
     if let Err(error) = try_block() {
@@ -1525,11 +1675,13 @@ fn try_block() -> Result<(), SchedError> {
     if current == BSP_CONTEXT {
         return Err(SchedError::NotInTaskContext);
     }
+    let mut misplaced = Misplaced::new();
     let next = {
         let mut guard = queue();
         task::block(task::lookup(current)?)?;
-        run_queue::exit_next(&mut guard)
+        pop_allowed(&mut guard, cpu, &mut misplaced)?
     };
+    misplaced.requeue()?;
     BLOCKS.fetch_add(1, Ordering::AcqRel);
     switch_away(cpu, current, next)
 }
@@ -1539,7 +1691,7 @@ fn try_block() -> Result<(), SchedError> {
 fn switch_away(cpu: usize, current: u64, next: Option<u64>) -> Result<(), SchedError> {
     match next {
         Some(next) => {
-            task::start(task::lookup(next)?, cpu as u32)?;
+            task::dispatch(task::lookup(next)?, cpu as u32)?;
             TASK_SWITCHES.fetch_add(1, Ordering::AcqRel);
             transfer(current, next)
         }
@@ -1548,7 +1700,7 @@ fn switch_away(cpu: usize, current: u64, next: Option<u64>) -> Result<(), SchedE
             if idle == 0 {
                 return Err(SchedError::IdleState);
             }
-            task::start(task::lookup(idle)?, cpu as u32)?;
+            task::dispatch(task::lookup(idle)?, cpu as u32)?;
             IDLE_ENTRIES[cpu].fetch_add(1, Ordering::AcqRel);
             TASK_SWITCHES.fetch_add(1, Ordering::AcqRel);
             transfer(current, idle)
@@ -1650,7 +1802,7 @@ pub fn qualify_remote(
         return Err(SchedError::WrongCpu);
     }
     match set_affinity(migrated.0, 1 << migrate_to)? {
-        Migration::Move { from, to } if from == migrate_from && to == migrate_to => {}
+        Some(Migration::Move { from, to }) if from == migrate_from && to == migrate_to => {}
         _ => return Err(SchedError::WrongCpu),
     }
 
@@ -1935,8 +2087,9 @@ fn try_sleep(start: u64, deadline: u64) -> Result<(), SchedError> {
         return Err(SchedError::NotInTaskContext);
     }
     // Passage à SLEEPING, inscription de l'échéance et choix de la suivante sous
-    // le verrou de la file : le tick, qui doit le prendre pour remettre la tâche
-    // en file, ne peut pas la réveiller avant qu'elle ait quitté le CPU.
+    // le verrou de la file. Un réveil concurrent attend `on_cpu` : la tâche ne
+    // reprend nulle part avant que ce CPU ait sauvegardé son contexte.
+    let mut misplaced = Misplaced::new();
     let next = {
         let mut guard = queue();
         task::sleep(task::lookup(current)?)?;
@@ -1944,8 +2097,9 @@ fn try_sleep(start: u64, deadline: u64) -> Result<(), SchedError> {
         timers()
             .insert(current, deadline)
             .map_err(SchedError::Timers)?;
-        run_queue::exit_next(&mut guard)
+        pop_allowed(&mut guard, cpu, &mut misplaced)?
     };
+    misplaced.requeue()?;
     SLEEPS.fetch_add(1, Ordering::AcqRel);
     switch_away(cpu, current, next)
 }
@@ -2376,12 +2530,15 @@ const SYNC_ROLE_PING: u64 = 3;
 const SYNC_ROLE_PONG: u64 = 4;
 const SYNC_ROLE_TARGET: u64 = 5;
 const SYNC_ROLE_WAKER: u64 = 6;
+const SYNC_ROLE_STORM: u64 = 7;
+const STORM_TASKS_PER_AP: usize = 2;
+pub const STORM_ROUNDS: u64 = 300;
 const COUNTER_TASKS_PER_AP: usize = 2;
 pub const COUNTER_ROUNDS: u64 = 20_000;
 pub const PMM_ROUNDS: u64 = 64;
 pub const PING_ROUNDS: u64 = 50;
-/// 3 tâches par AP (jusqu'à 7 AP), plus le ping-pong et la course au réveil.
-const SYNC_MAX_TASKS: usize = 32;
+/// 5 tâches par AP (jusqu'à 7 AP), plus le ping-pong et la course au réveil.
+const SYNC_MAX_TASKS: usize = 48;
 /// Attente maximale d'une phase : 10 s à 100 Hz.
 const SYNC_PHASE_TICKS: u64 = 1_000;
 
@@ -2403,6 +2560,9 @@ static WAKERS_READY: AtomicU64 = AtomicU64::new(0);
 static WAKE_WINS: AtomicU64 = AtomicU64::new(0);
 static WAKE_LOSSES: AtomicU64 = AtomicU64::new(0);
 static TARGET_RUNS: AtomicU64 = AtomicU64::new(0);
+static STORM_MIGRATIONS: AtomicU64 = AtomicU64::new(0);
+static STORM_MOVES: AtomicU64 = AtomicU64::new(0);
+static STORM_WAKES: AtomicU64 = AtomicU64::new(0);
 
 pub struct SyncQualification {
     pub cpus: usize,
@@ -2422,6 +2582,13 @@ pub struct SyncQualification {
     pub wake_wins: u64,
     pub wake_losses: u64,
     pub target_runs: u64,
+    pub storm_tasks: u64,
+    pub storm_migrations: u64,
+    pub storm_moves: u64,
+    pub storm_wakes: u64,
+    pub on_cpu_waits: u64,
+    pub deferred_migrations: u64,
+    pub misplaced_requeues: u64,
     pub acquisitions: [u64; 4],
     pub contention: [u64; 4],
     pub switch_checks: u64,
@@ -2468,6 +2635,9 @@ pub fn qualify_sync(
         &WAKE_WINS,
         &WAKE_LOSSES,
         &TARGET_RUNS,
+        &STORM_MIGRATIONS,
+        &STORM_MOVES,
+        &STORM_WAKES,
         &RESCHED_SENT,
         &RESCHED_RECEIVED,
     ] {
@@ -2558,6 +2728,53 @@ pub fn qualify_sync(
         SYNC_DONE.load(Ordering::Acquire) == phase_one_tasks + 5
     })?;
 
+    // e. Tempête de migrations : les tâches cèdent leur CPU ou se bloquent en
+    // alternance, pendant que le BSP fait tourner leur affinité d'un AP à
+    // l'autre et les réveille. Une tâche déplacée ou réveillée vers un autre AP
+    // peut être encore en train de sauvegarder son contexte sur l'ancien : la
+    // remise en file attend alors `on_cpu` (ON_CPU_WAITS).
+    let storm_tasks = aps * STORM_TASKS_PER_AP;
+    let mut storm = [0u64; SYNC_MAX_TASKS];
+    for (index, slot) in storm.iter_mut().enumerate().take(storm_tasks) {
+        *slot = spawn(ap(index), SYNC_ROLE_STORM)?;
+    }
+    let on_cpu_waits_before = ON_CPU_WAITS.load(Ordering::Acquire);
+    let deferred_before = DEFERRED_MIGRATIONS.load(Ordering::Acquire);
+    let misplaced_before = MISPLACED_REQUEUES.load(Ordering::Acquire);
+    for &id in &storm[..storm_tasks] {
+        enqueue(id, true)?;
+    }
+    let storm_target = phase_one_tasks + 5 + storm_tasks as u64;
+    let storm_limit = timer::ticks().saturating_add(SYNC_PHASE_TICKS);
+    let mut turn = 0usize;
+    while SYNC_DONE.load(Ordering::Acquire) < storm_target {
+        if timer::ticks() > storm_limit {
+            return Err(SchedError::SleepTimeout);
+        }
+        for (index, &id) in storm[..storm_tasks].iter().enumerate() {
+            if let Some(Migration::Move { .. }) = set_affinity(id, 1 << ap(index + turn))? {
+                STORM_MOVES.fetch_add(1, Ordering::Relaxed);
+            }
+            // Une tâche de la tempête peut se terminer entre deux tours : son
+            // réveil est alors refusé, ce qui est attendu ici et seulement ici.
+            match wake(id) {
+                Ok(WakeOutcome::Woken(_)) => {
+                    STORM_WAKES.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(WakeOutcome::NotAsleep) | Err(SchedError::WakeDead) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        turn += 1;
+        // Laisse passer un tick en attente : le temps de la boucle reste borné.
+        cpu::enable_interrupts();
+        core::hint::spin_loop();
+        cpu::disable_interrupts();
+    }
+    let on_cpu_waits = ON_CPU_WAITS.load(Ordering::Acquire) - on_cpu_waits_before;
+    let deferred_migrations = DEFERRED_MIGRATIONS.load(Ordering::Acquire) - deferred_before;
+    let misplaced_requeues = MISPLACED_REQUEUES.load(Ordering::Acquire) - misplaced_before;
+
     // Les AP reviennent dans leur idle task, puis marge pour un IPI en vol.
     let idles: [u64; MAX_SCHED_CPUS] =
         core::array::from_fn(|index| IDLE_IDS[index].load(Ordering::Acquire));
@@ -2588,6 +2805,8 @@ pub fn qualify_sync(
         && wake_wins == 1
         && wake_losses == 2
         && target_runs == 1
+        && STORM_WAKES.load(Ordering::Acquire) > 0
+        && (aps < 2 || STORM_MIGRATIONS.load(Ordering::Acquire) > 0)
         && ipi_sent >= 1
         && (1..=ipi_sent).contains(&ipi_received);
     if !consistent {
@@ -2655,6 +2874,13 @@ pub fn qualify_sync(
         wake_wins,
         wake_losses,
         target_runs,
+        storm_tasks: storm_tasks as u64,
+        storm_migrations: STORM_MIGRATIONS.load(Ordering::Acquire),
+        storm_moves: STORM_MOVES.load(Ordering::Acquire),
+        storm_wakes: STORM_WAKES.load(Ordering::Acquire),
+        on_cpu_waits,
+        deferred_migrations,
+        misplaced_requeues,
         acquisitions,
         contention,
         switch_checks: crate::sync::switch_checks() - switch_checks_before,
@@ -2749,6 +2975,21 @@ extern "C" fn elyon_sync_task_entry(arg: u64) -> ! {
                 wake_when_blocked(ping);
                 if round + 1 < PING_ROUNDS {
                     block_now();
+                }
+            }
+        }
+        SYNC_ROLE_STORM => {
+            let mut last = this_cpu();
+            for round in 0..STORM_ROUNDS {
+                if round % 3 == 2 {
+                    block_now();
+                } else {
+                    yield_now();
+                }
+                let cpu = this_cpu();
+                if cpu != last {
+                    STORM_MIGRATIONS.fetch_add(1, Ordering::Relaxed);
+                    last = cpu;
                 }
             }
         }

@@ -1031,6 +1031,17 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
                 sync.target_runs
             );
             kprintln!(
+                "[sched-sync] storm tasks={} rounds={} migrations={} moves={} deferred={} misplaced={} wakes={} on_cpu_waits={}",
+                sync.storm_tasks,
+                sched::STORM_ROUNDS,
+                sync.storm_migrations,
+                sync.storm_moves,
+                sync.deferred_migrations,
+                sync.misplaced_requeues,
+                sync.storm_wakes,
+                sync.on_cpu_waits
+            );
+            kprintln!(
                 "[sched-sync] locks acquisitions={},{},{},{} contention={},{},{},{} classes=pmm,run_queue,timer_queue,data switch_checks={}",
                 sync.acquisitions[0],
                 sync.acquisitions[1],

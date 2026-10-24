@@ -33,6 +33,9 @@ pub struct CpuLocal {
     /// Contexte quitté par le dernier switch de ce CPU, dont l'indicateur
     /// `on_cpu` reste à effacer par le contexte entrant.
     pub switched_from: AtomicU64,
+    /// Tâche quittée par ce CPU et sortie de son affinité : `finish_switch` la
+    /// met dans la file d'un CPU autorisé une fois son contexte sauvegardé.
+    pub pending_migration: AtomicU64,
 }
 
 impl CpuLocal {
@@ -44,6 +47,7 @@ impl CpuLocal {
             lock_acquisitions: [const { AtomicU64::new(0) }; LOCK_CLASSES],
             lock_contention: [const { AtomicU64::new(0) }; LOCK_CLASSES],
             switched_from: AtomicU64::new(0),
+            pending_migration: AtomicU64::new(0),
         }
     }
 }

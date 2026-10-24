@@ -218,6 +218,20 @@ pub fn start(id: TaskId, cpu_id: u32) -> Result<(), TaskError> {
     Ok(())
 }
 
+/// Lancement par le scheduler (K004-10) : même transition que `start`, mais le
+/// masque n'est pas relu. Le scheduler l'a vérifié sous le verrou de la file
+/// d'où il a retiré la tâche ; un changement d'affinité concurrent s'applique
+/// au `yield` suivant, par migration différée.
+pub fn dispatch(id: TaskId, cpu_id: u32) -> Result<(), TaskError> {
+    if cpu_id >= 64 {
+        return Err(TaskError::CpuOutsideAffinity);
+    }
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    transition(slot, TaskState::Ready, TaskState::Running)?;
+    slot.current_cpu.store(cpu_id, Ordering::Release);
+    Ok(())
+}
+
 pub fn yield_ready(id: TaskId) -> Result<(), TaskError> {
     let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
     transition(slot, TaskState::Running, TaskState::Ready)?;
