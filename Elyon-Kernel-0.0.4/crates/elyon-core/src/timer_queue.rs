@@ -49,6 +49,14 @@ impl<const N: usize> TimerQueue<N> {
             .any(|&(entry, _)| entry == task)
     }
 
+    /// Vrai si une échéance en attente satisfait `predicate` (K004-11 : une
+    /// tâche n'est récupérée que si aucune échéance ne la désigne).
+    pub fn any(&self, predicate: impl Fn(u64) -> bool) -> bool {
+        self.entries[..self.len]
+            .iter()
+            .any(|&(entry, _)| predicate(entry))
+    }
+
     pub fn next_deadline(&self) -> Option<u64> {
         (self.len > 0).then(|| self.entries[0].1)
     }
