@@ -63,7 +63,7 @@ one() {
 
 totals="$(one 'cpus=[0-9]+ waves=[0-9]+ tasks_per_wave=[0-9]+ rounds=[0-9]+ created=[0-9]+ exited=[0-9]+ reaped=[0-9]+ switches=[0-9]+$' totaux)"
 roles="$(one 'roles simd_rounds=[0-9]+ sleeps=[0-9]+ blocks=[0-9]+ wakes=[0-9]+ moves=[0-9]+ corruptions=[0-9]+ canary_failures=[0-9]+ running_max=[0-9]+$' rôles)"
-fairness="$(one 'fairness min_progress=[0-9]+ max_wait_switches=[0-9]+ limit=[0-9]+ idle_running_aps=[0-9]+$' équité)"
+fairness="$(one 'fairness min_progress=[0-9]+ max_wait_switches=[0-9]+ initial_wait=[0-9]+ yield_wait=[0-9]+ limit=[0-9]+ idle_running_aps=[0-9]+$' équité)"
 reclaim="$(one 'reclaim frames_before=[0-9]+ frames_after=[0-9]+ slots_before=[0-9]+ slots_after=[0-9]+$' récupération)"
 
 aps=$((CPUS - 1))
@@ -97,7 +97,11 @@ fi
 
 [[ "$(value "$fairness" min_progress)" == "$ROUNDS" ]] || fail "une tâche n'a pas fini ses tours: $fairness"
 [[ "$(value "$fairness" limit)" == $QUEUE_CAPACITY ]] || fail "borne d'attente inattendue: $fairness"
-[[ "$(value "$fairness" max_wait_switches)" -le $QUEUE_CAPACITY ]] || fail "famine: $fairness"
+initial_wait="$(value "$fairness" initial_wait)"
+yield_wait="$(value "$fairness" yield_wait)"
+[[ "$(value "$fairness" max_wait_switches)" == $((initial_wait > yield_wait ? initial_wait : yield_wait)) ]] \
+  || fail "attente maximale incohérente: $fairness"
+[[ "$initial_wait" -le $QUEUE_CAPACITY && "$yield_wait" -le $QUEUE_CAPACITY ]] || fail "famine: $fairness"
 [[ "$(value "$fairness" idle_running_aps)" == "$aps" ]] || fail "AP hors de leur idle task: $fairness"
 
 frames="$(value "$reclaim" frames_before)"

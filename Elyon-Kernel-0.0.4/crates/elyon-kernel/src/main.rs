@@ -1111,9 +1111,11 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
                 report.running_max
             );
             kprintln!(
-                "[stress] fairness min_progress={} max_wait_switches={} limit={} idle_running_aps={}",
+                "[stress] fairness min_progress={} max_wait_switches={} initial_wait={} yield_wait={} limit={} idle_running_aps={}",
                 report.min_progress,
                 report.max_wait_switches,
+                stress.initial_wait,
+                stress.yield_wait,
                 stress.limits.max_wait_switches,
                 report.idle_running_aps
             );

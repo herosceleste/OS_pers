@@ -3280,6 +3280,7 @@ static STRESS_ENQUEUED_AT: [AtomicU64; STRESS_MAX_WAVE] =
     [const { AtomicU64::new(0) }; STRESS_MAX_WAVE];
 static STRESS_EXITED: AtomicU64 = AtomicU64::new(0);
 static STRESS_MAX_WAIT: AtomicU64 = AtomicU64::new(0);
+static STRESS_MAX_INITIAL_WAIT: AtomicU64 = AtomicU64::new(0);
 static STRESS_CORRUPTIONS: AtomicU64 = AtomicU64::new(0);
 static STRESS_SIMD_ROUNDS: AtomicU64 = AtomicU64::new(0);
 static STRESS_SLEEPS: AtomicU64 = AtomicU64::new(0);
@@ -3368,6 +3369,8 @@ pub struct StressQualification {
     pub blocks: u64,
     pub wakes: u64,
     pub moves: u64,
+    pub initial_wait: u64,
+    pub yield_wait: u64,
 }
 
 pub fn qualify_stress(
@@ -3399,6 +3402,7 @@ pub fn qualify_stress(
     for counter in [
         &STRESS_EXITED,
         &STRESS_MAX_WAIT,
+        &STRESS_MAX_INITIAL_WAIT,
         &STRESS_CORRUPTIONS,
         &STRESS_SIMD_ROUNDS,
         &STRESS_SLEEPS,
@@ -3429,12 +3433,14 @@ pub fn qualify_stress(
             ids[index] = id;
             created += 1;
         }
+        // Toute la vague est en file avant qu'un AP ne démarre : un IPI par
+        // tâche laissait les premières tourner seules pendant que le BSP
+        // remplissait les files (lent sous VMware, où chaque IPI sort de la VM).
         for (index, &id) in ids.iter().enumerate().take(tasks_per_wave) {
-            STRESS_ENQUEUED_AT[index].store(
-                CPU_SWITCHES[ap(index)].load(Ordering::Acquire),
-                Ordering::Release,
-            );
-            enqueue(id, true)?;
+            stress_enqueue(id, index, ap(index))?;
+        }
+        for cpu in 1..cpus {
+            send_resched(cpu)?;
         }
 
         let target = ((wave + 1) * tasks_per_wave) as u64;
@@ -3532,7 +3538,9 @@ pub fn qualify_stress(
         free_slots_before,
         free_slots_after: task::free_slot_count() as u64,
         min_progress,
-        max_wait_switches: STRESS_MAX_WAIT.load(Ordering::Acquire),
+        max_wait_switches: STRESS_MAX_WAIT
+            .load(Ordering::Acquire)
+            .max(STRESS_MAX_INITIAL_WAIT.load(Ordering::Acquire)),
         idle_running_aps,
     };
     let limits = elyon_core::stress::StressLimits {
@@ -3552,7 +3560,30 @@ pub fn qualify_stress(
         blocks: STRESS_BLOCKS.load(Ordering::Acquire),
         wakes,
         moves,
+        initial_wait: STRESS_MAX_INITIAL_WAIT.load(Ordering::Acquire),
+        yield_wait: STRESS_MAX_WAIT.load(Ordering::Acquire),
     }))
+}
+
+/// Met une tâche de stress en file sur `cpu` sans prévenir l'AP, et note sous
+/// le verrou de la file le compteur de switchs de ce CPU : l'AP ne peut pas la
+/// prendre avant cette note, l'attente initiale mesurée ne compte donc que ce
+/// que ce CPU a fait après la mise en file (un switch en vol de marge).
+fn stress_enqueue(task_id: u64, index: usize, cpu: usize) -> Result<(), SchedError> {
+    irq_save(|| {
+        let id = task::lookup(task_id)?;
+        if task::snapshot(id)?.state != TaskState::Ready {
+            return Err(SchedError::Task(TaskError::InvalidTransition));
+        }
+        let mut queue = queue_of(cpu);
+        if !allowed(task::snapshot(id)?.affinity_mask, cpu) {
+            return Err(SchedError::Task(TaskError::CpuOutsideAffinity));
+        }
+        STRESS_ENQUEUED_AT[index]
+            .store(CPU_SWITCHES[cpu].load(Ordering::Acquire), Ordering::Release);
+        queue.push_back(task_id)?;
+        Ok(())
+    })
 }
 
 /// Cède le CPU et mesure, si la tâche reprend sur le même CPU, combien de
@@ -3612,7 +3643,7 @@ extern "C" fn elyon_stress_task_entry(arg: u64) -> ! {
     if role != STRESS_ROLE_BLOCK {
         let waited = CPU_SWITCHES[this_cpu()].load(Ordering::Relaxed)
             - STRESS_ENQUEUED_AT[index].load(Ordering::Acquire);
-        STRESS_MAX_WAIT.fetch_max(waited, Ordering::AcqRel);
+        STRESS_MAX_INITIAL_WAIT.fetch_max(waited, Ordering::AcqRel);
     }
     for round in 0..STRESS_ROUNDS {
         match role {
