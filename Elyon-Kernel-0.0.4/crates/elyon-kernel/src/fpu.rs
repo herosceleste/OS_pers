@@ -213,29 +213,52 @@ pub fn cpu_area(cpu: usize) -> u64 {
 
 /// Zone de sauvegarde d'une tâche neuve, initialisée à l'état propre.
 pub fn new_task_area() -> Result<u64, FpuSetupError> {
+    let layout = task_layout()?;
+    let area = allocate_area(layout)?;
+    copy_init_image(area, layout);
+    Ok(area)
+}
+
+/// Comme [`new_task_area`], mais rendable : la zone d'une tâche récupérée
+/// retourne au PMM (K004-11).
+pub fn new_task_area_owned() -> Result<memory::FrameRange, FpuSetupError> {
+    let layout = task_layout()?;
+    let range = memory::allocate_owned(1).ok_or(FpuSetupError::AllocationFailed)?;
+    let area = range.start();
+    if let Err(error) = fpu::validate_area(area, layout) {
+        // Une page PMM est toujours alignée et assez grande : ce cas trahit un
+        // AREA_SIZE incohérent, la page est rendue avant l'erreur.
+        memory::free(range).map_err(|_| FpuSetupError::AllocationFailed)?;
+        return Err(FpuSetupError::Fpu(error));
+    }
+    copy_init_image(area, layout);
+    Ok(range)
+}
+
+fn task_layout() -> Result<AreaLayout, FpuSetupError> {
     if !enabled() {
         return Err(FpuSetupError::NotEnabled);
     }
-    let size = AREA_SIZE.load(Ordering::Acquire);
-    let layout = AreaLayout {
-        size,
+    Ok(AreaLayout {
+        size: AREA_SIZE.load(Ordering::Acquire),
         align: if USE_XSAVE.load(Ordering::Acquire) {
             64
         } else {
             16
         },
-    };
-    let area = allocate_area(layout)?;
+    })
+}
+
+fn copy_init_image(area: u64, layout: AreaLayout) {
     // SAFETY: les deux zones sont mappées, disjointes (frames PMM distinctes) et
-    // longues d'au moins `size` octets.
+    // longues d'au moins `layout.size` octets.
     unsafe {
         copy_nonoverlapping(
             INIT_AREA.load(Ordering::Acquire) as *const u8,
             area as *mut u8,
-            size,
+            layout.size,
         )
     };
-    Ok(area)
 }
 
 /// Sauvegarde l'état x87/SSE/AVX courant dans `area`.

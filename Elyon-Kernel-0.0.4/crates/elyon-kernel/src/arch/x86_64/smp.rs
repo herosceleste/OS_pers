@@ -17,7 +17,9 @@ const STARTUP_WAIT_MS: usize = 100;
 
 pub const STABILITY_VECTOR: u8 = 0xF1;
 pub const STABILITY_ROUNDS: u64 = 10;
-const STABILITY_ROUND_DELAY_US: u32 = 20_000;
+/// Attente maximale du heartbeat de chaque AP par tour, et pas de scrutation.
+const STABILITY_HEARTBEAT_WAIT_US: u32 = 500_000;
+const STABILITY_POLL_US: u32 = 1_000;
 
 static STABILITY_IPI_ERRORS: AtomicU64 = AtomicU64::new(0);
 
@@ -234,16 +236,26 @@ pub fn qualify_stability() -> Result<StabilitySummary, SmpError> {
             apic::send_fixed(snapshot.apic_id, STABILITY_VECTOR).map_err(|_| SmpError::Apic)?;
         }
 
-        timer::pit_delay_us(STABILITY_ROUND_DELAY_US).map_err(|_| SmpError::TimerDelay)?;
-
-        for index in 1..expected_cpus {
-            let snapshot = percpu::snapshot(index).ok_or(SmpError::StabilityStateRegression)?;
-            if snapshot.state != percpu::CpuState::Online
-                || snapshot.boot_count != 1
-                || snapshot.heartbeat < round
-            {
+        // Attente bornée du heartbeat de chaque AP (K004-11) : un délai fixe
+        // échouait quand l'hôte retardait un vCPU, sans défaut du noyau.
+        let mut waited_us = 0;
+        loop {
+            let mut all_beat = true;
+            for index in 1..expected_cpus {
+                let snapshot = percpu::snapshot(index).ok_or(SmpError::StabilityStateRegression)?;
+                if snapshot.state != percpu::CpuState::Online || snapshot.boot_count != 1 {
+                    return Err(SmpError::StabilityHeartbeatMissing);
+                }
+                all_beat &= snapshot.heartbeat >= round;
+            }
+            if all_beat {
+                break;
+            }
+            if waited_us >= STABILITY_HEARTBEAT_WAIT_US {
                 return Err(SmpError::StabilityHeartbeatMissing);
             }
+            timer::pit_delay_us(STABILITY_POLL_US).map_err(|_| SmpError::TimerDelay)?;
+            waited_us += STABILITY_POLL_US;
         }
     }
 
