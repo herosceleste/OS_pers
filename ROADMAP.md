@@ -57,11 +57,12 @@ L'ordre des jalons découle de ces dépendances : d'abord le cœur commun, puis 
 | Jalon | Objectif | Preuve attendue |
 |---|---|---|
 | 0.0.3 | Interruptions et SMP | **Qualifié** (ACPI, LAPIC, IOAPIC, AP, timer) |
-| 0.0.4 | Scheduler et tâches noyau | En cours : K004-01 à K004-12 (préemption, FPU, per-CPU, sleep, stress SMP) |
-| 0.0.5 | Ring 3 et appels système | Premier processus utilisateur isolé du noyau ; `syscall`/`sysret`, TSS RSP0, segments utilisateur ; une faute en ring 3 tue le processus sans affecter le noyau |
+| 0.0.4 | Scheduler et tâches noyau | En cours : K004-01 à K004-12 (préemption, FPU, per-CPU, sleep, synchronisation SMP, stress SMP) |
+| 0.0.5 | Ring 3 et appels système | Premier processus utilisateur isolé du noyau ; `syscall`/`sysret`, TSS RSP0, segments utilisateur ; une faute en ring 3 tue le processus sans affecter le noyau ; exigences de la section Sécurité |
 | 0.0.6 | Mémoire virtuelle par processus | Un CR3 par processus, fautes de page, `mmap`/`munmap`, copie à l'écriture, libération des frames par le PMM |
 | 0.0.7 | VFS et premier chargeur | Couche VFS, initramfs, chargeur ELF statique ; un binaire statique lancé depuis l'initramfs |
 | 0.0.8 | Stockage | Pilotes virtio-blk et AHCI ; lecture/écriture ext4 sur disque |
+| 0.0.9 | Entrées et affichage | Clavier et souris (PS/2 puis USB HID), pilote d'affichage sur le framebuffer UEFI, console graphique, compositeur simple ; un programme utilisateur ouvre une fenêtre déplaçable à la souris. Socle du futur X11/Wayland (Linux) et de `user32`/`gdi32` (Windows) |
 
 ### Personnalité Linux et Debian
 
@@ -87,7 +88,19 @@ L'ordre des jalons découle de ces dépendances : d'abord le cœur commun, puis 
 
 ### Plateforme
 
-Graphique et entrées (framebuffer puis accélération), audio, USB, sécurité (utilisateurs, permissions, ACL NT), outillage de mise à jour. Ces chantiers seront planifiés au fur et à mesure des besoins des personnalités.
+Accélération graphique (au-delà du framebuffer de 0.0.9), audio, USB au-delà du HID, utilisateurs, permissions et ACL NT, outillage de mise à jour. Ces chantiers seront planifiés au fur et à mesure des besoins des personnalités.
+
+## Sécurité
+
+La sécurité est la priorité du projet : Elyon exécutera des binaires Linux et Windows qu'il ne contrôle pas, et chaque bug noyau est donc un bug de sécurité. Chaque critère est relu, avant sa PR, par des agents spécialisés (relecture Rust du code `unsafe` et de la concurrence, relecture sécurité, recherche d'erreurs silencieuses, performance), en plus des tests, des injections de faute et de la validation QEMU et VMware.
+
+Exigences obligatoires issues des relectures de 0.0.4, à satisfaire avant de qualifier 0.0.5 et 0.0.6 :
+
+- **`swapgs` à chaque entrée depuis le ring 3** (appels système, IRQ, exceptions), avant toute prise de verrou ou impression : l'index du CPU et la zone per-CPU sont lus via GS. `lfence` après le `swapgs` conditionnel (variante Spectre SWAPGS). La politique de `CR4.FSGSBASE` et de l'écriture des bases FS/GS par les processus est fixée explicitement.
+- **Entrée « paranoïaque » pour NMI, #DF et #MC** : le choix de faire `swapgs` ne s'y fie pas au CS sauvegardé (une NMI juste après `syscall` arrive en CPL 0 avec le GS utilisateur). Piles IST dédiées pour NMI et #MC ; `RSP0` du TSS propre à chaque tâche.
+- **Une entrée utilisateur ne doit jamais pouvoir arrêter le système** : les fautes et les erreurs atteignables depuis un processus tuent ce processus ; l'arrêt global (`halt_system`, par NMI sur tous les CPU) reste réservé aux invariants du noyau.
+- **Mémoire des processus** : uniquement des pages obtenues par `allocate_owned` (effacées, rendables par jeton), jamais d'accès par l'identity map du noyau à une page utilisateur ; les allocations permanentes du noyau restent non libérables.
+- **Masques `SFMASK`** (IF, DF, AC effacés à l'entrée) et nettoyage des registres non retournés à la sortie des appels système.
 
 ## Principes
 
