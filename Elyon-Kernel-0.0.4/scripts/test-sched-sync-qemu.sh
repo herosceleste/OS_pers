@@ -58,7 +58,8 @@ one() {
 
 aps=$((CPUS - 1))
 counter="$(one 'counter tasks=[0-9]+ rounds=[0-9]+ total=[0-9]+ expected=[0-9]+$' counter)"
-pmm="$(one 'pmm tasks=[0-9]+ rounds=[0-9]+ allocations=[0-9]+ duplicates=[0-9]+ failures=[0-9]+ free_before=[0-9]+ free_after=[0-9]+$' pmm)"
+pmm="$(one 'pmm tasks=[0-9]+ rounds=[0-9]+ allocations=[0-9]+ duplicates=[0-9]+ failures=[0-9]+ dirty=[0-9]+ free_before=[0-9]+ free_after=[0-9]+$' pmm)"
+storm="$(one 'storm tasks=[0-9]+ rounds=[0-9]+ migrations=[0-9]+ moves=[0-9]+ deferred=[0-9]+ misplaced=[0-9]+ wakes=[0-9]+ on_cpu_waits=[0-9]+$' storm)"
 pingpong="$(one 'pingpong ping_cpu=[0-9]+ pong_cpu=[0-9]+ rounds=[0-9]+ wakes=[0-9]+ retries=[0-9]+$' pingpong)"
 race="$(one 'wake_race target=[0-9]+ wakers=3 wins=[0-9]+ losses=[0-9]+ target_runs=[0-9]+$' wake_race)"
 locks="$(one 'locks acquisitions=[0-9]+,[0-9]+,[0-9]+,[0-9]+ contention=[0-9]+,[0-9]+,[0-9]+,[0-9]+ classes=pmm,run_queue,timer_queue,data switch_checks=[0-9]+$' locks)"
@@ -77,6 +78,7 @@ p_rounds="$(value "$pmm" rounds)"
 [[ "$(value "$pmm" tasks)" == "$aps" && "$(value "$pmm" allocations)" == $((aps * p_rounds)) ]] \
   || fail "allocations PMM invalides: $pmm"
 [[ "$(value "$pmm" duplicates)" == 0 && "$(value "$pmm" failures)" == 0 ]] || fail "page distribuée deux fois ou échec PMM: $pmm"
+[[ "$(value "$pmm" dirty)" == 0 ]] || fail "page allouée non effacée: $pmm"
 before="$(value "$pmm" free_before)"
 [[ "$before" -gt 0 && "$(value "$pmm" free_after)" == "$before" ]] || fail "pages libres non restaurées: $pmm"
 
@@ -88,6 +90,19 @@ before="$(value "$pmm" free_before)"
 # d. Course au réveil : un seul gagnant, une seule reprise.
 [[ "$(value "$race" wins)" == 1 && "$(value "$race" losses)" == 2 && "$(value "$race" target_runs)" == 1 ]] \
   || fail "course au réveil invalide: $race"
+
+# e. Tempête de migrations : chaque tâche se bloque un tour sur trois et est
+# réveillée ; dès 2 AP, elle change réellement de CPU, par déplacement d'une file
+# ou par migration différée après son yield.
+STORM_PER_AP=2
+s_tasks="$(value "$storm" tasks)"
+s_rounds="$(value "$storm" rounds)"
+[[ "$s_tasks" == $((aps * STORM_PER_AP)) ]] || fail "$s_tasks tâches de tempête, $((aps * STORM_PER_AP)) attendues"
+[[ "$(value "$storm" wakes)" == $((s_tasks * (s_rounds / 3))) ]] || fail "réveils de la tempête invalides: $storm"
+if [[ "$aps" -ge 2 ]]; then
+  [[ "$(value "$storm" migrations)" -gt 0 ]] || fail "aucune migration effective: $storm"
+  [[ $(($(value "$storm" moves) + $(value "$storm" deferred))) -gt 0 ]] || fail "aucun déplacement ni migration différée: $storm"
+fi
 
 # Verrous : une prise du verrou Data par incrément ; contention réelle dès 2 AP.
 IFS=, read -r -a acq <<<"$(list "$locks" acquisitions)"
@@ -108,7 +123,7 @@ if [[ -z "$sent" || -z "$received" || "$received" -lt 1 || "$received" -gt "$sen
   || "$coalesced" != $((sent - received)) ]]; then
   fail "comptes d'IPI incohérents: $summary"
 fi
-tasks_total=$((aps * (COUNTER_PER_AP + 1) + 2 + 3))
+tasks_total=$((aps * (COUNTER_PER_AP + 1 + STORM_PER_AP) + 2 + 3))
 if [[ "$(value "$summary" cpus)" != "$CPUS" || "$(value "$summary" idle_running_aps)" != "$aps" \
   || "$(value "$summary" running_max)" != 1 || "$(value "$summary" canaries_ok)" != "$tasks_total" ]]; then
   fail "synthèse invalide: $summary"
@@ -122,4 +137,4 @@ if grep -Eq '\[sched\] FAILED|\[KERNEL PANIC\]|\[EXCEPTION\]' <<<"$CLEAN"; then
   fail "erreur pendant la qualification"
 fi
 
-echo "[PASS] K004-10 synchronisation: $CPUS CPU, compteur $expected/$expected sous verrou (contention ${cont[3]}), PMM $((aps * p_rounds)) allocations sans doublon, ping-pong $(value "$pingpong" wakes) réveils, course au réveil 1 gagnant, $(value "$locks" switch_checks) switchs contrôlés, aucune violation d'ordre"
+echo "[PASS] K004-10 synchronisation: $CPUS CPU, compteur $expected/$expected sous verrou (contention ${cont[3]}), PMM $((aps * p_rounds)) allocations sans doublon, ping-pong $(value "$pingpong" wakes) réveils, course au réveil 1 gagnant, tempête $(value "$storm" migrations) migrations ($(value "$storm" on_cpu_waits) attentes on_cpu), $(value "$locks" switch_checks) switchs contrôlés, aucune violation d'ordre"
