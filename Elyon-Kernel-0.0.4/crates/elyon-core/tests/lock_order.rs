@@ -103,7 +103,7 @@ fn threads_taking_lock_subsets_in_rank_order_never_deadlock() {
             (0..THREADS)
                 .map(|thread| {
                     (0..ROUNDS)
-                        .filter(|round| (round + thread) % 7 & (1 << class) != 0)
+                        .filter(|round| ((round + thread) % 7) & (1 << class) != 0)
                         .count() as u64
                 })
                 .sum()
