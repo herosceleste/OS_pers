@@ -1006,12 +1006,13 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
                 sync.counter_tasks * sched::COUNTER_ROUNDS
             );
             kprintln!(
-                "[sched-sync] pmm tasks={} rounds={} allocations={} duplicates={} failures={} free_before={} free_after={}",
+                "[sched-sync] pmm tasks={} rounds={} allocations={} duplicates={} failures={} dirty={} free_before={} free_after={}",
                 sync.pmm_tasks,
                 sched::PMM_ROUNDS,
                 sync.pmm_allocations,
                 sync.pmm_duplicates,
                 sync.pmm_failures,
+                sync.pmm_dirty,
                 sync.free_before,
                 sync.free_after
             );

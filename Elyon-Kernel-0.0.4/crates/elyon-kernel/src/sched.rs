@@ -2550,6 +2550,8 @@ static SYNC_DONE: AtomicU64 = AtomicU64::new(0);
 static PMM_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 static PMM_DUPLICATES: AtomicU64 = AtomicU64::new(0);
 static PMM_FAILURES: AtomicU64 = AtomicU64::new(0);
+/// Pages reçues non effacées (le PMM doit les rendre à zéro).
+static PMM_DIRTY: AtomicU64 = AtomicU64::new(0);
 static PING_ID: AtomicU64 = AtomicU64::new(0);
 static PONG_ID: AtomicU64 = AtomicU64::new(0);
 static PINGPONG_WAKES: AtomicU64 = AtomicU64::new(0);
@@ -2572,6 +2574,7 @@ pub struct SyncQualification {
     pub pmm_allocations: u64,
     pub pmm_duplicates: u64,
     pub pmm_failures: u64,
+    pub pmm_dirty: u64,
     pub free_before: usize,
     pub free_after: usize,
     pub ping_cpu: usize,
@@ -2629,6 +2632,7 @@ pub fn qualify_sync(
         &PMM_ALLOCATIONS,
         &PMM_DUPLICATES,
         &PMM_FAILURES,
+        &PMM_DIRTY,
         &PINGPONG_WAKES,
         &PINGPONG_RETRIES,
         &WAKERS_READY,
@@ -2800,6 +2804,7 @@ pub fn qualify_sync(
         && pmm_allocations == pmm_tasks * PMM_ROUNDS
         && pmm_duplicates == 0
         && pmm_failures == 0
+        && PMM_DIRTY.load(Ordering::Acquire) == 0
         && free_after == free_before
         && pingpong_wakes == 2 * PING_ROUNDS
         && wake_wins == 1
@@ -2864,6 +2869,7 @@ pub fn qualify_sync(
         pmm_allocations,
         pmm_duplicates,
         pmm_failures,
+        pmm_dirty: PMM_DIRTY.load(Ordering::Acquire),
         free_before,
         free_after,
         ping_cpu,
@@ -2932,11 +2938,16 @@ fn counter_task() {
 
 fn pmm_task(current: u64) {
     for round in 0..PMM_ROUNDS {
-        let Some(frame) = crate::memory::allocate_frame() else {
+        let Some(range) = crate::memory::allocate_owned(1) else {
             PMM_FAILURES.fetch_add(1, Ordering::AcqRel);
             continue;
         };
+        let frame = range.start();
         PMM_ALLOCATIONS.fetch_add(1, Ordering::AcqRel);
+        // SAFETY: page identity-mappée que cette tâche détient seule.
+        if unsafe { read_volatile(frame as *const u64) } != 0 {
+            PMM_DIRTY.fetch_add(1, Ordering::AcqRel);
+        }
         let tag = (current << 32) | round;
         // SAFETY: page identity-mappée que cette tâche vient d'obtenir du PMM ;
         // si un autre CPU l'avait aussi obtenue, la marque serait écrasée.
@@ -2946,7 +2957,7 @@ fn pmm_task(current: u64) {
         if unsafe { read_volatile(frame as *const u64) } != tag {
             PMM_DUPLICATES.fetch_add(1, Ordering::AcqRel);
         }
-        if !crate::memory::free_frame(frame) {
+        if crate::memory::free(range).is_err() {
             PMM_FAILURES.fetch_add(1, Ordering::AcqRel);
         }
     }
