@@ -51,7 +51,7 @@ value() { sed -nE "s/.* $2=([0-9]+)( .*|$)/\1/p" <<<"$1"; }
 
 # Une ligne par AP, dans l'ordre, chacune avec au moins TARGET_ENTRIES entrées
 # depuis le ring 3, aucune erreur de GS, une sortie dont les contrôles passent.
-mapfile -t PROBES < <(grep -E '^\[ring3\] cpu=[0-9]+ user_entries=[0-9]+ gs_failures=[0-9]+ exits=[0-9]+ exit_gs_ok=[0-9]+ fsgsbase_on=[0-9]+$' <<<"$CLEAN")
+mapfile -t PROBES < <(grep -E '^\[ring3\] cpu=[0-9]+ user_entries=[0-9]+ gs_failures=[0-9]+ exits=[0-9]+ exit_gs_ok=[0-9]+ fsgsbase_on=[0-9]+ sce_on=[0-9]+$' <<<"$CLEAN")
 [[ "${#PROBES[@]}" == "$aps" ]] || fail "${#PROBES[@]} lignes de sonde, $aps attendues"
 total_entries=0
 for index in "${!PROBES[@]}"; do
@@ -62,6 +62,7 @@ for index in "${!PROBES[@]}"; do
   [[ "$(value "$line" gs_failures)" == 0 ]] || fail "noyau entré avec le GS utilisateur: $line"
   [[ "$(value "$line" exits)" == 1 && "$(value "$line" exit_gs_ok)" == 1 ]] || fail "sortie de sonde invalide: $line"
   [[ "$(value "$line" fsgsbase_on)" == 0 ]] || fail "CR4.FSGSBASE actif pendant la sonde: $line"
+  [[ "$(value "$line" sce_on)" == 0 ]] || fail "EFER.SCE actif avant syscall configuré: $line"
   total_entries=$((total_entries + entries))
 done
 

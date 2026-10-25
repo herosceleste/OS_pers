@@ -1217,19 +1217,21 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
             let mut consistent = !probe.cr4_fsgsbase;
             for (cpu, result) in probe.probes.iter().enumerate().take(probe.cpus).skip(1) {
                 kprintln!(
-                    "[ring3] cpu={} user_entries={} gs_failures={} exits={} exit_gs_ok={} fsgsbase_on={}",
+                    "[ring3] cpu={} user_entries={} gs_failures={} exits={} exit_gs_ok={} fsgsbase_on={} sce_on={}",
                     cpu,
                     result.user_entries,
                     result.gs_failures,
                     result.exits,
                     result.exit_gs_ok,
-                    result.fsgsbase_on
+                    result.fsgsbase_on,
+                    result.sce_on
                 );
                 consistent &= result.user_entries >= user_probe::TARGET_ENTRIES
                     && result.gs_failures == 0
                     && result.exits == 1
                     && result.exit_gs_ok == 1
-                    && result.fsgsbase_on == 0;
+                    && result.fsgsbase_on == 0
+                    && result.sce_on == 0;
             }
             kprintln!(
                 "[ring3] swapgs aps={} target_entries={} cr4_fsgsbase={} user_base={:#x}",

@@ -28,6 +28,8 @@ use crate::{memory, timer};
 const IA32_GS_BASE: u32 = 0xC000_0101;
 const IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
 const CR4_FSGSBASE: u64 = 1 << 16;
+const IA32_EFER: u32 = 0xC000_0080;
+const EFER_SCE: u64 = 1;
 /// Entrées depuis le ring 3 à observer avant de libérer la sonde.
 pub const TARGET_ENTRIES: u64 = 20;
 /// Délais de 1 ms entre deux IPI, au plus, par AP.
@@ -38,7 +40,7 @@ const MAX_PROBED_CPUS: usize = sched::MAX_SCHED_CPUS;
 
 global_asm!(
     r#"
-.section .rodata.user_probe,"a"
+.pushsection .rodata.user_probe,"a"
 // Code ring 3 de la sonde, copié dans la page de code utilisateur : boucle
 // jusqu'à ce que le noyau lève le drapeau au bas de la page de pile, puis
 // sort par `int 0x81`. Indépendant de sa position, aucune pile utilisée.
@@ -53,14 +55,19 @@ elyon_user_probe_code_start:
     ud2
 .global elyon_user_probe_code_end
 elyon_user_probe_code_end:
+// La section courante est restaurée : un autre bloc `global_asm!` assemblé à
+// la suite (les stubs de l'IDT) ne doit jamais tomber dans `.rodata`.
+.popsection
 "#,
     flag = const ring3::USER_STACK_VA,
     exit_vector = const idt::USER_PROBE_EXIT_VECTOR,
 );
 
 unsafe extern "C" {
-    static elyon_user_probe_code_start: u8;
-    static elyon_user_probe_code_end: u8;
+    // Tableaux de taille nulle : seules les adresses comptent, aucune lecture
+    // à travers ces symboles.
+    static elyon_user_probe_code_start: [u8; 0];
+    static elyon_user_probe_code_end: [u8; 0];
 }
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -72,6 +79,7 @@ static GS_FAILURES: AtomicU64 = AtomicU64::new(0);
 static EXITS: AtomicU64 = AtomicU64::new(0);
 static EXIT_GS_OK: AtomicU64 = AtomicU64::new(0);
 static FSGSBASE_ON: AtomicU64 = AtomicU64::new(0);
+static SCE_ON: AtomicU64 = AtomicU64::new(0);
 static DONE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
@@ -114,6 +122,8 @@ pub struct CpuProbe {
     pub exits: u64,
     pub exit_gs_ok: u64,
     pub fsgsbase_on: u64,
+    /// EFER.SCE trouvé actif (et effacé) avant l'entrée en ring 3.
+    pub sce_on: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -164,7 +174,16 @@ pub fn note_entry(saved_cs: u64) {
 
 #[unsafe(no_mangle)]
 extern "C" fn elyon_user_probe_exit_dispatch(saved_cs: u64) -> ! {
+    // Revue ECC K005-02 : la porte DPL 3 n'est valable que pendant une sonde,
+    // sur le CPU sondé. Hors de ce cadre, aucun code ring 3 n'existe encore :
+    // c'est une violation d'invariant (K005-08 tuera alors le processus).
     let probe = PROBE_CPU.load(Ordering::Acquire) as usize;
+    if !ACTIVE.load(Ordering::Acquire)
+        || probe >= MAX_PROBED_CPUS
+        || read_msr(IA32_GS_BASE) != cpu_local::area_address(probe)
+    {
+        sched::fail_from(SchedError::ArgMismatch);
+    }
     let ok = ring3::from_user(saved_cs)
         && read_msr(IA32_GS_BASE) == cpu_local::area_address(probe)
         && read_msr(IA32_KERNEL_GS_BASE) == EXPECTED_USER_GS.load(Ordering::Acquire);
@@ -172,6 +191,9 @@ extern "C" fn elyon_user_probe_exit_dispatch(saved_cs: u64) -> ! {
         EXIT_GS_OK.fetch_add(1, Ordering::AcqRel);
     }
     EXITS.fetch_add(1, Ordering::AcqRel);
+    // Le GS de la sonde ne lui survit pas.
+    // SAFETY: MSR architectural ; le noyau tourne avec GS_BASE (swapgs fait).
+    unsafe { cpu::write_msr(IA32_KERNEL_GS_BASE, 0) };
     DONE.store(true, Ordering::Release);
     // La tâche se termine sur sa pile noyau : rien n'y était plus vivant.
     sched::exit_now()
@@ -187,6 +209,20 @@ extern "C" fn elyon_user_probe_task_entry(arg: u64) -> ! {
         // Le ring 3 pourrait écrire sa propre base GS : politique violée.
         FSGSBASE_ON.fetch_add(1, Ordering::AcqRel);
     }
+    // `syscall` n'est pas encore configuré (K005-06) : EFER.SCE doit être nul,
+    // pour qu'un `syscall` du ring 3 lève #UD au lieu d'entrer en ring 0 à
+    // LSTAR = 0. Un firmware qui le laisse actif est corrigé et compté.
+    // SAFETY: IA32_EFER existe sur tout x86_64 ; seul SCE est modifié.
+    let efer = unsafe { cpu::read_msr(IA32_EFER) };
+    if efer & EFER_SCE != 0 {
+        SCE_ON.fetch_add(1, Ordering::AcqRel);
+        // SAFETY: effacer SCE ne touche ni LME ni NXE.
+        unsafe { cpu::write_msr(IA32_EFER, efer & !EFER_SCE) };
+    }
+    // L'état FPU que verra le ring 3 est l'image propre de la zone de cette
+    // tâche, restaurée par `transfer()` : la tâche n'exécute aucune instruction
+    // SIMD (noyau compilé sans SSE). Les vrais processus (K005-07) recevront
+    // une image propre explicite.
     let cpu = sched::this_cpu();
     // SAFETY: MSR architectural ; le GS utilisateur ne sert qu'au ring 3.
     unsafe { cpu::write_msr(IA32_KERNEL_GS_BASE, user_gs(cpu)) };
@@ -227,13 +263,13 @@ pub fn qualify(
     // SAFETY: le code de la sonde est une plage statique du noyau, plus petite
     // qu'une page ; la page de code vient d'être allouée et est mappée en identité.
     unsafe {
-        let start = &raw const elyon_user_probe_code_start;
-        let end = &raw const elyon_user_probe_code_end;
-        let len = end as usize - start as usize;
+        let start = (&raw const elyon_user_probe_code_start) as usize;
+        let end = (&raw const elyon_user_probe_code_end) as usize;
+        let len = end - start;
         if len > PAGE_SIZE as usize {
             return Err(ProbeError::AllocationFailed);
         }
-        copy_nonoverlapping(start, code as *mut u8, len);
+        copy_nonoverlapping(start as *const u8, code as *mut u8, len);
     }
     paging::map_user_probe(code, stack)?;
     paging::check_user_probe()?;
@@ -248,6 +284,7 @@ pub fn qualify(
             &EXITS,
             &EXIT_GS_OK,
             &FSGSBASE_ON,
+            &SCE_ON,
         ] {
             counter.store(0, Ordering::Release);
         }
@@ -258,14 +295,21 @@ pub fn qualify(
         EXPECTED_USER_GS.store(user_gs(ap), Ordering::Release);
         ACTIVE.store(true, Ordering::Release);
 
-        let (task_id, _region) = sched::spawn_on(
+        let spawned = sched::spawn_on(
             1 << ap,
             entry,
             PROBE_ARG_BASE | ap as u64,
             bsp,
             identity_limit,
-        )?;
-        sched::enqueue(task_id, true)?;
+        )
+        .and_then(|(task_id, _region)| sched::enqueue(task_id, true).map(|_| task_id));
+        let task_id = match spawned {
+            Ok(task_id) => task_id,
+            Err(error) => {
+                ACTIVE.store(false, Ordering::Release);
+                return Err(ProbeError::Sched(error));
+            }
+        };
 
         let mut rounds = 0;
         while !DONE.load(Ordering::Acquire) {
@@ -297,6 +341,7 @@ pub fn qualify(
             exits: EXITS.load(Ordering::Acquire),
             exit_gs_ok: EXIT_GS_OK.load(Ordering::Acquire),
             fsgsbase_on: FSGSBASE_ON.load(Ordering::Acquire),
+            sce_on: SCE_ON.load(Ordering::Acquire),
         };
     }
     PROBE_CPU.store(u64::MAX, Ordering::Release);

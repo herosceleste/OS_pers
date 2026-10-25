@@ -325,6 +325,9 @@ elyon_user_probe_exit:
     hlt
     jmp 2b
 
+// Limite (revue ECC K005-02) : une NMI ou une #MC entre `swapgs` et `iretq`
+// trouve un CS noyau et ne refait pas `swapgs` ; son diagnostic tournerait
+// avec le GS utilisateur. L'entrée « paranoïaque » de K005-03 le traitera.
 // void elyon_enter_user(const IretFrame *frame) -> !
 // Entre en ring 3 : IRQ masquées jusqu'à `iretq`, `swapgs` vers le GS
 // utilisateur (préparé dans KERNEL_GS_BASE), registres généraux effacés pour
@@ -566,7 +569,8 @@ pub fn install_user_gate(vector: u8, code_selector: u16, handler: u64) {
     let base = addr_of_mut!(IDT) as *mut IdtEntry;
     let mut entry = IdtEntry::new(handler, code_selector, 0);
     entry.options = INTERRUPT_GATE_PRESENT_RING3;
-    // SAFETY: entrée de l'IDT statique ; l'IDT est chargée une fois pour toutes.
+    // SAFETY: entrée de l'IDT statique, déjà chargée par `lidt` ; appelé par
+    // le BSP avant le démarrage des AP, donc avant que le vecteur puisse servir.
     unsafe { base.add(vector as usize).write(entry) };
 }
 
