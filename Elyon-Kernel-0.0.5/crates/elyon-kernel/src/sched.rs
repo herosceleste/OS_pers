@@ -20,6 +20,7 @@ use elyon_core::percpu_sched::{
 };
 use elyon_core::preempt::{self, Quantum, SliceClock, TickDecision};
 use elyon_core::run_queue::{self, QueueError, RunQueue};
+use elyon_core::segments::{self, SegmentError};
 use elyon_core::task_stack::{self, StackRegion};
 use elyon_core::timer_queue::{self, SleepRecord, TimerQueue, TimerQueueError};
 
@@ -91,6 +92,7 @@ pub enum SchedError {
     Task(TaskError),
     Stack(TaskStackError),
     Frames(FramesError),
+    Segments(SegmentError),
     /// Une tâche à récupérer est encore dans une file ou la file temporelle.
     ReapQueued,
     Queue(QueueError),
@@ -141,6 +143,7 @@ impl SchedError {
             Self::Task(error) => error.as_str(),
             Self::Stack(error) => error.as_str(),
             Self::Frames(error) => error.as_str(),
+            Self::Segments(error) => error.as_str(),
             Self::ReapQueued => "a dead task is still queued or has a pending deadline",
             Self::Queue(error) => error.as_str(),
             Self::Timer(error) => error.as_str(),
@@ -466,6 +469,16 @@ fn transfer(current: u64, next: u64) -> Result<(), SchedError> {
         }
     }
 
+    // K005-01 : une entrée depuis le ring 3 prendra la pile noyau de la tâche
+    // entrante. Hors tâche, aucune entrée ring 3 n'est possible : 0, qu'un
+    // processeur ne peut pas utiliser comme pile.
+    let rsp0 = if next == BSP_CONTEXT {
+        0
+    } else {
+        rsp0_of(next)?
+    };
+    crate::arch::x86_64::gdt::set_rsp0(this_cpu(), rsp0);
+
     crate::arch::x86_64::cpu_local::current()
         .switched_from
         .store(current, Ordering::Relaxed);
@@ -658,6 +671,14 @@ fn wait_off_cpu(task_id: u64) -> Result<(), SchedError> {
 
 /// Un switch dure quelques microsecondes ; au-delà, l'autre CPU est bloqué.
 const ON_CPU_WAIT_SPINS: u64 = 200_000_000;
+
+/// `RSP0` d'une tâche : le sommet de sa pile noyau (K005-01). Toute tâche
+/// exécutée en possède une ; son absence est une erreur fatale.
+fn rsp0_of(task_id: u64) -> Result<u64, SchedError> {
+    let (start, end) = task::stack_of(task::lookup(task_id)?)?
+        .ok_or(SchedError::Stack(TaskStackError::NotOwned))?;
+    segments::rsp0_for(start, end).map_err(SchedError::Segments)
+}
 
 fn fpu_area_of(context: u64) -> Result<u64, SchedError> {
     let area = if context == BSP_CONTEXT {
@@ -3662,5 +3683,175 @@ extern "C" fn elyon_stress_task_entry(arg: u64) -> ! {
         STRESS_PROGRESS[index].store(round + 1, Ordering::Release);
     }
     STRESS_EXITED.fetch_add(1, Ordering::AcqRel);
+    exit_now()
+}
+
+// --- K005-01 : segments utilisateur et RSP0 par tâche -----------------------------
+//
+// Chaque AP exécute SEG_TASKS_PER_AP tâches qui cèdent le CPU SEG_ROUNDS fois. À
+// chaque reprise, la tâche relit la GDT chargée sur son CPU (segments noyau et
+// utilisateur, TSS, disposition compatible syscall/sysret) et vérifie que le
+// RSP0 du TSS de ce CPU est le sommet de sa propre pile : `transfer()` l'y a
+// écrit juste avant de la reprendre.
+
+const SEG_ARG_BASE: u64 = 0xE1_0501_0000_0000;
+pub const SEG_TASKS_PER_AP: usize = 4;
+pub const SEG_ROUNDS: u64 = 50;
+const SEG_MAX_TASKS: usize = 3 * SEG_TASKS_PER_AP;
+/// Tours d'attente maximaux d'une tâche terminée qui n'a pas encore quitté son CPU.
+const SEG_REAP_SPINS: u64 = 50_000_000;
+
+static SEG_CHECKS: AtomicU64 = AtomicU64::new(0);
+static SEG_MISMATCHES: AtomicU64 = AtomicU64::new(0);
+static SEG_GDT_FAILURES: AtomicU64 = AtomicU64::new(0);
+/// CPU dont la GDT chargée a été vérifiée, un bit par CPU.
+static SEG_GDT_CPUS: AtomicU64 = AtomicU64::new(0);
+static SEG_DONE: AtomicU64 = AtomicU64::new(0);
+/// Dernier RSP0 relu par chaque tâche dans le TSS de son CPU.
+static SEG_RSP0: [AtomicU64; SEG_MAX_TASKS] = [const { AtomicU64::new(0) }; SEG_MAX_TASKS];
+
+#[derive(Clone, Copy, Debug)]
+pub struct SegmentsQualification {
+    pub cpus: usize,
+    pub star: u64,
+    pub gdt_cpus: u64,
+    pub tasks: usize,
+    pub checks: u64,
+    pub mismatches: u64,
+    pub gdt_failures: u64,
+    pub distinct_rsp0: usize,
+    pub bsp_rsp0: u64,
+    pub running_max: usize,
+}
+
+pub fn qualify_segments(
+    bsp_stack_start: u64,
+    bsp_stack_end: u64,
+    identity_limit: u64,
+) -> Result<Option<SegmentsQualification>, SchedError> {
+    cpu::disable_interrupts();
+    if this_cpu() != 0 {
+        return Err(SchedError::UnknownCpu);
+    }
+    let cpus = online_mask().count_ones() as usize;
+    if cpus < 2 {
+        return Ok(None);
+    }
+    let aps = cpus - 1;
+    let tasks = aps * SEG_TASKS_PER_AP;
+    if tasks > SEG_MAX_TASKS {
+        return Err(SchedError::TraceOverflow);
+    }
+    let bsp = StackRegion {
+        start: bsp_stack_start,
+        end: bsp_stack_end,
+    };
+    let ap = |index: usize| 1 + index % aps;
+    let entry = elyon_segments_task_entry as *const () as usize as u64;
+
+    for counter in [
+        &SEG_CHECKS,
+        &SEG_MISMATCHES,
+        &SEG_GDT_FAILURES,
+        &SEG_GDT_CPUS,
+        &SEG_DONE,
+    ] {
+        counter.store(0, Ordering::Release);
+    }
+    for slot in &SEG_RSP0 {
+        slot.store(0, Ordering::Release);
+    }
+    RUNNING_MAX.store(0, Ordering::Release);
+
+    // La GDT du BSP, puis celle de chaque AP par ses tâches.
+    let star = crate::arch::x86_64::gdt::check_loaded().map_err(SchedError::Segments)?;
+    SEG_GDT_CPUS.fetch_or(1, Ordering::AcqRel);
+
+    let mut ids = [0u64; SEG_MAX_TASKS];
+    for (index, slot) in ids.iter_mut().enumerate().take(tasks) {
+        let arg = SEG_ARG_BASE | index as u64;
+        let (id, _region) = spawn_on(1 << ap(index), entry, arg, bsp, identity_limit)?;
+        *slot = id;
+    }
+    for &id in &ids[..tasks] {
+        enqueue(id, true)?;
+    }
+    wait_until(|| SEG_DONE.load(Ordering::Acquire) == tasks as u64)?;
+
+    let idles: [u64; MAX_SCHED_CPUS] =
+        core::array::from_fn(|index| IDLE_IDS[index].load(Ordering::Acquire));
+    wait_until(|| (1..cpus).all(|index| CURRENT[index].load(Ordering::Acquire) == idles[index]))?;
+    for &task_id in &ids[..tasks] {
+        // Une tâche compte sa fin juste avant `exit_now` : elle peut être encore
+        // RUNNING, puis encore sur son CPU.
+        let id = task::lookup(task_id)?;
+        let mut spins = 0u64;
+        while task::snapshot(id)?.state != TaskState::Dead || reap(task_id)? == ReapOutcome::NotYet
+        {
+            spins += 1;
+            if spins > SEG_REAP_SPINS {
+                return Err(SchedError::OnCpuWaitTimeout);
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    let seen: [u64; SEG_MAX_TASKS] =
+        core::array::from_fn(|index| SEG_RSP0[index].load(Ordering::Acquire));
+    let distinct_rsp0 = (0..tasks)
+        .filter(|&index| seen[index] != 0 && !seen[..index].contains(&seen[index]))
+        .count();
+
+    Ok(Some(SegmentsQualification {
+        cpus,
+        star,
+        gdt_cpus: SEG_GDT_CPUS.load(Ordering::Acquire),
+        tasks,
+        checks: SEG_CHECKS.load(Ordering::Acquire),
+        mismatches: SEG_MISMATCHES.load(Ordering::Acquire),
+        gdt_failures: SEG_GDT_FAILURES.load(Ordering::Acquire),
+        distinct_rsp0,
+        // Le BSP est hors tâche : aucune entrée ring 3 ne peut y avoir lieu.
+        bsp_rsp0: crate::arch::x86_64::gdt::rsp0(0),
+        running_max: RUNNING_MAX.load(Ordering::Acquire),
+    }))
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn elyon_segments_task_entry(arg: u64) -> ! {
+    if arg & !0xFFFF != SEG_ARG_BASE {
+        fail(SchedError::ArgMismatch);
+    }
+    let index = (arg & 0xFFFF) as usize;
+    if index >= SEG_MAX_TASKS {
+        fail(SchedError::ArgMismatch);
+    }
+    let own = match rsp0_of(CURRENT[this_cpu()].load(Ordering::Acquire)) {
+        Ok(rsp0) => rsp0,
+        Err(error) => fail(error),
+    };
+    for _ in 0..SEG_ROUNDS {
+        // IRQ masquées : rien ne change de tâche sur ce CPU pendant la relecture.
+        cpu::disable_interrupts();
+        let cpu = this_cpu();
+        match crate::arch::x86_64::gdt::check_loaded() {
+            Ok(_) => {
+                SEG_GDT_CPUS.fetch_or(1 << cpu, Ordering::AcqRel);
+            }
+            Err(_) => {
+                SEG_GDT_FAILURES.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        let rsp0 = crate::arch::x86_64::gdt::rsp0(cpu);
+        if rsp0 == own {
+            SEG_CHECKS.fetch_add(1, Ordering::AcqRel);
+        } else {
+            SEG_MISMATCHES.fetch_add(1, Ordering::AcqRel);
+        }
+        SEG_RSP0[index].store(rsp0, Ordering::Release);
+        cpu::enable_interrupts();
+        yield_now();
+    }
+    SEG_DONE.fetch_add(1, Ordering::AcqRel);
     exit_now()
 }

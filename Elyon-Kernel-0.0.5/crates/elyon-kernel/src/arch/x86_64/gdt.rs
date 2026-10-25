@@ -1,6 +1,7 @@
-use core::ptr::{addr_of, addr_of_mut};
+use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 
-use x86_64::instructions::tables::load_tss;
+use elyon_core::segments::{self, LAYOUT};
+use x86_64::instructions::tables::{load_tss, sgdt};
 use x86_64::registers::segmentation::{CS, DS, ES, SS, Segment};
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
 use x86_64::structures::tss::TaskStateSegment;
@@ -10,6 +11,9 @@ use super::MAX_CPU_SLOTS;
 
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 pub const DOUBLE_FAULT_STACK_SIZE: usize = 16 * 1024;
+/// Entrées de la GDT : null, code et données noyau, données et code
+/// utilisateur, TSS sur deux entrées (K005-01, disposition `segments::LAYOUT`).
+pub const GDT_ENTRIES: usize = 7;
 
 #[repr(C, align(16))]
 struct ExceptionStack([u8; DOUBLE_FAULT_STACK_SIZE]);
@@ -49,9 +53,19 @@ pub fn prepare_for_cpu(cpu_index: usize, ist_start: u64, ist_end: u64) {
 
         let code = (*gdt_table)[cpu_index].append(Descriptor::kernel_code_segment());
         let data = (*gdt_table)[cpu_index].append(Descriptor::kernel_data_segment());
+        // K005-01 : données puis code utilisateur, l'ordre qu'impose `sysret`.
+        let user_data = (*gdt_table)[cpu_index].append(Descriptor::user_data_segment());
+        let user_code = (*gdt_table)[cpu_index].append(Descriptor::user_code_segment());
         let tss_ptr = addr_of!((*tss_table)[cpu_index]);
         let tss_descriptor = Descriptor::tss_segment_unchecked(tss_ptr);
         let tss = (*gdt_table)[cpu_index].append(tss_descriptor);
+        assert!(
+            code.index() << 3 == LAYOUT.kernel_code
+                && data.index() << 3 == LAYOUT.kernel_data
+                && user_data.index() << 3 == LAYOUT.user_data
+                && user_code.index() << 3 == LAYOUT.user_code
+                && tss.index() << 3 == LAYOUT.tss
+        );
 
         CODE_SELECTORS[cpu_index] = code.index() << 3;
         DATA_SELECTORS[cpu_index] = data.index() << 3;
@@ -108,4 +122,50 @@ pub fn tss_address(cpu_index: usize) -> u64 {
 pub fn tss_selector_for(cpu_index: usize) -> u16 {
     assert!(cpu_index < MAX_CPU_SLOTS);
     unsafe { TSS_SELECTORS[cpu_index] }
+}
+
+/// Pile noyau `RSP0` du TSS de `cpu_index` : celle que prend toute entrée
+/// depuis le ring 3 (K005-01). Écrite par ce seul CPU, IRQ masquées, avant le
+/// switch vers la tâche qui la possède ; lue aussi par le processeur, d'où
+/// l'écriture volatile.
+pub fn set_rsp0(cpu_index: usize, rsp0: u64) {
+    assert!(cpu_index < MAX_CPU_SLOTS);
+    // SAFETY: le TSS de ce CPU n'est écrit que par lui-même ; l'adresse est
+    // canonique (sommet d'une pile du noyau, ou 0 hors tâche).
+    unsafe {
+        let table = addr_of_mut!(TSS_TABLE);
+        let slot = addr_of_mut!((*table)[cpu_index].privilege_stack_table[0]);
+        write_volatile(slot, VirtAddr::new(rsp0));
+    }
+}
+
+pub fn rsp0(cpu_index: usize) -> u64 {
+    assert!(cpu_index < MAX_CPU_SLOTS);
+    // SAFETY: lecture d'un champ du TSS statique de ce CPU.
+    unsafe {
+        let table = addr_of!(TSS_TABLE);
+        read_volatile(addr_of!((*table)[cpu_index].privilege_stack_table[0])).as_u64()
+    }
+}
+
+/// Entrées de la GDT chargée sur ce CPU, relues via `sgdt` : la preuve porte
+/// sur la table que le processeur utilise, pas sur la copie préparée.
+pub fn loaded_entries() -> Option<[u64; GDT_ENTRIES]> {
+    let pointer = sgdt();
+    if usize::from(pointer.limit) + 1 < GDT_ENTRIES * 8 {
+        return None;
+    }
+    let base = pointer.base.as_u64() as *const u64;
+    // SAFETY: `sgdt` rend la base et la limite de la GDT chargée, une table
+    // statique du noyau mappée en identité ; la limite couvre GDT_ENTRIES.
+    Some(core::array::from_fn(|index| unsafe {
+        read_volatile(base.add(index))
+    }))
+}
+
+/// Contrôle de la GDT chargée sur ce CPU ; rend la valeur `STAR` qu'elle permet.
+pub fn check_loaded() -> Result<u64, segments::SegmentError> {
+    let entries = loaded_entries().ok_or(segments::SegmentError::TooShort)?;
+    segments::check_gdt(&entries, &LAYOUT)?;
+    segments::star(&LAYOUT)
 }
