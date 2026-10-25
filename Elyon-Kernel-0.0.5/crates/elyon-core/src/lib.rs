@@ -15,6 +15,7 @@ pub mod percpu_sched;
 pub mod pit;
 pub mod preempt;
 pub mod run_queue;
+pub mod segments;
 pub mod stress;
 pub mod sync;
 pub mod task_stack;
