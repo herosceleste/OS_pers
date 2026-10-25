@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# K004-12 : qualification finale 0.0.4 sous QEMU/OVMF, 4 vCPU. Les contrôles
+# K003 historiques sont complétés par le gate final K003-01..12 et
+# K004-01..11, le même que celui appliqué au log VMware.
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG="$ROOT/build/qemu-release-0.0.4.log"
 EVIDENCE="$ROOT/build/qualification-0.0.4.txt"
-QEMU_TIMEOUT="${ELYON_QEMU_TIMEOUT:-40}"
+QEMU_TIMEOUT="${ELYON_QEMU_TIMEOUT:-120}"
 
 bash "$ROOT/scripts/build.sh"
 
@@ -81,8 +85,14 @@ if grep -Eq '\[KERNEL PANIC\]|\[EXCEPTION\]|\[[^]]+\] FAILED|ELYON_[A-Z_]+_FAILE
   exit 1
 fi
 
+# Gate final complet, identique à la validation VMware.
+ELYON_ENV="QEMU/OVMF" bash "$ROOT/scripts/validate-vmware-final.sh" "$LOG" "$BUILD_ID" || {
+  echo "[FAIL] K004-12: gate final 0.0.4 non satisfait sous QEMU/OVMF" >&2
+  exit 1
+}
+
 {
-  echo "ELYON KERNEL 0.0.4 - K003 REGRESSION BASELINE"
+  echo "ELYON KERNEL 0.0.4 - FINAL QUALIFICATION (K003-01..12, K004-01..11)"
   echo "build_id=$BUILD_ID"
   echo "rust=$RUST_VERSION"
   echo "qemu_cpus=4"
@@ -92,12 +102,12 @@ fi
   cat "$ROOT/build/SHA256SUMS"
   echo
   echo "Markers:"
-  grep -E '^ELYON_(ACPI_READY|LAPIC_READY|PERCPU_READY|AP_READY|AP_BOOT_READY|SMP_READY|SMP_STABLE|CONTEXT_SWITCH_READY|IOAPIC_READY|TIMER_READY|KERNEL_READY_0_0_4)' "$LOG" || true
+  tr -d '\r' <"$LOG" | grep -E '^ELYON_[A-Z0-9_]+( |$)' || true
   echo
   echo "Final summaries:"
-  grep -E '^\[smp\] all_ready|^\[smp\] stability|^\[context\] result|^\[ioapic\] legacy_routes=|^\[timer\] ticks=' "$LOG" || true
+  tr -d '\r' <"$LOG" | grep -E '^\[smp\] all_ready|^\[smp\] stability|^\[context\] result|^\[ioapic\] legacy_routes=|^\[timer\] ticks=|^\[task\] ids=|^\[task-stack\] tasks=|^\[sched\] policy=|^\[preempt\] policy=|^\[context-integrity\] tasks=|^\[fpu-integrity\] tasks=|^\[percpu-sched\] cpus=|^\[sched-ipi\] cpus=|^\[sched-sleep\] cpus=|^\[sched-sync\] (locks|cpus)|^\[stress\] ' || true
 } >"$EVIDENCE"
 
 cat "$EVIDENCE"
 
-echo "[PASS] Elyon 0.0.4 baseline: régressions K003-01..12 cohérentes sur 4 vCPU, boot nominal sans anomalie"
+echo "[PASS] K004-12 qualification finale 0.0.4: K003-01..12 et K004-01..11 cohérents sur QEMU/OVMF 4 vCPU, boot nominal sans anomalie"

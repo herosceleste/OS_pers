@@ -4,9 +4,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG="${1:-/mnt/c/Elyon_VM/elyon-serial.log}"
 EXPECTED_BUILD_ID="${2:-$(git -C "$ROOT/.." rev-parse --short=12 HEAD)}"
+# K004-12 : le même gate qualifie le boot QEMU/OVMF (test-release-gate-qemu.sh)
+# et le boot VMware ; seul le nom de l'environnement change dans les messages.
+ENV_NAME="${ELYON_ENV:-VMware}"
 
 [[ -f "$LOG" ]] || {
-  echo "[FAIL] log VMware introuvable: $LOG" >&2
+  echo "[FAIL] log $ENV_NAME introuvable: $LOG" >&2
   exit 1
 }
 
@@ -30,7 +33,7 @@ require_regex() {
 
 require_fixed "[kernel] build_id=$EXPECTED_BUILD_ID"   "le log ne correspond pas au commit local attendu $EXPECTED_BUILD_ID"
 
-require_regex "\[acpi\] cpu_count=4 usable=4 ioapics=[1-9][0-9]* isos=[0-9]+ nmis=[0-9]+"   "VMware n'expose pas 4 CPU utilisables dans MADT"
+require_regex "\[acpi\] cpu_count=4 usable=4 ioapics=[1-9][0-9]* isos=[0-9]+ nmis=[0-9]+"   "$ENV_NAME n'expose pas 4 CPU utilisables dans MADT"
 
 require_fixed "ELYON_ACPI_READY" "ACPI non validé"
 require_fixed "ELYON_LAPIC_READY" "Local APIC non validé"
@@ -41,14 +44,14 @@ mapfile -t PREPARED < <(
 )
 
 if [[ "${#PREPARED[@]}" -ne 3 ]]; then
-  echo "[FAIL] 3 AP préparés attendus dans VMware, obtenus: ${#PREPARED[@]}" >&2
+  echo "[FAIL] 3 AP préparés attendus sous $ENV_NAME, obtenus: ${#PREPARED[@]}" >&2
   exit 1
 fi
 
 for line in "${PREPARED[@]}"; do
   cpu="$(sed -nE 's/^\[percpu\] cpu=([0-9]+).*/\1/p' <<<"$line")"
   apic="$(sed -nE 's/^\[percpu\].* apic_id=([0-9]+).*/\1/p' <<<"$line")"
-  require_fixed "ELYON_AP_READY cpu=$cpu apic_id=$apic"     "AP cpu=$cpu apic_id=$apic n'a pas atteint READY sous VMware"
+  require_fixed "ELYON_AP_READY cpu=$cpu apic_id=$apic"     "AP cpu=$cpu apic_id=$apic n'a pas atteint READY sous $ENV_NAME"
 done
 
 require_regex "\[smp\] all_ready started=3 online=4 prepared=0 expected=4 trampoline=0x8000 sipi_vector=0x8"   "tous les AP ne sont pas online"
@@ -67,7 +70,7 @@ mapfile -t TASK_STACKS < <(
   tr -d '\r' <"$LOG" | grep -E '^\[task-stack\] task=[0-9]+ stack=0x[0-9a-f]+\.\.0x[0-9a-f]+ size=64 KiB initial_rsp=0x[0-9a-f]+ observed_rsp=0x[0-9a-f]+ saved_rsp=0x[0-9a-f]+ arg=0x[0-9a-f]+ canary=OK$'
 )
 if [[ "${#TASK_STACKS[@]}" -ne 3 ]]; then
-  echo "[FAIL] K004-02: 3 tâches avec pile dédiée attendues sous VMware, obtenues: ${#TASK_STACKS[@]}" >&2
+  echo "[FAIL] K004-02: 3 tâches avec pile dédiée attendues sous $ENV_NAME, obtenues: ${#TASK_STACKS[@]}" >&2
   exit 1
 fi
 require_fixed "[task-stack] tasks=3 distinct=1 overlaps=0 owned=3 rounds=2 switches=12 args_ok=3 canaries_ok=3"   "K004-02: synthèse piles/contextes invalide"
@@ -88,7 +91,7 @@ require_regex "^\[preempt\] policy=timer-preemptive quantum_ticks=1 target=30 pr
 require_fixed "ELYON_SCHED_PREEMPT_READY" "K004-04: marqueur préemption absent"
 
 if grep -Fq "[context-integrity] FAILED" "$LOG"; then
-  echo "[FAIL] K004-05: corruption de contexte détectée sous VMware" >&2
+  echo "[FAIL] K004-05: corruption de contexte détectée sous $ENV_NAME" >&2
   grep -F "[context-integrity] FAILED" "$LOG" >&2
   exit 1
 fi
@@ -96,7 +99,7 @@ require_regex "^\[context-integrity\] tasks=[0-9]+,[0-9]+,[0-9]+ registers=15 df
 require_fixed "ELYON_SCHED_CONTEXT_READY" "K004-05: marqueur contexte absent"
 
 if grep -Eq '\[(fpu|fpu-integrity)\] FAILED' "$LOG"; then
-  echo "[FAIL] K004-06: échec FPU ou corruption SIMD détectée sous VMware" >&2
+  echo "[FAIL] K004-06: échec FPU ou corruption SIMD détectée sous $ENV_NAME" >&2
   grep -E '\[(fpu|fpu-integrity)\] FAILED' "$LOG" >&2
   exit 1
 fi
@@ -106,35 +109,35 @@ require_fixed "ELYON_SCHED_FPU_READY" "K004-06: marqueur FPU absent"
 
 # K004-07 : même contrôle indépendant que le test QEMU, appliqué au log VMware.
 ELYON_CHECK_LOG="$LOG" ELYON_CPUS=4 bash "$ROOT/scripts/test-sched-percpu-qemu.sh" >/dev/null || {
-  echo "[FAIL] K004-07: scheduler per-CPU non conforme sous VMware" >&2
+  echo "[FAIL] K004-07: scheduler per-CPU non conforme sous $ENV_NAME" >&2
   ELYON_CHECK_LOG="$LOG" ELYON_CPUS=4 bash "$ROOT/scripts/test-sched-percpu-qemu.sh" 2>&1 >/dev/null | head -3 >&2
   exit 1
 }
 
 # K004-08 : même contrôle indépendant que le test QEMU, appliqué au log VMware.
 ELYON_CHECK_LOG="$LOG" ELYON_CPUS=4 bash "$ROOT/scripts/test-sched-ipi-qemu.sh" >/dev/null || {
-  echo "[FAIL] K004-08: rescheduling à distance non conforme sous VMware" >&2
+  echo "[FAIL] K004-08: rescheduling à distance non conforme sous $ENV_NAME" >&2
   ELYON_CHECK_LOG="$LOG" ELYON_CPUS=4 bash "$ROOT/scripts/test-sched-ipi-qemu.sh" 2>&1 >/dev/null | head -3 >&2
   exit 1
 }
 
 # K004-09 : même contrôle indépendant que le test QEMU, appliqué au log VMware.
 ELYON_CHECK_LOG="$LOG" ELYON_CPUS=4 bash "$ROOT/scripts/test-sched-sleep-qemu.sh" >/dev/null || {
-  echo "[FAIL] K004-09: sleep/wakeup non conforme sous VMware" >&2
+  echo "[FAIL] K004-09: sleep/wakeup non conforme sous $ENV_NAME" >&2
   ELYON_CHECK_LOG="$LOG" ELYON_CPUS=4 bash "$ROOT/scripts/test-sched-sleep-qemu.sh" 2>&1 >/dev/null | head -3 >&2
   exit 1
 }
 
 # K004-10 : même contrôle indépendant que le test QEMU, appliqué au log VMware.
 ELYON_CHECK_LOG="$LOG" ELYON_CPUS=4 bash "$ROOT/scripts/test-sched-sync-qemu.sh" >/dev/null || {
-  echo "[FAIL] K004-10: synchronisation non conforme sous VMware" >&2
+  echo "[FAIL] K004-10: synchronisation non conforme sous $ENV_NAME" >&2
   ELYON_CHECK_LOG="$LOG" ELYON_CPUS=4 bash "$ROOT/scripts/test-sched-sync-qemu.sh" 2>&1 >/dev/null | head -3 >&2
   exit 1
 }
 
 # K004-11 : même contrôle indépendant que le test QEMU, appliqué au log VMware.
 ELYON_CHECK_LOG="$LOG" ELYON_CPUS=4 bash "$ROOT/scripts/test-sched-stress-qemu.sh" >/dev/null || {
-  echo "[FAIL] K004-11: stress SMP non conforme sous VMware" >&2
+  echo "[FAIL] K004-11: stress SMP non conforme sous $ENV_NAME" >&2
   ELYON_CHECK_LOG="$LOG" ELYON_CPUS=4 bash "$ROOT/scripts/test-sched-stress-qemu.sh" 2>&1 >/dev/null | head -3 >&2
   exit 1
 }
@@ -142,9 +145,9 @@ ELYON_CHECK_LOG="$LOG" ELYON_CPUS=4 bash "$ROOT/scripts/test-sched-stress-qemu.s
 require_fixed "ELYON_KERNEL_READY_0_0_4" "boot nominal final absent"
 
 if grep -Eq '\[KERNEL PANIC\]|\[EXCEPTION\]|\[[^]]+\] FAILED|ELYON_[A-Z_]+_FAILED' "$LOG"; then
-  echo "[FAIL] anomalie inattendue détectée dans le log VMware" >&2
+  echo "[FAIL] anomalie inattendue détectée dans le log $ENV_NAME" >&2
   grep -E '\[KERNEL PANIC\]|\[EXCEPTION\]|\[[^]]+\] FAILED|ELYON_[A-Z_]+_FAILED' "$LOG" >&2 || true
   exit 1
 fi
 
-echo "[PASS] VMware 4 vCPU: Elyon 0.0.4 K003-01..12 et K004-01..11 validés sur build_id=$EXPECTED_BUILD_ID"
+echo "[PASS] $ENV_NAME 4 vCPU: Elyon 0.0.4 K003-01..12 et K004-01..11 validés sur build_id=$EXPECTED_BUILD_ID"
