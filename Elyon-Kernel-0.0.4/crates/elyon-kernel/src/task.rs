@@ -9,6 +9,9 @@ const STATE_RUNNING: u8 = 2;
 const STATE_BLOCKED: u8 = 3;
 const STATE_SLEEPING: u8 = 4;
 const STATE_DEAD: u8 = 5;
+/// DEAD, en cours de récupération par un seul appelant (K004-11) ; vu de
+/// l'extérieur comme DEAD.
+const STATE_REAPING: u8 = 6;
 const STATE_ALLOCATING: u8 = 0xFF;
 
 static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
@@ -63,7 +66,7 @@ impl TaskState {
             STATE_RUNNING => Some(Self::Running),
             STATE_BLOCKED => Some(Self::Blocked),
             STATE_SLEEPING => Some(Self::Sleeping),
-            STATE_DEAD => Some(Self::Dead),
+            STATE_DEAD | STATE_REAPING => Some(Self::Dead),
             _ => None,
         }
     }
@@ -187,6 +190,8 @@ pub fn create_kernel(affinity_mask: u64) -> Result<TaskId, TaskError> {
         slot.stack_end.store(0, Ordering::Release);
         slot.saved_rsp.store(0, Ordering::Release);
         slot.fpu_area.store(0, Ordering::Release);
+        slot.on_cpu.store(false, Ordering::Release);
+        slot.wait_ticket.store(0, Ordering::Release);
         slot.state.store(STATE_READY, Ordering::Release);
         CREATED_TASKS.fetch_add(1, Ordering::AcqRel);
 
@@ -387,6 +392,77 @@ pub fn claim_wait(id: TaskId, ticket: u64) -> Result<bool, TaskError> {
 pub fn take_wait(id: TaskId) -> Result<u64, TaskError> {
     let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
     Ok(slot.wait_ticket.swap(0, Ordering::AcqRel))
+}
+
+/// Index du slot de la tâche dans le registre ; stable de sa création à sa
+/// récupération.
+pub fn slot_index(id: TaskId) -> Result<usize, TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    TASKS
+        .iter()
+        .position(|candidate| core::ptr::eq(candidate, slot))
+        .ok_or(TaskError::UnknownTask)
+}
+
+/// Commence la récupération d'une tâche DEAD (K004-11). Seul l'appelant dont
+/// le passage DEAD → REAPING réussit la poursuit. Une tâche qui occupe encore
+/// son CPU (contexte non sauvegardé) n'est pas récupérable : `Ok(false)`.
+/// Un ticket d'attente sur une tâche morte trahit un réveil en cours. DEAD
+/// est terminal : une fois le passage réussi, `on_cpu` ne peut plus que
+/// retomber, et une tâche encore sur son CPU repasse à DEAD.
+pub fn begin_reap(id: TaskId) -> Result<bool, TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    slot.state
+        .compare_exchange(
+            STATE_DEAD,
+            STATE_REAPING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map_err(|_| TaskError::InvalidTransition)?;
+    if slot.on_cpu.load(Ordering::Acquire) {
+        slot.state.store(STATE_DEAD, Ordering::Release);
+        return Ok(false);
+    }
+    if slot.wait_ticket.load(Ordering::Acquire) != 0 {
+        return Err(TaskError::WaitAlreadyArmed);
+    }
+    Ok(true)
+}
+
+/// Retire la pile du slot REAPING avant que ses pages soient rendues : une
+/// nouvelle tâche qui les reçoit ne doit pas voir de chevauchement.
+pub fn release_stack(id: TaskId) -> Result<(), TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    if slot.state.load(Ordering::Acquire) != STATE_REAPING {
+        return Err(TaskError::InvalidTransition);
+    }
+    slot.stack_start.store(0, Ordering::Release);
+    slot.stack_end.store(0, Ordering::Release);
+    slot.fpu_area.store(0, Ordering::Release);
+    Ok(())
+}
+
+/// Termine la récupération : le slot redevient libre. L'identifiant n'est
+/// jamais réattribué, donc un identifiant périmé ne désigne plus rien.
+pub fn finish_reap(id: TaskId) -> Result<(), TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    if slot.state.load(Ordering::Acquire) != STATE_REAPING {
+        return Err(TaskError::InvalidTransition);
+    }
+    slot.id.store(0, Ordering::Release);
+    slot.affinity_mask.store(0, Ordering::Release);
+    slot.saved_rsp.store(0, Ordering::Release);
+    slot.state.store(STATE_EMPTY, Ordering::Release);
+    Ok(())
+}
+
+/// Slots libres du registre.
+pub fn free_slot_count() -> usize {
+    TASKS
+        .iter()
+        .filter(|slot| slot.state.load(Ordering::Acquire) == STATE_EMPTY)
+        .count()
 }
 
 pub fn is_on_cpu(id: TaskId) -> Result<bool, TaskError> {

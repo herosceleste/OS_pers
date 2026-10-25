@@ -14,6 +14,7 @@ use elyon_core::task_stack::{self, CANARY, CANARY_QWORDS, FrameSpec, StackError,
 
 use crate::arch::x86_64::cpu;
 use crate::task::{self, TaskError, TaskId, TaskState};
+use crate::task_frames::{self, FramesError};
 use crate::{context, kprintln, memory};
 
 pub const QUALIFY_TASKS: usize = 3;
@@ -76,6 +77,7 @@ pub struct StackQualification {
 pub enum TaskStackError {
     Task(TaskError),
     Stack(StackError),
+    Frames(FramesError),
     AllocationFailed,
     Overlap,
     NotOwned,
@@ -95,6 +97,7 @@ impl TaskStackError {
         match self {
             Self::Task(error) => error.as_str(),
             Self::Stack(error) => error.as_str(),
+            Self::Frames(error) => error.as_str(),
             Self::AllocationFailed => "PMM could not allocate a task stack",
             Self::Overlap => "task stacks overlap each other or the BSP stack",
             Self::NotOwned => "task registry does not record the expected stack",
@@ -263,7 +266,9 @@ pub struct PreparedStack {
 
 /// Réserve une pile de 64 KiB au PMM pour la tâche READY `id`, la met à zéro,
 /// pose les canaris, écrit le frame initial (entrée `entry`, argument `arg`,
-/// retour vers `elyon_task_trampoline`) et l'attribue à la tâche.
+/// retour vers `elyon_task_trampoline`) et l'attribue à la tâche. La pile est
+/// rendable : son jeton est gardé par le slot jusqu'à la récupération de la
+/// tâche (K004-11).
 pub fn prepare(
     id: TaskId,
     entry: u64,
@@ -271,8 +276,11 @@ pub fn prepare(
     bsp: StackRegion,
     identity_limit: u64,
 ) -> Result<PreparedStack, TaskStackError> {
-    let start =
-        memory::allocate_contiguous_frames(STACK_FRAMES).ok_or(TaskStackError::AllocationFailed)?;
+    let frames = memory::allocate_owned(STACK_FRAMES).ok_or(TaskStackError::AllocationFailed)?;
+    let start = frames.start();
+    // Dès maintenant, la pile appartient au slot : elle n'est rendue qu'à sa
+    // récupération.
+    task_frames::keep_stack(id, frames).map_err(TaskStackError::Frames)?;
     let region = StackRegion {
         start,
         end: start + STACK_SIZE,
