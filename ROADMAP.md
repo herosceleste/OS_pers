@@ -58,7 +58,7 @@ L'ordre des jalons découle de ces dépendances : d'abord le cœur commun, puis 
 |---|---|---|
 | 0.0.3 | Interruptions et SMP | **Qualifié** (ACPI, LAPIC, IOAPIC, AP, timer) |
 | 0.0.4 | Scheduler et tâches noyau | **Qualifié** (préemption, FPU, per-CPU, sleep, synchronisation SMP, stress SMP) |
-| 0.0.5 | Ring 3 et appels système | Premier processus utilisateur isolé du noyau ; `syscall`/`sysret`, TSS RSP0, segments utilisateur ; une faute en ring 3 tue le processus sans affecter le noyau ; exigences de la section Sécurité |
+| 0.0.5 | Ring 3 et appels système | En cours : K005-01 à K005-12. Premier processus utilisateur isolé du noyau ; `syscall`/`sysret`, TSS RSP0, segments utilisateur ; une faute en ring 3 tue le processus sans affecter le noyau ; exigences de la section Sécurité |
 | 0.0.6 | Mémoire virtuelle par processus | Un CR3 par processus, fautes de page, `mmap`/`munmap`, copie à l'écriture, libération des frames par le PMM |
 | 0.0.7 | VFS et premier chargeur | Couche VFS, initramfs, chargeur ELF statique ; un binaire statique lancé depuis l'initramfs |
 | 0.0.8 | Stockage | Pilotes virtio-blk et AHCI ; lecture/écriture ext4 sur disque |

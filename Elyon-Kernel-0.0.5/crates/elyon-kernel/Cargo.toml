@@ -1,0 +1,14 @@
+[package]
+name = "elyon-kernel"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "elyon-kernel"
+path = "src/main.rs"
+
+[dependencies]
+elyon-abi = { path = "../elyon-abi" }
+elyon-core = { path = "../elyon-core" }
+x86_64 = { version = "=0.15.5", default-features = false, features = ["instructions"] }

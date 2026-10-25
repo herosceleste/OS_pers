@@ -1,0 +1,647 @@
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+
+pub const MAX_TASKS: usize = 256;
+pub const NO_CPU: u32 = u32::MAX;
+
+const STATE_EMPTY: u8 = 0;
+const STATE_READY: u8 = 1;
+const STATE_RUNNING: u8 = 2;
+const STATE_BLOCKED: u8 = 3;
+const STATE_SLEEPING: u8 = 4;
+const STATE_DEAD: u8 = 5;
+/// DEAD, en cours de récupération par un seul appelant (K004-11) ; vu de
+/// l'extérieur comme DEAD.
+const STATE_REAPING: u8 = 6;
+const STATE_ALLOCATING: u8 = 0xFF;
+
+static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
+static CREATED_TASKS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct TaskId(u64);
+
+impl TaskId {
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TaskState {
+    Ready,
+    Running,
+    Blocked,
+    Sleeping,
+    Dead,
+}
+
+impl TaskState {
+    #[expect(
+        dead_code,
+        reason = "API du modèle de tâche K004-01, pas encore consommée au boot"
+    )]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "READY",
+            Self::Running => "RUNNING",
+            Self::Blocked => "BLOCKED",
+            Self::Sleeping => "SLEEPING",
+            Self::Dead => "DEAD",
+        }
+    }
+
+    const fn raw(self) -> u8 {
+        match self {
+            Self::Ready => STATE_READY,
+            Self::Running => STATE_RUNNING,
+            Self::Blocked => STATE_BLOCKED,
+            Self::Sleeping => STATE_SLEEPING,
+            Self::Dead => STATE_DEAD,
+        }
+    }
+
+    const fn from_raw(raw: u8) -> Option<Self> {
+        match raw {
+            STATE_READY => Some(Self::Ready),
+            STATE_RUNNING => Some(Self::Running),
+            STATE_BLOCKED => Some(Self::Blocked),
+            STATE_SLEEPING => Some(Self::Sleeping),
+            STATE_DEAD | STATE_REAPING => Some(Self::Dead),
+            _ => None,
+        }
+    }
+}
+
+struct TaskSlot {
+    id: AtomicU64,
+    state: AtomicU8,
+    affinity_mask: AtomicU64,
+    current_cpu: AtomicU32,
+    stack_start: AtomicU64,
+    stack_end: AtomicU64,
+    saved_rsp: AtomicU64,
+    fpu_area: AtomicU64,
+    /// Vrai de l'entrée de la tâche sur un CPU jusqu'à ce que le contexte
+    /// suivant ait fini de sauvegarder le sien (K004-10).
+    on_cpu: AtomicBool,
+    /// Ticket de l'attente en cours, sommeil ou blocage (0 : aucune). Armé
+    /// avant l'entrée en attente ; seul celui qui le réclame (le tick à
+    /// l'échéance, ou un réveil explicite) réveille la tâche (K004-10).
+    wait_ticket: AtomicU64,
+}
+
+impl TaskSlot {
+    const fn empty() -> Self {
+        Self {
+            id: AtomicU64::new(0),
+            state: AtomicU8::new(STATE_EMPTY),
+            affinity_mask: AtomicU64::new(0),
+            current_cpu: AtomicU32::new(NO_CPU),
+            stack_start: AtomicU64::new(0),
+            stack_end: AtomicU64::new(0),
+            saved_rsp: AtomicU64::new(0),
+            fpu_area: AtomicU64::new(0),
+            on_cpu: AtomicBool::new(false),
+            wait_ticket: AtomicU64::new(0),
+        }
+    }
+}
+
+static TASKS: [TaskSlot; MAX_TASKS] = [const { TaskSlot::empty() }; MAX_TASKS];
+
+#[derive(Clone, Copy)]
+pub struct TaskSnapshot {
+    #[expect(
+        dead_code,
+        reason = "API du modèle de tâche K004-01, pas encore consommée au boot"
+    )]
+    pub id: TaskId,
+    pub state: TaskState,
+    pub affinity_mask: u64,
+    pub current_cpu: u32,
+}
+
+#[derive(Clone, Copy)]
+pub enum TaskError {
+    CapacityExceeded,
+    InvalidAffinity,
+    UnknownTask,
+    InvalidTransition,
+    CpuOutsideAffinity,
+    StackAlreadyAttached,
+    StackInUse,
+    WaitAlreadyArmed,
+}
+
+impl TaskError {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CapacityExceeded => "task registry capacity exceeded",
+            Self::InvalidAffinity => "task affinity mask is empty",
+            Self::UnknownTask => "unknown task id",
+            Self::InvalidTransition => "illegal task state transition",
+            Self::CpuOutsideAffinity => "CPU is outside task affinity mask",
+            Self::StackAlreadyAttached => "task already owns a stack",
+            Self::StackInUse => "stack overlaps the stack of another active task",
+            Self::WaitAlreadyArmed => "task already holds a wait ticket",
+        }
+    }
+}
+
+pub struct ModelQualification {
+    pub first_id: u64,
+    pub second_id: u64,
+    pub unique_ids: bool,
+    pub successful_transitions: u64,
+    pub invalid_transitions_rejected: u64,
+    pub states_seen_mask: u8,
+    pub created_total: u64,
+}
+
+pub fn create_kernel(affinity_mask: u64) -> Result<TaskId, TaskError> {
+    if affinity_mask == 0 {
+        return Err(TaskError::InvalidAffinity);
+    }
+
+    for slot in &TASKS {
+        if slot
+            .state
+            .compare_exchange(
+                STATE_EMPTY,
+                STATE_ALLOCATING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            continue;
+        }
+
+        let id_raw = NEXT_TASK_ID.fetch_add(1, Ordering::AcqRel);
+        if id_raw == 0 {
+            slot.state.store(STATE_EMPTY, Ordering::Release);
+            return Err(TaskError::CapacityExceeded);
+        }
+
+        slot.id.store(id_raw, Ordering::Release);
+        slot.affinity_mask.store(affinity_mask, Ordering::Release);
+        slot.current_cpu.store(NO_CPU, Ordering::Release);
+        slot.stack_start.store(0, Ordering::Release);
+        slot.stack_end.store(0, Ordering::Release);
+        slot.saved_rsp.store(0, Ordering::Release);
+        slot.fpu_area.store(0, Ordering::Release);
+        slot.on_cpu.store(false, Ordering::Release);
+        slot.wait_ticket.store(0, Ordering::Release);
+        slot.state.store(STATE_READY, Ordering::Release);
+        CREATED_TASKS.fetch_add(1, Ordering::AcqRel);
+
+        return Ok(TaskId(id_raw));
+    }
+
+    Err(TaskError::CapacityExceeded)
+}
+
+pub fn snapshot(id: TaskId) -> Result<TaskSnapshot, TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    let raw = slot.state.load(Ordering::Acquire);
+    let state = TaskState::from_raw(raw).ok_or(TaskError::UnknownTask)?;
+
+    Ok(TaskSnapshot {
+        id,
+        state,
+        affinity_mask: slot.affinity_mask.load(Ordering::Acquire),
+        current_cpu: slot.current_cpu.load(Ordering::Acquire),
+    })
+}
+
+pub fn start(id: TaskId, cpu_id: u32) -> Result<(), TaskError> {
+    if cpu_id >= 64 {
+        return Err(TaskError::CpuOutsideAffinity);
+    }
+
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    let affinity = slot.affinity_mask.load(Ordering::Acquire);
+    if affinity & (1u64 << cpu_id) == 0 {
+        return Err(TaskError::CpuOutsideAffinity);
+    }
+
+    transition(slot, TaskState::Ready, TaskState::Running)?;
+    slot.current_cpu.store(cpu_id, Ordering::Release);
+    Ok(())
+}
+
+/// Lancement par le scheduler (K004-10) : même transition que `start`, mais le
+/// masque n'est pas relu. Le scheduler l'a vérifié sous le verrou de la file
+/// d'où il a retiré la tâche ; un changement d'affinité concurrent s'applique
+/// au `yield` suivant, par migration différée.
+pub fn dispatch(id: TaskId, cpu_id: u32) -> Result<(), TaskError> {
+    if cpu_id >= 64 {
+        return Err(TaskError::CpuOutsideAffinity);
+    }
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    transition(slot, TaskState::Ready, TaskState::Running)?;
+    slot.current_cpu.store(cpu_id, Ordering::Release);
+    Ok(())
+}
+
+pub fn yield_ready(id: TaskId) -> Result<(), TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    transition(slot, TaskState::Running, TaskState::Ready)?;
+    slot.current_cpu.store(NO_CPU, Ordering::Release);
+    Ok(())
+}
+
+pub fn block(id: TaskId) -> Result<(), TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    transition(slot, TaskState::Running, TaskState::Blocked)?;
+    slot.current_cpu.store(NO_CPU, Ordering::Release);
+    Ok(())
+}
+
+pub fn sleep(id: TaskId) -> Result<(), TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    transition(slot, TaskState::Running, TaskState::Sleeping)?;
+    slot.current_cpu.store(NO_CPU, Ordering::Release);
+    Ok(())
+}
+
+pub fn wake(id: TaskId) -> Result<(), TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    let current = slot.state.load(Ordering::Acquire);
+
+    if current != STATE_BLOCKED && current != STATE_SLEEPING {
+        return Err(TaskError::InvalidTransition);
+    }
+
+    slot.state
+        .compare_exchange(current, STATE_READY, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| TaskError::InvalidTransition)?;
+    slot.current_cpu.store(NO_CPU, Ordering::Release);
+    Ok(())
+}
+
+pub fn terminate(id: TaskId) -> Result<(), TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    let current = slot.state.load(Ordering::Acquire);
+
+    if !matches!(
+        current,
+        STATE_READY | STATE_RUNNING | STATE_BLOCKED | STATE_SLEEPING
+    ) {
+        return Err(TaskError::InvalidTransition);
+    }
+
+    slot.state
+        .compare_exchange(current, STATE_DEAD, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| TaskError::InvalidTransition)?;
+    slot.current_cpu.store(NO_CPU, Ordering::Release);
+    Ok(())
+}
+
+/// Attribue la pile `[start, end)` à une tâche READY qui n'en possède pas encore.
+///
+/// Invariant K004-02 : une pile n'appartient qu'à une seule tâche active. Une
+/// pile qui chevauche celle d'une tâche non DEAD est refusée. L'attribution est
+/// faite par le BSP pendant le boot, avant que les tâches ne s'exécutent.
+pub fn attach_stack(id: TaskId, start: u64, end: u64) -> Result<(), TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    if slot.state.load(Ordering::Acquire) != STATE_READY {
+        return Err(TaskError::InvalidTransition);
+    }
+    if slot.stack_end.load(Ordering::Acquire) != 0 {
+        return Err(TaskError::StackAlreadyAttached);
+    }
+
+    for other in &TASKS {
+        let state = other.state.load(Ordering::Acquire);
+        if matches!(state, STATE_EMPTY | STATE_ALLOCATING | STATE_DEAD) {
+            continue;
+        }
+        let other_start = other.stack_start.load(Ordering::Acquire);
+        let other_end = other.stack_end.load(Ordering::Acquire);
+        if other_end != 0 && start < other_end && other_start < end {
+            return Err(TaskError::StackInUse);
+        }
+    }
+
+    slot.stack_start.store(start, Ordering::Release);
+    slot.stack_end.store(end, Ordering::Release);
+    Ok(())
+}
+
+/// Pile `[start, end)` attribuée à la tâche, si elle en possède une.
+pub fn stack_of(id: TaskId) -> Result<Option<(u64, u64)>, TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    let end = slot.stack_end.load(Ordering::Acquire);
+    if end == 0 {
+        return Ok(None);
+    }
+    Ok(Some((slot.stack_start.load(Ordering::Acquire), end)))
+}
+
+/// Identifiant d'une tâche existante, retrouvé à partir de sa valeur brute.
+pub fn lookup(raw: u64) -> Result<TaskId, TaskError> {
+    let id = TaskId(raw);
+    find_slot(id).map(|_| id).ok_or(TaskError::UnknownTask)
+}
+
+/// Emplacement du RSP sauvegardé de la tâche, écrit et relu par le switch de
+/// contexte. Le pointeur reste valide tant que le registre statique existe.
+/// Marque la tâche comme occupant (ou n'occupant plus) un CPU. Le passage à
+/// faux est publié en Release après la sauvegarde complète de son contexte.
+pub fn set_on_cpu(id: TaskId, on_cpu: bool) -> Result<(), TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    slot.on_cpu.store(on_cpu, Ordering::Release);
+    Ok(())
+}
+
+/// Réclame la tâche pour un CPU : faux si elle occupe encore un autre CPU.
+pub fn claim_on_cpu(id: TaskId) -> Result<bool, TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    Ok(slot
+        .on_cpu
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok())
+}
+
+static NEXT_WAIT_TICKET: AtomicU64 = AtomicU64::new(1);
+
+/// Arme un nouveau ticket d'attente, avant l'entrée en BLOCKED ou SLEEPING.
+/// Une tâche qui tourne n'en détient aucun : sinon un réveil destiné à une
+/// attente passée pourrait réveiller celle-ci.
+pub fn arm_wait(id: TaskId) -> Result<u64, TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    let ticket = NEXT_WAIT_TICKET.fetch_add(1, Ordering::Relaxed);
+    slot.wait_ticket
+        .compare_exchange(0, ticket, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| TaskError::WaitAlreadyArmed)?;
+    Ok(ticket)
+}
+
+/// Réclame l'attente `ticket` (tick à l'échéance) : faux si elle a déjà été
+/// réclamée ou remplacée par une attente plus récente.
+pub fn claim_wait(id: TaskId, ticket: u64) -> Result<bool, TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    Ok(slot
+        .wait_ticket
+        .compare_exchange(ticket, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok())
+}
+
+/// Réclame l'attente en cours quelle qu'elle soit (réveil explicite) ; 0 : aucune.
+pub fn take_wait(id: TaskId) -> Result<u64, TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    Ok(slot.wait_ticket.swap(0, Ordering::AcqRel))
+}
+
+/// Index du slot de la tâche dans le registre ; stable de sa création à sa
+/// récupération.
+pub fn slot_index(id: TaskId) -> Result<usize, TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    TASKS
+        .iter()
+        .position(|candidate| core::ptr::eq(candidate, slot))
+        .ok_or(TaskError::UnknownTask)
+}
+
+/// Commence la récupération d'une tâche DEAD (K004-11). Seul l'appelant dont
+/// le passage DEAD → REAPING réussit la poursuit. Une tâche qui occupe encore
+/// son CPU (contexte non sauvegardé) n'est pas récupérable : `Ok(false)`.
+/// Un ticket d'attente sur une tâche morte trahit un réveil en cours. DEAD
+/// est terminal : une fois le passage réussi, `on_cpu` ne peut plus que
+/// retomber, et une tâche encore sur son CPU repasse à DEAD.
+pub fn begin_reap(id: TaskId) -> Result<bool, TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    slot.state
+        .compare_exchange(
+            STATE_DEAD,
+            STATE_REAPING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map_err(|_| TaskError::InvalidTransition)?;
+    if slot.on_cpu.load(Ordering::Acquire) {
+        slot.state.store(STATE_DEAD, Ordering::Release);
+        return Ok(false);
+    }
+    if slot.wait_ticket.load(Ordering::Acquire) != 0 {
+        return Err(TaskError::WaitAlreadyArmed);
+    }
+    Ok(true)
+}
+
+/// Retire la pile du slot REAPING avant que ses pages soient rendues : une
+/// nouvelle tâche qui les reçoit ne doit pas voir de chevauchement.
+pub fn release_stack(id: TaskId) -> Result<(), TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    if slot.state.load(Ordering::Acquire) != STATE_REAPING {
+        return Err(TaskError::InvalidTransition);
+    }
+    slot.stack_start.store(0, Ordering::Release);
+    slot.stack_end.store(0, Ordering::Release);
+    slot.fpu_area.store(0, Ordering::Release);
+    Ok(())
+}
+
+/// Termine la récupération : le slot redevient libre. L'identifiant n'est
+/// jamais réattribué, donc un identifiant périmé ne désigne plus rien.
+pub fn finish_reap(id: TaskId) -> Result<(), TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    if slot.state.load(Ordering::Acquire) != STATE_REAPING {
+        return Err(TaskError::InvalidTransition);
+    }
+    slot.id.store(0, Ordering::Release);
+    slot.affinity_mask.store(0, Ordering::Release);
+    slot.saved_rsp.store(0, Ordering::Release);
+    slot.state.store(STATE_EMPTY, Ordering::Release);
+    Ok(())
+}
+
+/// Slots libres du registre.
+pub fn free_slot_count() -> usize {
+    TASKS
+        .iter()
+        .filter(|slot| slot.state.load(Ordering::Acquire) == STATE_EMPTY)
+        .count()
+}
+
+pub fn is_on_cpu(id: TaskId) -> Result<bool, TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    Ok(slot.on_cpu.load(Ordering::Acquire))
+}
+
+pub fn saved_rsp_ptr(id: TaskId) -> Result<*mut u64, TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    Ok(slot.saved_rsp.as_ptr())
+}
+
+/// Attribue à la tâche sa zone de sauvegarde FPU/SSE/AVX (K004-06).
+pub fn set_fpu_area(id: TaskId, area: u64) -> Result<(), TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    slot.fpu_area.store(area, Ordering::Release);
+    Ok(())
+}
+
+/// Zone de sauvegarde FPU de la tâche, 0 si elle n'en a pas.
+pub fn fpu_area(id: TaskId) -> Result<u64, TaskError> {
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    Ok(slot.fpu_area.load(Ordering::Acquire))
+}
+
+/// Change le masque d'affinité d'une tâche (K004-08). La migration éventuelle
+/// entre files est décidée et effectuée par le scheduler.
+pub fn set_affinity(id: TaskId, affinity_mask: u64) -> Result<(), TaskError> {
+    if affinity_mask == 0 {
+        return Err(TaskError::InvalidAffinity);
+    }
+    let slot = find_slot(id).ok_or(TaskError::UnknownTask)?;
+    slot.affinity_mask.store(affinity_mask, Ordering::Release);
+    Ok(())
+}
+
+/// Nombre de tâches RUNNING sur le CPU logique `cpu`.
+pub fn running_count_on(cpu: u32) -> usize {
+    TASKS
+        .iter()
+        .filter(|slot| {
+            slot.state.load(Ordering::Acquire) == STATE_RUNNING
+                && slot.current_cpu.load(Ordering::Acquire) == cpu
+        })
+        .count()
+}
+
+/// Nombre de tâches actuellement RUNNING, tous CPU confondus.
+pub fn running_count() -> usize {
+    TASKS
+        .iter()
+        .filter(|slot| slot.state.load(Ordering::Acquire) == STATE_RUNNING)
+        .count()
+}
+
+pub fn created_total() -> u64 {
+    CREATED_TASKS.load(Ordering::Acquire)
+}
+
+pub fn qualify_model() -> Result<ModelQualification, TaskError> {
+    let affinity_all = 0b1111u64;
+    let first = create_kernel(affinity_all)?;
+    let second = create_kernel(0b0001)?;
+
+    let unique_ids = first != second;
+    if !unique_ids {
+        return Err(TaskError::InvalidTransition);
+    }
+
+    let mut states_seen = state_bit(TaskState::Ready);
+    let mut transitions = 0u64;
+    let mut rejected = 0u64;
+
+    start(first, 0)?;
+    transitions += 1;
+    states_seen |= state_bit(TaskState::Running);
+
+    yield_ready(first)?;
+    transitions += 1;
+
+    start(first, 1)?;
+    transitions += 1;
+
+    block(first)?;
+    transitions += 1;
+    states_seen |= state_bit(TaskState::Blocked);
+
+    wake(first)?;
+    transitions += 1;
+
+    start(first, 2)?;
+    transitions += 1;
+
+    sleep(first)?;
+    transitions += 1;
+    states_seen |= state_bit(TaskState::Sleeping);
+
+    wake(first)?;
+    transitions += 1;
+
+    start(first, 3)?;
+    transitions += 1;
+
+    terminate(first)?;
+    transitions += 1;
+    states_seen |= state_bit(TaskState::Dead);
+
+    match block(second) {
+        Err(TaskError::InvalidTransition) => rejected += 1,
+        Err(error) => return Err(error),
+        Ok(()) => return Err(TaskError::InvalidTransition),
+    }
+
+    match start(second, 1) {
+        Err(TaskError::CpuOutsideAffinity) => rejected += 1,
+        Err(error) => return Err(error),
+        Ok(()) => return Err(TaskError::InvalidTransition),
+    }
+
+    start(second, 0)?;
+    transitions += 1;
+    terminate(second)?;
+    transitions += 1;
+
+    let first_snapshot = snapshot(first)?;
+    let second_snapshot = snapshot(second)?;
+
+    if first_snapshot.state != TaskState::Dead
+        || second_snapshot.state != TaskState::Dead
+        || first_snapshot.current_cpu != NO_CPU
+        || second_snapshot.current_cpu != NO_CPU
+    {
+        return Err(TaskError::InvalidTransition);
+    }
+
+    Ok(ModelQualification {
+        first_id: first.raw(),
+        second_id: second.raw(),
+        unique_ids,
+        successful_transitions: transitions,
+        invalid_transitions_rejected: rejected,
+        states_seen_mask: states_seen,
+        created_total: created_total(),
+    })
+}
+
+pub const fn required_states_mask() -> u8 {
+    state_bit(TaskState::Ready)
+        | state_bit(TaskState::Running)
+        | state_bit(TaskState::Blocked)
+        | state_bit(TaskState::Sleeping)
+        | state_bit(TaskState::Dead)
+}
+
+const fn state_bit(state: TaskState) -> u8 {
+    1 << (state.raw() - 1)
+}
+
+fn find_slot(id: TaskId) -> Option<&'static TaskSlot> {
+    if id.raw() == 0 {
+        return None;
+    }
+
+    TASKS.iter().find(|slot| {
+        let state = slot.state.load(Ordering::Acquire);
+        state != STATE_EMPTY
+            && state != STATE_ALLOCATING
+            && slot.id.load(Ordering::Acquire) == id.raw()
+    })
+}
+
+fn transition(slot: &TaskSlot, expected: TaskState, next: TaskState) -> Result<(), TaskError> {
+    slot.state
+        .compare_exchange(
+            expected.raw(),
+            next.raw(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map(|_| ())
+        .map_err(|_| TaskError::InvalidTransition)
+}

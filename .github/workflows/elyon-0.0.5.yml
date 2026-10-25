@@ -1,0 +1,188 @@
+name: Elyon Kernel 0.0.5 CI
+
+on:
+  push:
+    branches:
+      - elyon-0.0.5
+    paths:
+      - "Elyon-Kernel-0.0.5/**"
+      - ".github/workflows/elyon-0.0.5.yml"
+  pull_request:
+    paths:
+      - "Elyon-Kernel-0.0.5/**"
+      - ".github/workflows/elyon-0.0.5.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-boot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+
+      # Le miroir Ubuntu du runner descend parfois à ~36 ko/s (20 min pour 44 Mo
+      # au run #41). Les .deb sont conservés entre les runs : apt réutilise ceux
+      # dont la version et la somme correspondent et ne télécharge que le reste.
+      - name: Restore apt package cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/apt-archives
+          key: apt-${{ runner.os }}-noble-qemu-ovmf-v1-${{ github.run_id }}
+          restore-keys: |
+            apt-${{ runner.os }}-noble-qemu-ovmf-v1-
+
+      - name: Install host dependencies
+        run: |
+          mkdir -p ~/apt-archives/partial
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            -o Dir::Cache::Archives="$HOME/apt-archives" \
+            qemu-system-x86 ovmf xorriso dosfstools mtools
+          # actions/cache sauvegarde le dossier en fin de job sous l'utilisateur
+          # du runner : on lui rend les .deb lisibles et on retire le partiel.
+          sudo rm -rf ~/apt-archives/partial ~/apt-archives/lock
+          sudo chown -R "$(id -u):$(id -g)" ~/apt-archives
+          du -sh ~/apt-archives
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+          rustup target add x86_64-unknown-uefi --toolchain 1.99.1
+          rustup target add x86_64-unknown-none --toolchain 1.99.1
+          rustc +1.99.1 --version
+
+      - name: Format check
+        working-directory: Elyon-Kernel-0.0.5
+        run: cargo +1.99.1 fmt --all -- --check
+
+      - name: Host unit tests (elyon-core, elyon-abi)
+        working-directory: Elyon-Kernel-0.0.5
+        run: cargo +1.99.1 test --locked -p elyon-core -p elyon-abi
+
+      - name: Clippy (deny warnings)
+        working-directory: Elyon-Kernel-0.0.5
+        run: |
+          cargo +1.99.1 clippy --locked -p elyon-core -p elyon-abi --all-targets -- -D warnings
+          cargo +1.99.1 clippy --locked -p elyon-kernel --target x86_64-unknown-none -- -D warnings
+          cargo +1.99.1 clippy --locked -p elyon-loader --target x86_64-unknown-uefi -- -D warnings
+
+      - name: Undocumented unsafe report (non-blocking)
+        working-directory: Elyon-Kernel-0.0.5
+        continue-on-error: true
+        run: |
+          for spec in "elyon-kernel x86_64-unknown-none" "elyon-loader x86_64-unknown-uefi"; do
+            set -- $spec
+            count=$(cargo +1.99.1 clippy --locked -p "$1" --target "$2" -- -W clippy::undocumented_unsafe_blocks 2>&1 \
+              | grep -c "unsafe block missing a safety comment" || true)
+            echo "::notice title=undocumented unsafe::$1 $count"
+          done
+
+      - name: Build loader and kernel
+        working-directory: Elyon-Kernel-0.0.5
+        run: bash scripts/build.sh
+
+      - name: QEMU OVMF smoke test
+        working-directory: Elyon-Kernel-0.0.5
+        run: bash scripts/smoke-test.sh
+
+      - name: ACPI regression
+        working-directory: Elyon-Kernel-0.0.5
+        run: bash scripts/test-acpi-qemu.sh
+
+      - name: Local APIC regression
+        working-directory: Elyon-Kernel-0.0.5
+        run: bash scripts/test-lapic-qemu.sh
+
+      - name: Per-CPU regression
+        working-directory: Elyon-Kernel-0.0.5
+        run: bash scripts/test-percpu-qemu.sh
+
+      - name: INIT-SIPI one-AP regression
+        working-directory: Elyon-Kernel-0.0.5
+        run: bash scripts/test-smp-one-ap-qemu.sh
+
+      - name: All-AP SMP regression
+        working-directory: Elyon-Kernel-0.0.5
+        run: bash scripts/test-smp-all-aps-qemu.sh
+
+      - name: SMP stability regression
+        working-directory: Elyon-Kernel-0.0.5
+        run: bash scripts/test-smp-stability-qemu.sh
+
+      - name: Context-switch regression
+        working-directory: Elyon-Kernel-0.0.5
+        run: bash scripts/test-context-switch-qemu.sh
+
+      - name: K004-01 task model test
+        working-directory: Elyon-Kernel-0.0.5
+        run: bash scripts/test-task-model-qemu.sh
+
+      - name: K004-02 task stacks test
+        working-directory: Elyon-Kernel-0.0.5
+        run: bash scripts/test-task-stacks-qemu.sh
+
+      - name: K004-03 cooperative round-robin test
+        working-directory: Elyon-Kernel-0.0.5
+        run: bash scripts/test-sched-rr-qemu.sh
+
+      - name: K004-04 LAPIC timer preemption test
+        working-directory: Elyon-Kernel-0.0.5
+        run: bash scripts/test-sched-preempt-qemu.sh
+
+      - name: K004-05 CPU context integrity test
+        working-directory: Elyon-Kernel-0.0.5
+        run: bash scripts/test-sched-context-qemu.sh
+
+      - name: K004-06 FPU/SSE/AVX isolation test (XSAVE when available)
+        working-directory: Elyon-Kernel-0.0.5
+        run: bash scripts/test-sched-fpu-qemu.sh
+
+      - name: K004-06 FPU/SSE isolation test (forced FXSAVE fallback)
+        working-directory: Elyon-Kernel-0.0.5
+        env:
+          ELYON_FPU_FORCE_FXSAVE: "1"
+        run: bash scripts/test-sched-fpu-qemu.sh
+
+      - name: K004-07 per-CPU scheduler and idle task test
+        working-directory: Elyon-Kernel-0.0.5
+        run: bash scripts/test-sched-percpu-qemu.sh
+
+      - name: K004-08 resched IPI, remote wake-up and migration test
+        working-directory: Elyon-Kernel-0.0.5
+        run: bash scripts/test-sched-ipi-qemu.sh
+
+      - name: K004-09 sleep/wakeup and timer queue test
+        working-directory: Elyon-Kernel-0.0.5
+        run: bash scripts/test-sched-sleep-qemu.sh
+
+      - name: K004-10 spinlocks, lock order and SMP synchronisation test
+        working-directory: Elyon-Kernel-0.0.5
+        run: bash scripts/test-sched-sync-qemu.sh
+
+      - name: K004-11 SMP stress, task reaping and context-switch volume test
+        working-directory: Elyon-Kernel-0.0.5
+        run: bash scripts/test-sched-stress-qemu.sh
+
+      - name: IOAPIC regression
+        working-directory: Elyon-Kernel-0.0.5
+        run: bash scripts/test-ioapic-qemu.sh
+
+      - name: Local APIC timer regression
+        working-directory: Elyon-Kernel-0.0.5
+        run: bash scripts/test-timer-qemu.sh
+
+      - name: 0.0.5 release gate (K003 + K004 regressions)
+        working-directory: Elyon-Kernel-0.0.5
+        run: bash scripts/test-release-gate-qemu.sh
+
+      - name: Invalid-opcode fail-closed regression
+        working-directory: Elyon-Kernel-0.0.5
+        run: bash scripts/test-ud-qemu.sh
+
+      - name: Double-fault IST regression
+        working-directory: Elyon-Kernel-0.0.5
+        run: bash scripts/test-df-qemu.sh
