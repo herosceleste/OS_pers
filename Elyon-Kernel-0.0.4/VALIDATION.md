@@ -1,6 +1,6 @@
 # Elyon Kernel 0.0.4 — Validation
 
-**EN COURS — K004-01 à K004-10 sont validés. K004-11 et K004-12 restent à qualifier.**
+**EN COURS — K004-01 à K004-11 sont validés. K004-12 reste à qualifier.**
 
 ## Baseline héritée
 
@@ -20,7 +20,7 @@ La 0.0.4 est dérivée de la Release `v0.0.3`, dont les critères K003-01 à K00
 | K004-08 | Reschedule IPI + affinité | **PASS** |
 | K004-09 | Sleep/wakeup | **PASS** |
 | K004-10 | Synchronisation scheduler/IRQ/SMP | **PASS** |
-| K004-11 | Stress SMP | À faire |
+| K004-11 | Stress SMP | **PASS** |
 | K004-12 | Qualification finale 0.0.4 | À faire |
 
 ## Politique de preuve
@@ -560,3 +560,72 @@ Limites : sous VMware, la tempête n'a déclenché aucune attente `on_cpu` ; ce 
 **K004-10 : PASS.**
 
 Le prochain critère est **K004-11 : stress SMP.**
+
+## K004-11 — Stress SMP, récupération des tâches et volume de context switches
+
+Une tâche terminée est désormais récupérée : sa pile et sa zone FPU retournent au PMM et son slot est réutilisé. Le stress crée ainsi des milliers de tâches sur les 4 CPU sans épuiser les 256 slots du registre ni la mémoire.
+
+La logique pure est dans `elyon_core::stress`, testée sur l'hôte :
+
+- `check_stress()` refuse, chacun avec son erreur, un nombre de CPU ou de tâches inattendu, une tâche non terminée ou non récupérée, trop peu de switchs, une tâche sur deux CPU, une corruption SIMD, un canari abîmé, des pages ou des slots qui ne reviennent pas exactement à leur valeur de départ (moins : fuite ; plus : double libération), et une famine ;
+- `TimerQueue::any()` permet de vérifier qu'aucune échéance ne désigne une tâche récupérée ;
+- 18 tests.
+
+Côté noyau :
+
+- piles et zones FPU viennent de `allocate_owned` ; leurs jetons `FrameRange` sont gardés par slot (`task_frames.rs`), sous un verrou de classe `Pmm` jamais tenu pendant un appel au PMM ;
+- `sched::reap()` récupère une tâche DEAD : elle ne doit être dans aucune file ni avoir d'échéance ou de ticket d'attente, et doit avoir une pile aux canaris intacts ; le passage DEAD → REAPING est atomique, une tâche encore `on_cpu` repasse à DEAD (`NotYet`) ; la pile est retirée du slot avant que ses pages soient rendues, puis le slot redevient libre. Les identifiants ne sont jamais réattribués : un identifiant périmé ne désigne plus rien ;
+- files de CPU et file temporelle passent de 8 et 16 à 64 entrées ;
+- un compteur de switchs par CPU, incrémenté dans `transfer()`, sert de mesure de famine indépendante du temps ;
+- une panique Rust et tout échec de qualification après le démarrage des AP arrêtent tous les CPU par `fatal::halt_system` (limite de K004-10 levée) ;
+- le contrôle de stabilité SMP de K003 attend chaque heartbeat d'AP au plus 500 ms par tour au lieu d'un délai PIT fixe (limite de K004-10 levée).
+
+La qualification, exécutée après K004-10 avec le timer du BSP à 100 Hz, enchaîne 9 vagues de 40 tâches par AP, soit 1080 tâches à 4 CPU. Chaque vague est entièrement mise en file avant qu'un AP ne démarre, puis récupérée avant la suivante. Chaque tâche fait 100 tours selon son rôle :
+
+1. yield : cède le CPU et mesure combien de switchs son CPU fait avant de la reprendre ;
+2. simd : charge XMM0..15 et un MXCSR propres à la tâche, cède le CPU, relit ; le code Rust du noyau, compilé sans SSE, ne touche jamais ces registres ;
+3. sleep : dort 10 ms un tour sur dix ;
+4. block : se bloque un tour sur cinq ; le BSP la réveille et fait tourner son affinité d'un AP à l'autre.
+
+Le BSP vérifie avec `check_stress()` 1080 tâches créées, terminées et récupérées, au moins la moitié des tours en switchs, aucune tâche sur deux CPU, aucune corruption SIMD, le retour exact des pages et des slots libres, le retour des AP en idle, et une attente d'au plus 64 switchs, longueur maximale d'une file. En Round-Robin, chaque tâche placée devant une autre passe une fois avant elle ; une vague met au plus 50 tâches dans une file. L'attente est mesurée entre la mise en file et le premier passage, relevée sous le verrou de la file, et entre deux passages, pour les rôles à affinité fixe.
+
+Trois injections de faute ont été détectées, chacune arrêtant tous les CPU : la zone FPU non rendue (`free frames not restored after reaping`, 1080 pages manquantes), la sauvegarde FPU sautée pendant le stress (`registers or FPU state corrupted`, 26 924 tours corrompus) et une tâche toujours contournée dans sa file (`a stress task was starved`, attente initiale de 3627 switchs). Cette dernière injection est passée d'abord inaperçue, l'attente n'étant mesurée qu'entre deux passages : l'attente initiale a été ajoutée. Le script `test-sched-stress-qemu.sh` recalcule chaque valeur à partir du nombre d'AP ; 31 copies altérées d'un log réel sont toutes refusées et 3 variantes légitimes acceptées.
+
+Le code a été relu par les agents ECC rust-reviewer, security-reviewer, silent-failure-hunter et architect, sans point bloquant ni chemin d'utilisation après libération. Les corrections retenues figurent dans la PR #21 : course entre le compte de sortie d'une tâche et sa terminaison, qui aurait arrêté à tort le système, borne de famine resserrée de 128 à 64, contrôles de file et d'échéance faits avant le passage à REAPING, retour à DEAD d'une tâche encore sur son CPU, libération des deux plages même si la première échoue, échéance d'une tâche récupérée comptée comme périmée.
+
+Le premier boot VMware, sur le commit `5d5dc4b`, a échoué fail-closed : 50 515 switchs pour 54 000 exigés, et une attente initiale de 64. Le BSP relevait le compteur de l'AP avant de mettre la tâche en file et envoyait un IPI par tâche ; sous VMware, où chaque IPI sort de la VM, comme sur un hôte QEMU chargé (attente faussement mesurée à 103), les premières tâches d'une vague tournaient seules et l'AP accumulait des switchs avant la mise en file. Le relevé est désormais fait sous le verrou de la file et la vague démarre d'un seul IPI par AP.
+
+La qualification a été exécutée sur le commit `cc6ed4ab3631`, GitHub Actions run **#66** du workflow Elyon 0.0.4, et en local sous QEMU 8.2.2 / OVMF, à 4 et 2 vCPU.
+
+Preuves :
+
+```text
+[stress] cpus=4 waves=9 tasks_per_wave=120 rounds=100 created=1080 exited=1080 reaped=1080 switches=109594
+[stress] roles simd_rounds=27000 sleeps=2700 blocks=5400 wakes=5400 moves=8766 corruptions=0 canary_failures=0 running_max=1
+[stress] fairness min_progress=100 max_wait_switches=41 initial_wait=40 yield_wait=41 limit=64 idle_running_aps=3
+[stress] reclaim frames_before=249060 frames_after=249060 slots_before=197 slots_after=197
+ELYON_SCHED_STRESS_READY
+[PASS] K004-11 stress SMP: 4 CPU, 1080 tâches en 9 vagues créées, terminées et récupérées, 109594 switchs, 27000 tours SIMD sans corruption, 5400 blocages réveillés, attente max 41 switchs (borne 64), pages et slots restitués
+[PASS] K004-11 stress SMP: 2 CPU, 360 tâches en 9 vagues créées, terminées et récupérées, 36385 switchs, 9000 tours SIMD sans corruption, 1800 blocages réveillés, attente max 40 switchs (borne 64), pages et slots restitués
+```
+
+Validation croisée sous VMware® Workstation 17 Pro 17.0.2 build-21581411, UEFI, 4 vCPU, même build :
+
+```text
+[stress] cpus=4 waves=9 tasks_per_wave=120 rounds=100 created=1080 exited=1080 reaped=1080 switches=100172
+[stress] roles simd_rounds=27000 sleeps=2700 blocks=5400 wakes=5400 moves=87 corruptions=0 canary_failures=0 running_max=1
+[stress] fairness min_progress=100 max_wait_switches=41 initial_wait=40 yield_wait=41 limit=64 idle_running_aps=3
+[stress] reclaim frames_before=271582 frames_after=271582 slots_before=197 slots_after=197
+[PASS] K004-11 stress SMP: 4 CPU, 1080 tâches en 9 vagues créées, terminées et récupérées, 100172 switchs, 27000 tours SIMD sans corruption, 5400 blocages réveillés, attente max 41 switchs (borne 64), pages et slots restitués
+[PASS] VMware 4 vCPU: Elyon 0.0.4 K003-01..12 et K004-01..11 validés sur build_id=cc6ed4ab3631
+```
+
+`moves` ne compte que les tâches « block » déplacées alors qu'elles étaient en file : sous VMware, le BSP les trouve presque toujours bloquées et le nouveau masque ne s'applique qu'à leur réveil.
+
+Sur le même commit, 10 boots répétés de K004-11, 5 à 4 vCPU et 5 à 2 vCPU, dont les 5 premiers avec l'hôte chargé à 100 %, ont tous réussi : attente initiale de 40 et entre yields de 41 à 4 vCPU, 39 et 40 à 2 vCPU, à chaque boot ; 108 013 à 109 789 switchs à 4 vCPU, 35 955 à 36 448 à 2 vCPU. La fausse famine observée sous charge avant le correctif n'est pas réapparue.
+
+Limites : les AP n'ont pas de timer, le stress y est donc coopératif et une tâche qui ne cède jamais son CPU n'est pas détectée par la mesure en switchs ; une file ou la file temporelle pleine est une erreur fatale, il faudra une contre-pression avant le ring 3 ; `running_count_on` parcourt les 256 slots à chaque switch ; la clé de la file temporelle limite le ticket d'attente à 32 bits, soit environ 4 milliards d'attentes avant l'arrêt `TicketOverflow` ; les tâches des qualifications précédentes ne sont pas récupérées et gardent leurs slots et leurs pages ; `canary_failures` vaut toujours 0 dans le rapport, `reap()` arrêtant le système au premier canari abîmé ; `begin_reap` suppose qu'une tâche DEAD n'est dans aucune file, ce que garantit la sortie depuis RUNNING mais pas un `terminate` d'une tâche en file.
+
+**K004-11 : PASS.**
+
+Le prochain critère est **K004-12 : qualification finale 0.0.4.**
