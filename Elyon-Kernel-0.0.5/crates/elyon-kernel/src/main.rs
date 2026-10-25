@@ -1161,12 +1161,14 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
                 seg.gdt_cpus
             );
             kprintln!(
-                "[segments] rsp0 cpus={} tasks={} rounds={} checks={} mismatches={} gdt_failures={} distinct={} bsp_rsp0={:#x} running_max={}",
+                "[segments] rsp0 cpus={} tasks={} rounds={} checks={} mismatches={} live_rsp_ok={} live_rsp_failures={} gdt_failures={} distinct={} bsp_rsp0={:#x} running_max={}",
                 seg.cpus,
                 seg.tasks,
                 sched::SEG_ROUNDS,
                 seg.checks,
                 seg.mismatches,
+                seg.live_rsp_ok,
+                seg.live_rsp_failures,
                 seg.gdt_failures,
                 seg.distinct_rsp0,
                 seg.bsp_rsp0,
@@ -1174,6 +1176,8 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
             );
             let all_cpus = (1u64 << seg.cpus) - 1;
             let consistent = seg.mismatches == 0
+                && seg.live_rsp_failures == 0
+                && seg.live_rsp_ok == seg.tasks as u64 * sched::SEG_ROUNDS
                 && seg.gdt_failures == 0
                 && seg.checks == seg.tasks as u64 * sched::SEG_ROUNDS
                 && seg.distinct_rsp0 == seg.tasks

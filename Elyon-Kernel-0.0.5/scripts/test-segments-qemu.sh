@@ -69,7 +69,7 @@ expected_layout="$(printf 'layout kernel_code=%#x kernel_data=%#x user_data=%#x 
 layout="$(one 'layout ' disposition)"
 [[ "$layout" == "[segments] $expected_layout" ]] || fail "disposition ou STAR inattendue: $layout (attendu: $expected_layout)"
 
-expected_rsp0="rsp0 cpus=$CPUS tasks=$tasks rounds=$ROUNDS checks=$((tasks * ROUNDS)) mismatches=0 gdt_failures=0 distinct=$tasks bsp_rsp0=0x0 running_max=1"
+expected_rsp0="rsp0 cpus=$CPUS tasks=$tasks rounds=$ROUNDS checks=$((tasks * ROUNDS)) mismatches=0 live_rsp_ok=$((tasks * ROUNDS)) live_rsp_failures=0 gdt_failures=0 distinct=$tasks bsp_rsp0=0x0 running_max=1"
 rsp0="$(one 'rsp0 ' RSP0)"
 [[ "$rsp0" == "[segments] $expected_rsp0" ]] || fail "RSP0 invalide: $rsp0 (attendu: $expected_rsp0)"
 
@@ -86,4 +86,4 @@ if grep -Eq '\[sched\] FAILED|\[KERNEL PANIC\]|\[EXCEPTION\]|\[halt\]' <<<"$CLEA
   fail "erreur pendant la qualification"
 fi
 
-echo "[PASS] K005-01 segments: GDT vérifiée sur $CPUS CPU (code/données noyau, données/code utilisateur DPL 3, TSS $tr_hex), STAR=0x$(printf '%016x' "$star"), RSP0 = sommet de la pile de la tâche à chacun des $((tasks * ROUNDS)) contrôles ($tasks tâches distinctes), 0 hors tâche"
+echo "[PASS] K005-01 segments: GDT vérifiée sur $CPUS CPU (code/données noyau, données/code utilisateur DPL 3, TSS $tr_hex), STAR=0x$(printf '%016x' "$star"), RSP0 = sommet de la pile de la tâche, confirmé par son RSP réel, à chacun des $((tasks * ROUNDS)) contrôles ($tasks tâches distinctes), 0 hors tâche"

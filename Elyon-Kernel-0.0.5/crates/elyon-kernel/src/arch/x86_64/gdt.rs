@@ -129,22 +129,40 @@ pub fn tss_selector_for(cpu_index: usize) -> u16 {
 /// switch vers la tâche qui la possède ; lue aussi par le processeur, d'où
 /// l'écriture volatile.
 pub fn set_rsp0(cpu_index: usize, rsp0: u64) {
-    assert!(cpu_index < MAX_CPU_SLOTS);
-    // SAFETY: le TSS de ce CPU n'est écrit que par lui-même ; l'adresse est
-    // canonique (sommet d'une pile du noyau, ou 0 hors tâche).
+    let halves = rsp0_halves(cpu_index);
+    // SAFETY: le TSS de ce CPU n'est écrit que par lui-même, IRQ masquées ;
+    // les deux moitiés sont des u32 alignés sur 4 (voir `rsp0_halves`).
     unsafe {
-        let table = addr_of_mut!(TSS_TABLE);
-        let slot = addr_of_mut!((*table)[cpu_index].privilege_stack_table[0]);
-        write_volatile(slot, VirtAddr::new(rsp0));
+        write_volatile(halves, rsp0 as u32);
+        write_volatile(halves.add(1), (rsp0 >> 32) as u32);
     }
 }
 
 pub fn rsp0(cpu_index: usize) -> u64 {
+    let halves = rsp0_halves(cpu_index);
+    // SAFETY: lecture de deux u32 alignés du TSS statique de ce CPU.
+    unsafe { u64::from(read_volatile(halves)) | (u64::from(read_volatile(halves.add(1))) << 32) }
+}
+
+/// RSP0 vu comme deux u32. Le TSS est `packed(4)` : RSP0, à l'offset 4, n'est
+/// aligné que sur 4 octets, un accès volatile de 8 octets serait mal aligné.
+fn rsp0_halves(cpu_index: usize) -> *mut u32 {
     assert!(cpu_index < MAX_CPU_SLOTS);
-    // SAFETY: lecture d'un champ du TSS statique de ce CPU.
+    // SAFETY: calcul d'adresse dans le TSS statique de ce CPU, sans accès.
+    unsafe {
+        let table = addr_of_mut!(TSS_TABLE);
+        addr_of_mut!((*table)[cpu_index].privilege_stack_table[0]).cast::<u32>()
+    }
+}
+
+/// Base du bitmap d'E/S du TSS de `cpu_index`.
+pub fn iomap_base(cpu_index: usize) -> u16 {
+    assert!(cpu_index < MAX_CPU_SLOTS);
+    // SAFETY: lecture d'un u16 du TSS statique ; `addr_of!` évite toute
+    // référence vers un champ d'une structure `packed`.
     unsafe {
         let table = addr_of!(TSS_TABLE);
-        read_volatile(addr_of!((*table)[cpu_index].privilege_stack_table[0])).as_u64()
+        read_volatile(addr_of!((*table)[cpu_index].iomap_base))
     }
 }
 
@@ -164,8 +182,9 @@ pub fn loaded_entries() -> Option<[u64; GDT_ENTRIES]> {
 }
 
 /// Contrôle de la GDT chargée sur ce CPU ; rend la valeur `STAR` qu'elle permet.
-pub fn check_loaded() -> Result<u64, segments::SegmentError> {
+pub fn check_loaded(cpu_index: usize) -> Result<u64, segments::SegmentError> {
     let entries = loaded_entries().ok_or(segments::SegmentError::TooShort)?;
     segments::check_gdt(&entries, &LAYOUT)?;
+    segments::check_iomap(iomap_base(cpu_index), segments::TSS_LIMIT)?;
     segments::star(&LAYOUT)
 }

@@ -234,8 +234,111 @@ fn rsp0_refuses_a_stack_smaller_than_one_alignment() {
 }
 
 #[test]
+fn rsp0_refuses_a_non_canonical_top() {
+    assert_eq!(
+        segments::rsp0_for(0x0000_7fff_ffff_0000, 0x0000_8000_0000_0000),
+        Err(SegmentError::Rsp0)
+    );
+    assert_eq!(
+        segments::rsp0_for(0x0000_7fff_fff0_0000, 0x0000_7fff_ffff_fff0),
+        Ok(0x0000_7fff_ffff_fff0)
+    );
+}
+
+// --- Revue ECC K005-01 : types refusés et bitmap d'E/S ---------------------------
+
+#[test]
+fn conforming_user_code_is_refused() {
+    let mut entries = gdt();
+    entries[4] = USER_CODE | (1 << 42);
+    assert_eq!(
+        segments::check_gdt(&entries, &segments::LAYOUT),
+        Err(SegmentError::UserCode)
+    );
+}
+
+#[test]
+fn conforming_kernel_code_is_refused() {
+    let mut entries = gdt();
+    entries[1] = KERNEL_CODE | (1 << 42);
+    assert_eq!(
+        segments::check_gdt(&entries, &segments::LAYOUT),
+        Err(SegmentError::KernelCode)
+    );
+}
+
+#[test]
+fn expand_down_user_data_is_refused() {
+    let mut entries = gdt();
+    entries[3] = USER_DATA | (1 << 42);
+    assert_eq!(
+        segments::check_gdt(&entries, &segments::LAYOUT),
+        Err(SegmentError::UserData)
+    );
+}
+
+#[test]
+fn a_tss_long_enough_for_an_io_bitmap_is_refused() {
+    let mut entries = gdt();
+    entries[5] = (TSS_BUSY_LOW & !0xFFFF) | 0x2067;
+    assert_eq!(
+        segments::check_gdt(&entries, &segments::LAYOUT),
+        Err(SegmentError::Tss)
+    );
+}
+
+#[test]
+fn an_io_bitmap_base_past_the_tss_limit_means_no_port_access() {
+    assert_eq!(segments::check_iomap(0x68, 0x67), Ok(()));
+    assert_eq!(
+        segments::check_iomap(0x60, 0x67),
+        Err(SegmentError::IoBitmap)
+    );
+}
+
+// --- RSP0 observé, contrôlé contre le RSP réel de la tâche --------------------
+
+#[test]
+fn an_observed_rsp0_just_above_the_live_rsp_is_accepted() {
+    let forbidden = [(0x20_0000, 0x20_4000)];
+    assert_eq!(
+        segments::check_observed_rsp0(0x11_0000, 0x10_ff00, 0x1_0000, &forbidden),
+        Ok(())
+    );
+}
+
+#[test]
+fn an_observed_rsp0_below_the_live_rsp_is_refused() {
+    assert_eq!(
+        segments::check_observed_rsp0(0x10_ff00, 0x11_0000, 0x1_0000, &[]),
+        Err(SegmentError::RspOutside)
+    );
+}
+
+#[test]
+fn an_observed_rsp0_of_another_stack_is_refused() {
+    // RSP0 d'une autre tâche, une pile plus haut : trop loin du RSP réel.
+    assert_eq!(
+        segments::check_observed_rsp0(0x13_0000, 0x10_ff00, 0x1_0000, &[]),
+        Err(SegmentError::RspOutside)
+    );
+}
+
+#[test]
+fn an_observed_rsp0_inside_a_forbidden_stack_is_refused() {
+    let forbidden = [(0x10_8000, 0x11_0000)];
+    assert_eq!(
+        segments::check_observed_rsp0(0x11_0000, 0x10_ff00, 0x1_0000, &forbidden),
+        Err(SegmentError::Rsp0Forbidden)
+    );
+}
+
+#[test]
 fn every_error_has_a_message() {
     for error in [
+        SegmentError::IoBitmap,
+        SegmentError::RspOutside,
+        SegmentError::Rsp0Forbidden,
         SegmentError::StarLayout,
         SegmentError::TooShort,
         SegmentError::Null,

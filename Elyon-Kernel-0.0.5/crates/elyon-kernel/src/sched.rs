@@ -3709,6 +3709,12 @@ static SEG_GDT_CPUS: AtomicU64 = AtomicU64::new(0);
 static SEG_DONE: AtomicU64 = AtomicU64::new(0);
 /// Dernier RSP0 relu par chaque tâche dans le TSS de son CPU.
 static SEG_RSP0: [AtomicU64; SEG_MAX_TASKS] = [const { AtomicU64::new(0) }; SEG_MAX_TASKS];
+/// Contrôles indépendants de `rsp0_of` : RSP0 relu contre le RSP réel de la
+/// tâche et hors des piles réservées (revue ECC K005-01).
+static SEG_LIVE_RSP_OK: AtomicU64 = AtomicU64::new(0);
+static SEG_LIVE_RSP_FAILURES: AtomicU64 = AtomicU64::new(0);
+/// Pile de boot du BSP, que RSP0 ne doit jamais désigner.
+static SEG_BSP_STACK: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 #[derive(Clone, Copy, Debug)]
 pub struct SegmentsQualification {
@@ -3719,6 +3725,8 @@ pub struct SegmentsQualification {
     pub checks: u64,
     pub mismatches: u64,
     pub gdt_failures: u64,
+    pub live_rsp_ok: u64,
+    pub live_rsp_failures: u64,
     pub distinct_rsp0: usize,
     pub bsp_rsp0: u64,
     pub running_max: usize,
@@ -3755,16 +3763,20 @@ pub fn qualify_segments(
         &SEG_GDT_FAILURES,
         &SEG_GDT_CPUS,
         &SEG_DONE,
+        &SEG_LIVE_RSP_OK,
+        &SEG_LIVE_RSP_FAILURES,
     ] {
         counter.store(0, Ordering::Release);
     }
     for slot in &SEG_RSP0 {
         slot.store(0, Ordering::Release);
     }
+    SEG_BSP_STACK[0].store(bsp_stack_start, Ordering::Release);
+    SEG_BSP_STACK[1].store(bsp_stack_end, Ordering::Release);
     RUNNING_MAX.store(0, Ordering::Release);
 
     // La GDT du BSP, puis celle de chaque AP par ses tâches.
-    let star = crate::arch::x86_64::gdt::check_loaded().map_err(SchedError::Segments)?;
+    let star = crate::arch::x86_64::gdt::check_loaded(0).map_err(SchedError::Segments)?;
     SEG_GDT_CPUS.fetch_or(1, Ordering::AcqRel);
 
     let mut ids = [0u64; SEG_MAX_TASKS];
@@ -3810,6 +3822,8 @@ pub fn qualify_segments(
         checks: SEG_CHECKS.load(Ordering::Acquire),
         mismatches: SEG_MISMATCHES.load(Ordering::Acquire),
         gdt_failures: SEG_GDT_FAILURES.load(Ordering::Acquire),
+        live_rsp_ok: SEG_LIVE_RSP_OK.load(Ordering::Acquire),
+        live_rsp_failures: SEG_LIVE_RSP_FAILURES.load(Ordering::Acquire),
         distinct_rsp0,
         // Le BSP est hors tâche : aucune entrée ring 3 ne peut y avoir lieu.
         bsp_rsp0: crate::arch::x86_64::gdt::rsp0(0),
@@ -3834,7 +3848,7 @@ extern "C" fn elyon_segments_task_entry(arg: u64) -> ! {
         // IRQ masquées : rien ne change de tâche sur ce CPU pendant la relecture.
         cpu::disable_interrupts();
         let cpu = this_cpu();
-        match crate::arch::x86_64::gdt::check_loaded() {
+        match crate::arch::x86_64::gdt::check_loaded(cpu) {
             Ok(_) => {
                 SEG_GDT_CPUS.fetch_or(1 << cpu, Ordering::AcqRel);
             }
@@ -3847,6 +3861,29 @@ extern "C" fn elyon_segments_task_entry(arg: u64) -> ! {
             SEG_CHECKS.fetch_add(1, Ordering::AcqRel);
         } else {
             SEG_MISMATCHES.fetch_add(1, Ordering::AcqRel);
+        }
+        // Contrôle indépendant de `rsp0_of` : le RSP réel de la tâche est
+        // juste sous RSP0, et RSP0 ne désigne ni l'IST #DF de ce CPU ni la pile
+        // de boot du BSP.
+        let rsp: u64;
+        // SAFETY: lecture du registre RSP, sans effet de bord.
+        unsafe {
+            core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags))
+        };
+        let forbidden = [
+            crate::arch::x86_64::gdt::double_fault_stack_span_for(cpu),
+            (
+                SEG_BSP_STACK[0].load(Ordering::Acquire),
+                SEG_BSP_STACK[1].load(Ordering::Acquire),
+            ),
+        ];
+        match segments::check_observed_rsp0(rsp0, rsp, stacks::STACK_SIZE, &forbidden) {
+            Ok(()) => {
+                SEG_LIVE_RSP_OK.fetch_add(1, Ordering::AcqRel);
+            }
+            Err(_) => {
+                SEG_LIVE_RSP_FAILURES.fetch_add(1, Ordering::AcqRel);
+            }
         }
         SEG_RSP0[index].store(rsp0, Ordering::Release);
         cpu::enable_interrupts();

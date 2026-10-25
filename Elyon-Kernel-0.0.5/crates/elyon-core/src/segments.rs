@@ -38,6 +38,12 @@ pub enum SegmentError {
     UserCode,
     Tss,
     Rsp0,
+    /// Le TSS donnerait au ring 3 un bitmap de permissions d'E/S.
+    IoBitmap,
+    /// Le RSP0 relu n'est pas le sommet de la pile où la tâche s'exécute.
+    RspOutside,
+    /// Le RSP0 relu tombe dans une pile réservée (IST, boot).
+    Rsp0Forbidden,
 }
 
 impl SegmentError {
@@ -54,6 +60,9 @@ impl SegmentError {
             Self::UserCode => "user code segment is not a present ring 3 long-mode code segment",
             Self::Tss => "TSS descriptor is not a present ring 0 64-bit TSS",
             Self::Rsp0 => "task stack gives no valid RSP0",
+            Self::IoBitmap => "TSS gives ring 3 an I/O permission bitmap",
+            Self::RspOutside => "RSP0 is not the top of the stack the task runs on",
+            Self::Rsp0Forbidden => "RSP0 lies inside a reserved stack",
         }
     }
 }
@@ -107,20 +116,57 @@ pub const fn decode(raw: u64) -> DescriptorInfo {
     }
 }
 
+/// Bit 2 du type : « conforming » pour un code, « expand-down » pour des
+/// données. Aucun des deux n'a sa place dans la GDT du noyau.
+const KIND_CONFORMING_OR_EXPAND_DOWN: u8 = 0b0100;
+
+/// Limite d'un TSS 64 bits sans bitmap de permissions d'E/S : 104 octets - 1.
+pub const TSS_LIMIT: u32 = 0x67;
+
 fn is_code(raw: u64, dpl: u8) -> bool {
     let d = decode(raw);
-    d.present && !d.system && d.executable && d.long && !d.default_big && d.dpl == dpl
+    d.present
+        && !d.system
+        && d.executable
+        && d.kind & KIND_CONFORMING_OR_EXPAND_DOWN == 0
+        && d.long
+        && !d.default_big
+        && d.dpl == dpl
 }
 
 fn is_data(raw: u64, dpl: u8) -> bool {
     let d = decode(raw);
-    d.present && !d.system && !d.executable && d.writable && d.dpl == dpl
+    d.present
+        && !d.system
+        && !d.executable
+        && d.writable
+        && d.kind & KIND_CONFORMING_OR_EXPAND_DOWN == 0
+        && d.dpl == dpl
 }
 
-/// TSS 64 bits disponible (0x9) ou occupé (0xB, après `ltr`), ring 0.
+/// Limite d'un descripteur : bits 15:0 et 51:48.
+const fn limit_of(raw: u64) -> u32 {
+    ((raw & 0xFFFF) | ((raw >> 32) & 0xF_0000)) as u32
+}
+
+/// TSS 64 bits disponible (0x9) ou occupé (0xB, après `ltr`), ring 0, sans
+/// place pour un bitmap d'E/S.
 fn is_tss(raw: u64) -> bool {
     let d = decode(raw);
-    d.present && d.system && (d.kind == 0x9 || d.kind == 0xB) && d.dpl == 0
+    d.present
+        && d.system
+        && (d.kind == 0x9 || d.kind == 0xB)
+        && d.dpl == 0
+        && limit_of(raw) == TSS_LIMIT
+}
+
+/// Un `iomap_base` au-delà de la limite du TSS signifie « pas de bitmap » :
+/// le ring 3 n'a accès à aucun port (IOPL 0).
+pub fn check_iomap(iomap_base: u16, limit: u32) -> Result<(), SegmentError> {
+    if u32::from(iomap_base) <= limit {
+        return Err(SegmentError::IoBitmap);
+    }
+    Ok(())
 }
 
 /// Vérifie les entrées relues dans la GDT chargée contre la disposition.
@@ -156,8 +202,36 @@ pub fn check_gdt(entries: &[u64], layout: &Layout) -> Result<(), SegmentError> {
 /// aligné sur 16 octets comme l'exige l'entrée d'interruption.
 pub fn rsp0_for(start: u64, end: u64) -> Result<u64, SegmentError> {
     let top = end & !0xF;
-    if start == 0 || top <= start {
+    if start == 0 || top <= start || !is_canonical(top) {
         return Err(SegmentError::Rsp0);
     }
     Ok(top)
+}
+
+/// Adresse canonique sur 48 bits : bits 63:47 tous égaux.
+pub const fn is_canonical(address: u64) -> bool {
+    let upper = address >> 47;
+    upper == 0 || upper == 0x1_FFFF
+}
+
+/// Contrôle indépendant du RSP0 relu par une tâche dans le TSS de son CPU,
+/// contre son RSP réel `rsp` : la tâche s'exécute sur la pile dont RSP0 est
+/// le sommet, donc `rsp` est juste en dessous, à moins de `stack_size`.
+/// RSP0 ne doit tomber dans aucune pile réservée `[start, end)`.
+pub fn check_observed_rsp0(
+    rsp0: u64,
+    rsp: u64,
+    stack_size: u64,
+    forbidden: &[(u64, u64)],
+) -> Result<(), SegmentError> {
+    if rsp >= rsp0 || rsp0 - rsp > stack_size {
+        return Err(SegmentError::RspOutside);
+    }
+    if forbidden
+        .iter()
+        .any(|&(start, end)| rsp0 > start && rsp0 <= end)
+    {
+        return Err(SegmentError::Rsp0Forbidden);
+    }
+    Ok(())
 }

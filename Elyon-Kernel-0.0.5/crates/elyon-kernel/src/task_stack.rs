@@ -21,7 +21,7 @@ pub const QUALIFY_TASKS: usize = 3;
 pub const ROUNDS: u64 = 2;
 
 const STACK_FRAMES: usize = 16;
-const STACK_SIZE: u64 = STACK_FRAMES as u64 * PAGE_SIZE;
+pub const STACK_SIZE: u64 = STACK_FRAMES as u64 * PAGE_SIZE;
 const INITIAL_RFLAGS: u64 = 0x2;
 const ARG_BASE: u64 = 0xE1_0402_0000;
 const BSP_CPU: u32 = 0;
