@@ -1,6 +1,6 @@
 # Elyon Kernel 0.0.4 — Validation
 
-**EN COURS — K004-01 à K004-11 sont validés. K004-12 reste à qualifier.**
+**QUALIFIÉ — K004-01 à K004-12 sont validés, sans régression K003-01 à K003-12. Décision de clôture : [QUALIFICATION_0.0.4.md](QUALIFICATION_0.0.4.md).**
 
 ## Baseline héritée
 
@@ -21,7 +21,7 @@ La 0.0.4 est dérivée de la Release `v0.0.3`, dont les critères K003-01 à K00
 | K004-09 | Sleep/wakeup | **PASS** |
 | K004-10 | Synchronisation scheduler/IRQ/SMP | **PASS** |
 | K004-11 | Stress SMP | **PASS** |
-| K004-12 | Qualification finale 0.0.4 | À faire |
+| K004-12 | Qualification finale 0.0.4 | **PASS** |
 
 ## Politique de preuve
 
@@ -629,3 +629,30 @@ Limites : les AP n'ont pas de timer, le stress y est donc coopératif et une tâ
 **K004-11 : PASS.**
 
 Le prochain critère est **K004-12 : qualification finale 0.0.4.**
+
+## K004-12 — Qualification finale 0.0.4
+
+Le gate de release QEMU (`test-release-gate-qemu.sh`) ne vérifiait que les marqueurs K003. Il applique désormais au log de son boot à 4 vCPU le gate final, `validate-vmware-final.sh`, qui couvre K003-01..12 et K004-01..11 et rejoue sur le log le contrôle indépendant de chaque test K004-07..11. Le même script qualifie le log VMware ; seul le nom de l'environnement, passé par `ELYON_ENV`, change dans ses messages. Le fichier de preuves `qualification-0.0.4.txt` liste tous les marqueurs et les synthèses de chaque critère K004. Le délai de QEMU passe de 40 à 120 s pour couvrir le stress de K004-11.
+
+Le gate a refusé un log privé de `ELYON_SCHED_STRESS_READY` et un log dont le build_id ne correspondait pas au commit.
+
+La qualification a été exécutée sur le commit `e7416f1c5612`, dont le noyau est celui de K004-11, GitHub Actions run **#70** du workflow Elyon 0.0.4 :
+
+```text
+[PASS] QEMU/OVMF 4 vCPU: Elyon 0.0.4 K003-01..12 et K004-01..11 validés sur build_id=a181d6cac7ae
+[PASS] K004-12 qualification finale 0.0.4: K003-01..12 et K004-01..11 cohérents sur QEMU/OVMF 4 vCPU, boot nominal sans anomalie
+[PASS] #UD diagnostiqué puis arrêté en fail-closed (qemu rc=124)
+[PASS] #DF pris en charge sur l'IST dédiée puis arrêt fail-closed (qemu rc=124)
+```
+
+Validation croisée sous VMware Workstation Pro, UEFI, 4 vCPU, sur l'ISO construite depuis le même commit :
+
+```text
+[PASS] VMware 4 vCPU: Elyon 0.0.4 K003-01..12 et K004-01..11 validés sur build_id=e7416f1c5612
+```
+
+Les empreintes des binaires, les marqueurs, les synthèses de chaque critère sous VMware et les dettes reportées figurent dans [QUALIFICATION_0.0.4.md](QUALIFICATION_0.0.4.md).
+
+**K004-12 : PASS.**
+
+**Elyon 0.0.4 est qualifié.**
