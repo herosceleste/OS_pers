@@ -120,6 +120,16 @@ fn the_iret_frame_enters_ring_3_with_interrupts_enabled() {
 }
 
 #[test]
+fn the_iret_frame_layout_matches_the_enter_user_stub() {
+    assert_eq!(core::mem::offset_of!(IretFrame, rip), 0);
+    assert_eq!(core::mem::offset_of!(IretFrame, cs), 8);
+    assert_eq!(core::mem::offset_of!(IretFrame, rflags), 16);
+    assert_eq!(core::mem::offset_of!(IretFrame, rsp), 24);
+    assert_eq!(core::mem::offset_of!(IretFrame, ss), 32);
+    assert_eq!(core::mem::size_of::<IretFrame>(), 40);
+}
+
+#[test]
 fn the_iret_frame_refuses_a_kernel_target() {
     assert_eq!(
         ring3::iret_frame(0x0010_0000, ring3::USER_STACK_TOP),

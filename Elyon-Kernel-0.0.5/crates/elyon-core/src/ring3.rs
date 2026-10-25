@@ -118,7 +118,10 @@ pub fn check_kernel_entry(entry: u64) -> Result<(), Ring3Error> {
 }
 
 /// Cadre empilé avant `iretq` vers le ring 3, dans l'ordre où `iretq` le dépile.
+/// Disposition C : le stub `elyon_enter_user` lit ses champs aux offsets 0, 8,
+/// 16, 24 et 32.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
 pub struct IretFrame {
     pub rip: u64,
     pub cs: u64,

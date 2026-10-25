@@ -17,6 +17,7 @@ mod task;
 mod task_frames;
 mod task_stack;
 mod timer;
+mod user_probe;
 
 use core::panic::PanicInfo;
 
@@ -81,6 +82,12 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
     );
 
     idt::init(code_selector);
+    // K005-02 : seule porte atteignable par `int` depuis le ring 3.
+    idt::install_user_gate(
+        idt::USER_PROBE_EXIT_VECTOR,
+        code_selector,
+        idt::user_probe_exit_handler(),
+    );
     kprintln!("[arch] IDT=OK exceptions=diagnostic");
 
     if TEST_UD {
@@ -1194,6 +1201,53 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         Err(error) => {
             kprintln!(
                 "[segments] FAILED reason={} ticks={}",
+                error.as_str(),
+                timer::ticks()
+            );
+            fatal::halt_system();
+        }
+    }
+
+    match user_probe::qualify(
+        info.kernel_stack_start,
+        info.kernel_stack_end,
+        paging::identity_limit(),
+    ) {
+        Ok(Some(probe)) => {
+            let mut consistent = !probe.cr4_fsgsbase;
+            for (cpu, result) in probe.probes.iter().enumerate().take(probe.cpus).skip(1) {
+                kprintln!(
+                    "[ring3] cpu={} user_entries={} gs_failures={} exits={} exit_gs_ok={} fsgsbase_on={}",
+                    cpu,
+                    result.user_entries,
+                    result.gs_failures,
+                    result.exits,
+                    result.exit_gs_ok,
+                    result.fsgsbase_on
+                );
+                consistent &= result.user_entries >= user_probe::TARGET_ENTRIES
+                    && result.gs_failures == 0
+                    && result.exits == 1
+                    && result.exit_gs_ok == 1
+                    && result.fsgsbase_on == 0;
+            }
+            kprintln!(
+                "[ring3] swapgs aps={} target_entries={} cr4_fsgsbase={} user_base={:#x}",
+                probe.cpus - 1,
+                user_probe::TARGET_ENTRIES,
+                u8::from(probe.cr4_fsgsbase),
+                elyon_core::ring3::USER_BASE
+            );
+            if !consistent {
+                kprintln!("[ring3] FAILED reason=swapgs or ring 3 GS invariant violated");
+                fatal::halt_system();
+            }
+            kprintln!("ELYON_RING3_SWAPGS_READY");
+        }
+        Ok(None) => kprintln!("[ring3] skipped single_cpu=1"),
+        Err(error) => {
+            kprintln!(
+                "[ring3] FAILED reason={} ticks={}",
                 error.as_str(),
                 timer::ticks()
             );

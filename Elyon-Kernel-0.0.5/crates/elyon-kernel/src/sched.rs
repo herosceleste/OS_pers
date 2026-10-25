@@ -1492,7 +1492,7 @@ fn attach_fpu(id: task::TaskId) -> Result<(), SchedError> {
     Ok(())
 }
 
-fn spawn_on(
+pub(crate) fn spawn_on(
     affinity: u64,
     entry: u64,
     arg: u64,
@@ -1643,6 +1643,16 @@ fn leave_idle_if_work() -> Result<(), SchedError> {
     transfer(idle, next)
 }
 
+/// Nombre de CPU en ligne (K005-02 : sonde ring 3).
+pub fn online_cpus() -> usize {
+    online_mask().count_ones() as usize
+}
+
+/// Échec fatal depuis un autre module : diagnostic puis arrêt de tous les CPU.
+pub fn fail_from(error: SchedError) -> ! {
+    fail(error)
+}
+
 fn online_mask() -> u64 {
     use crate::arch::x86_64::percpu as cpus;
     let count = cpus::cpu_count().min(MAX_SCHED_CPUS);
@@ -1651,7 +1661,7 @@ fn online_mask() -> u64 {
         .fold(0u64, |mask, index| mask | (1 << index))
 }
 
-fn send_resched(target: usize) -> Result<(), SchedError> {
+pub(crate) fn send_resched(target: usize) -> Result<(), SchedError> {
     if !percpu_sched::should_send_ipi(target, this_cpu()) {
         return Ok(());
     }
@@ -1873,7 +1883,9 @@ fn switch_away(cpu: usize, current: u64, next: Option<u64>) -> Result<(), SchedE
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn elyon_resched_ipi_dispatch() {
+extern "C" fn elyon_resched_ipi_dispatch(saved_cs: u64) {
+    // K005-02 : une IRQ peut interrompre le ring 3 ; le stub a déjà fait `swapgs`.
+    crate::user_probe::note_entry(saved_cs);
     on_resched_ipi();
 }
 
@@ -2098,7 +2110,7 @@ pub fn qualify_remote(
     }))
 }
 
-fn wait_until(mut condition: impl FnMut() -> bool) -> Result<(), SchedError> {
+pub(crate) fn wait_until(mut condition: impl FnMut() -> bool) -> Result<(), SchedError> {
     for _ in 0..REMOTE_WAIT_STEPS {
         if condition() {
             return Ok(());
