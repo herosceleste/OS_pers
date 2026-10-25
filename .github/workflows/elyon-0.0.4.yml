@@ -175,7 +175,7 @@ jobs:
         working-directory: Elyon-Kernel-0.0.4
         run: bash scripts/test-timer-qemu.sh
 
-      - name: K003 baseline regression gate
+      - name: K004-12 final 0.0.4 qualification gate (K003 + K004 regressions)
         working-directory: Elyon-Kernel-0.0.4
         run: bash scripts/test-release-gate-qemu.sh
 
