@@ -92,7 +92,7 @@ ELYON_ENV="QEMU/OVMF" bash "$ROOT/scripts/validate-vmware-final.sh" "$LOG" "$BUI
 }
 
 {
-  echo "ELYON KERNEL 0.0.5 - RELEASE GATE (régressions K003-01..12, K004-01..11)"
+  echo "ELYON KERNEL 0.0.5 - RELEASE GATE (régressions K003-01..12, K004-01..11 ; K005-01)"
   echo "build_id=$BUILD_ID"
   echo "rust=$RUST_VERSION"
   echo "qemu_cpus=4"
@@ -105,9 +105,9 @@ ELYON_ENV="QEMU/OVMF" bash "$ROOT/scripts/validate-vmware-final.sh" "$LOG" "$BUI
   tr -d '\r' <"$LOG" | grep -E '^ELYON_[A-Z0-9_]+( |$)' || true
   echo
   echo "Final summaries:"
-  tr -d '\r' <"$LOG" | grep -E '^\[smp\] all_ready|^\[smp\] stability|^\[context\] result|^\[ioapic\] legacy_routes=|^\[timer\] ticks=|^\[task\] ids=|^\[task-stack\] tasks=|^\[sched\] policy=|^\[preempt\] policy=|^\[context-integrity\] tasks=|^\[fpu-integrity\] tasks=|^\[percpu-sched\] cpus=|^\[sched-ipi\] cpus=|^\[sched-sleep\] cpus=|^\[sched-sync\] (locks|cpus)|^\[stress\] ' || true
+  tr -d '\r' <"$LOG" | grep -E '^\[smp\] all_ready|^\[smp\] stability|^\[context\] result|^\[ioapic\] legacy_routes=|^\[timer\] ticks=|^\[task\] ids=|^\[task-stack\] tasks=|^\[sched\] policy=|^\[preempt\] policy=|^\[context-integrity\] tasks=|^\[fpu-integrity\] tasks=|^\[percpu-sched\] cpus=|^\[sched-ipi\] cpus=|^\[sched-sleep\] cpus=|^\[sched-sync\] (locks|cpus)|^\[stress\] |^\[segments\] ' || true
 } >"$EVIDENCE"
 
 cat "$EVIDENCE"
 
-echo "[PASS] gate de release 0.0.5: régressions K003-01..12 et K004-01..11 cohérentes sur QEMU/OVMF 4 vCPU, boot nominal sans anomalie"
+echo "[PASS] gate de release 0.0.5: régressions K003-01..12 et K004-01..11 et K005-01 cohérents sur QEMU/OVMF 4 vCPU, boot nominal sans anomalie"

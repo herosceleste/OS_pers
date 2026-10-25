@@ -167,6 +167,10 @@ jobs:
         working-directory: Elyon-Kernel-0.0.5
         run: bash scripts/test-sched-stress-qemu.sh
 
+      - name: K005-01 user segments and per-task RSP0 test
+        working-directory: Elyon-Kernel-0.0.5
+        run: bash scripts/test-segments-qemu.sh
+
       - name: IOAPIC regression
         working-directory: Elyon-Kernel-0.0.5
         run: bash scripts/test-ioapic-qemu.sh

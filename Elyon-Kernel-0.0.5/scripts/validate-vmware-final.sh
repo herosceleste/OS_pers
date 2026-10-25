@@ -142,6 +142,13 @@ ELYON_CHECK_LOG="$LOG" ELYON_CPUS=4 bash "$ROOT/scripts/test-sched-stress-qemu.s
   exit 1
 }
 
+# K005-01 : même contrôle indépendant que le test QEMU, appliqué au log.
+ELYON_CHECK_LOG="$LOG" ELYON_CPUS=4 bash "$ROOT/scripts/test-segments-qemu.sh" >/dev/null || {
+  echo "[FAIL] K005-01: segments ou RSP0 non conformes sous $ENV_NAME" >&2
+  ELYON_CHECK_LOG="$LOG" ELYON_CPUS=4 bash "$ROOT/scripts/test-segments-qemu.sh" 2>&1 >/dev/null | head -3 >&2
+  exit 1
+}
+
 require_fixed "ELYON_KERNEL_READY_0_0_5" "boot nominal final absent"
 
 if grep -Eq '\[KERNEL PANIC\]|\[EXCEPTION\]|\[[^]]+\] FAILED|ELYON_[A-Z_]+_FAILED' "$LOG"; then
@@ -150,4 +157,4 @@ if grep -Eq '\[KERNEL PANIC\]|\[EXCEPTION\]|\[[^]]+\] FAILED|ELYON_[A-Z_]+_FAILE
   exit 1
 fi
 
-echo "[PASS] $ENV_NAME 4 vCPU: Elyon 0.0.5 K003-01..12 et K004-01..11 validés sur build_id=$EXPECTED_BUILD_ID"
+echo "[PASS] $ENV_NAME 4 vCPU: Elyon 0.0.5 K003-01..12, K004-01..11 et K005-01 validés sur build_id=$EXPECTED_BUILD_ID"
