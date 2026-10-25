@@ -171,6 +171,10 @@ jobs:
         working-directory: Elyon-Kernel-0.0.5
         run: bash scripts/test-segments-qemu.sh
 
+      - name: K005-02 swapgs on every ring 3 entry test
+        working-directory: Elyon-Kernel-0.0.5
+        run: bash scripts/test-ring3-swapgs-qemu.sh
+
       - name: IOAPIC regression
         working-directory: Elyon-Kernel-0.0.5
         run: bash scripts/test-ioapic-qemu.sh
