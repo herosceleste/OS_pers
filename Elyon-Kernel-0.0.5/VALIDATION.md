@@ -1,6 +1,6 @@
 # Elyon Kernel 0.0.5 — Validation
 
-**EN COURS — K005-01 est validé. K005-02 à K005-12 restent à qualifier.**
+**EN COURS — K005-01 et K005-02 sont validés. K005-03 à K005-12 restent à qualifier.**
 
 ## Baseline héritée
 
@@ -11,7 +11,7 @@ La 0.0.5 est dérivée de la Release `v0.0.4`, dont les critères K003-01 à K00
 | Critère | Description | Statut |
 |---|---|---|
 | K005-01 | Segments utilisateur, `RSP0` par tâche | **PASS** |
-| K005-02 | `swapgs` à chaque entrée depuis le ring 3 | À faire |
+| K005-02 | `swapgs` à chaque entrée depuis le ring 3 | **PASS** |
 | K005-03 | Entrée « paranoïaque » NMI/#DF/#MC | À faire |
 | K005-04 | SMEP, SMAP et copies validées | À faire |
 | K005-05 | Pages utilisateur isolées et rendables | À faire |
@@ -81,3 +81,58 @@ Limites : RSP0 est le sommet de la pile sur laquelle la tâche s'exécute aussi 
 **K005-01 : PASS.**
 
 Le prochain critère est **K005-02 : `swapgs` à chaque entrée depuis le ring 3.**
+
+## K005-02 — `swapgs` à chaque entrée depuis le ring 3
+
+Du code s'exécute désormais en ring 3. Toute entrée depuis le ring 3 échange GS_BASE et KERNEL_GS_BASE avant que le noyau ne touche à sa zone per-CPU, et la sortie vers le ring 3 les rééchange : le noyau ne tourne jamais avec le GS d'un processus, et un processus ne voit jamais celui du noyau.
+
+La logique pure est dans `elyon_core::ring3`, testée sur l'hôte :
+
+- `from_user()` : une entrée vient du ring 3 quand le RPL du CS sauvegardé vaut 3, seul critère des stubs d'entrée ;
+- région utilisateur `USER_BASE` dans PML4[1], à 512 Gio : le mappage identité du noyau, dans PML4[0], ne reçoit jamais le bit U/S ;
+- `table_entry()`, `check_user_entry()` et `check_kernel_entry()` construisent et contrôlent les entrées de table de pages des deux chemins ;
+- `iret_frame()` construit le cadre `iretq` vers le ring 3 (CS `0x23`, SS `0x1b`, RFLAGS `0x202`, IOPL 0) et refuse une cible ou une pile hors de la région utilisateur, ou une pile mal alignée ; sa disposition C est figée par un test, l'asm la lisant à des offsets fixes ;
+- 14 tests.
+
+Côté noyau :
+
+- macros `SWAPGS_ON_ENTRY` et `SWAPGS_ON_EXIT` dans `idt.rs` : test du RPL du CS sauvegardé, `swapgs` si l'entrée vient du ring 3, `lfence` sur les deux chemins de l'entrée (variante Spectre SWAPGS), `swapgs` juste avant `iretq` vers le ring 3. Elles équipent les stubs du timer, de l'IPI de rescheduling, de l'IPI de stabilité et le chemin commun des exceptions ; le vecteur spurious n'accède pas à GS ;
+- `elyon_enter_user` masque les IRQ, empile le cadre, efface les 15 registres généraux, fait `swapgs` vers le GS utilisateur préparé dans KERNEL_GS_BASE, puis `iretq` ;
+- tables utilisateur propres (PDPT, PD, PT) sous PML4[1] ; `check_user_probe()` relit le bit U/S à chaque niveau du chemin utilisateur et son absence sur toutes les entrées du mappage identité de 4 Gio ;
+- `int 0x81` est la seule porte DPL 3 ; tout autre `int n` depuis le ring 3 lève #GP ; la porte n'est acceptée que pendant une sonde, sur le CPU sondé ;
+- `CR4.FSGSBASE` reste inactif : le ring 3 ne peut pas écrire sa base GS ; `EFER.SCE` est vérifié et forcé à 0 sur chaque AP, pour qu'un `syscall` lève #UD tant qu'il n'est pas configuré (K005-06).
+
+La qualification, exécutée après K005-01, sonde chaque AP à tour de rôle. Une page de code, en lecture seule, et une page de pile sont mappées dans la région utilisateur ; une tâche noyau du CPU sondé écrit un GS utilisateur propre à ce CPU dans KERNEL_GS_BASE et entre en ring 3, dans une boucle qui attend un drapeau au bas de sa page de pile. Le BSP lui envoie des IPI de rescheduling ; à chaque entrée depuis le ring 3, le dispatcher vérifie par les MSR, sans passer par GS, que GS_BASE est la zone per-CPU de ce CPU et que KERNEL_GS_BASE garde le GS utilisateur. Après 20 entrées, le noyau lève le drapeau ; la sonde sort par `int 0x81`, dont le dispatcher refait les mêmes contrôles, efface KERNEL_GS_BASE et termine la tâche, récupérée ensuite.
+
+Trois injections de faute ont été détectées : `swapgs` retiré à l'entrée (le noyau lit sa zone per-CPU à travers le GS de la sonde et prend une #PF à `CR2=0x8000101000`, exactement ce GS sur le CPU 1), `swapgs` retiré à la sortie (même faute à l'entrée suivante) et `swapgs` inconditionnel (les IRQ prises en mode noyau basculent sur le mauvais GS ; le scheduler s'arrête dès les régressions K004 : `task runs on a CPU outside its affinity`). Le script `test-ring3-swapgs-qemu.sh` exige une ligne par AP dans l'ordre, au moins 20 entrées, aucune erreur de GS, une sortie contrôlée, FSGSBASE et SCE inactifs, et relit CR4 en fin de boot, indépendamment.
+
+Le code a été relu par les agents ECC rust-reviewer et security-reviewer, sans point bloquant. Corrections retenues : section asm de la sonde non restaurée (`.pushsection`/`.popsection`), qui pouvait faire tomber les stubs de l'IDT dans `.rodata`, porte `int 0x81` liée à la sonde active, `EFER.SCE` contrôlé, KERNEL_GS_BASE effacé après la sonde, provenance des adresses du code copié, nettoyage de `ACTIVE` en cas d'échec.
+
+La qualification a été exécutée sur le commit `913dab778016`, GitHub Actions run **#7** du workflow Elyon 0.0.5, et en local sous QEMU 8.2.2 / OVMF, 4 vCPU, avec la suite complète de 26 tests QEMU.
+
+Preuves :
+
+```text
+[ring3] cpu=1 user_entries=20 gs_failures=0 exits=1 exit_gs_ok=1 fsgsbase_on=0 sce_on=0
+[ring3] cpu=2 user_entries=20 gs_failures=0 exits=1 exit_gs_ok=1 fsgsbase_on=0 sce_on=0
+[ring3] cpu=3 user_entries=20 gs_failures=0 exits=1 exit_gs_ok=1 fsgsbase_on=0 sce_on=0
+[ring3] swapgs aps=3 target_entries=20 cr4_fsgsbase=0 user_base=0x8000000000
+ELYON_RING3_SWAPGS_READY
+[PASS] K005-02 swapgs: code exécuté en ring 3 sur 3 AP, 60 entrées depuis le ring 3 avec GS_BASE noyau et GS utilisateur préservé, 3 sorties par int 0x81 contrôlées, CR4.FSGSBASE inactif (0x0000000000040668)
+```
+
+Validation croisée sous VMware Workstation Pro, UEFI, 4 vCPU, même build :
+
+```text
+[ring3] cpu=1 user_entries=20 gs_failures=0 exits=1 exit_gs_ok=1 fsgsbase_on=0 sce_on=0
+[ring3] cpu=2 user_entries=20 gs_failures=0 exits=1 exit_gs_ok=1 fsgsbase_on=0 sce_on=0
+[ring3] cpu=3 user_entries=20 gs_failures=0 exits=1 exit_gs_ok=1 fsgsbase_on=0 sce_on=0
+[ring3] swapgs aps=3 target_entries=20 cr4_fsgsbase=0 user_base=0x8000000000
+[PASS] VMware 4 vCPU: Elyon 0.0.5 K003-01..12, K004-01..11 et K005-01..02 validés sur build_id=913dab778016
+```
+
+Limites : seuls les stubs d'IRQ et la porte `int 0x81` sont exercés depuis le ring 3 ; une exception venue du ring 3 (#GP, #PF, #UD) fait `swapgs` mais arrête encore le système, K005-08 tuera le processus ; une NMI ou une #MC entre `swapgs` et `iretq`, ou une faute de `iretq` lui-même, trouve un CS noyau avec le GS utilisateur chargé : l'entrée « paranoïaque » de K005-03 le traitera ; NX, SMEP, SMAP et UMIP ne sont pas encore actifs (K005-04, K005-05) : la page de pile utilisateur est exécutable et le ring 3 peut lire les adresses de la GDT et de l'IDT par `sgdt`/`sidt` ; KERNEL_GS_BASE n'est pas sauvegardé par tâche ; la sonde voit l'image FPU propre de sa tâche, les vrais processus recevront une image propre explicite (K005-07).
+
+**K005-02 : PASS.**
+
+Le prochain critère est **K005-03 : entrée « paranoïaque » NMI/#DF/#MC.**
