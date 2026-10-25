@@ -1143,6 +1143,64 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         }
     }
 
+    match sched::qualify_segments(
+        info.kernel_stack_start,
+        info.kernel_stack_end,
+        paging::identity_limit(),
+    ) {
+        Ok(Some(seg)) => {
+            let layout = elyon_core::segments::LAYOUT;
+            kprintln!(
+                "[segments] layout kernel_code={:#x} kernel_data={:#x} user_data={:#x} user_code={:#x} tss={:#x} star={:#018x} gdt_cpus={:#x}",
+                layout.kernel_code,
+                layout.kernel_data,
+                elyon_core::segments::user_selector(layout.user_data),
+                elyon_core::segments::user_selector(layout.user_code),
+                layout.tss,
+                seg.star,
+                seg.gdt_cpus
+            );
+            kprintln!(
+                "[segments] rsp0 cpus={} tasks={} rounds={} checks={} mismatches={} live_rsp_ok={} live_rsp_failures={} gdt_failures={} distinct={} bsp_rsp0={:#x} running_max={}",
+                seg.cpus,
+                seg.tasks,
+                sched::SEG_ROUNDS,
+                seg.checks,
+                seg.mismatches,
+                seg.live_rsp_ok,
+                seg.live_rsp_failures,
+                seg.gdt_failures,
+                seg.distinct_rsp0,
+                seg.bsp_rsp0,
+                seg.running_max
+            );
+            let all_cpus = (1u64 << seg.cpus) - 1;
+            let consistent = seg.mismatches == 0
+                && seg.live_rsp_failures == 0
+                && seg.live_rsp_ok == seg.tasks as u64 * sched::SEG_ROUNDS
+                && seg.gdt_failures == 0
+                && seg.checks == seg.tasks as u64 * sched::SEG_ROUNDS
+                && seg.distinct_rsp0 == seg.tasks
+                && seg.gdt_cpus == all_cpus
+                && seg.bsp_rsp0 == 0
+                && seg.running_max == 1;
+            if !consistent {
+                kprintln!("[segments] FAILED reason=segment or RSP0 invariant violated");
+                fatal::halt_system();
+            }
+            kprintln!("ELYON_SEGMENTS_READY");
+        }
+        Ok(None) => kprintln!("[segments] skipped single_cpu=1"),
+        Err(error) => {
+            kprintln!(
+                "[segments] FAILED reason={} ticks={}",
+                error.as_str(),
+                timer::ticks()
+            );
+            fatal::halt_system();
+        }
+    }
+
     if framebuffer::draw_boot_screen(info, paging::identity_limit()) {
         kprintln!(
             "[display] framebuffer=OK {}x{} stride={}",
