@@ -9,19 +9,22 @@
 //! frame rendue au PMM. Un shootdown en échec laisse une traduction possible
 //! sur un autre CPU : le système s'arrête alors fail-closed.
 
+use core::mem::ManuallyDrop;
 use core::ptr::copy_nonoverlapping;
 
 use elyon_abi::PAGE_SIZE;
 use elyon_core::user_pages::{PageKind, UserPageError};
 
 use crate::arch::x86_64::paging;
-use crate::memory::{self, FrameRange};
-use crate::tlb::{self, TlbError};
-use crate::{fatal, kprintln};
+use crate::kprintln;
+use crate::memory::{self, FrameRange, PmmError};
+use crate::tlb;
 
+/// Erreur de création ou de libération d'une page utilisateur.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UserMemoryError {
     Page(UserPageError),
+    Pmm(PmmError),
     AllocationFailed,
     /// Contenu initial plus grand qu'une page.
     TooLarge,
@@ -31,6 +34,7 @@ impl UserMemoryError {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Page(error) => error.as_str(),
+            Self::Pmm(_) => "PMM refused to take the user frame back",
             Self::AllocationFailed => "PMM could not allocate a user page",
             Self::TooLarge => "initial content exceeds one page",
         }
@@ -52,15 +56,22 @@ pub struct UserPage {
     range: FrameRange,
 }
 
-fn shootdown_or_halt(address: u64) {
-    if let Err(error) = tlb::shootdown(address) {
-        fail(error);
-    }
+/// Rend au PMM une frame dont l'alias identité est présent et qu'aucun
+/// mappage utilisateur ne désigne plus sur aucun CPU.
+fn give_back(range: FrameRange) -> Result<(), UserMemoryError> {
+    memory::free(range).map_err(UserMemoryError::Pmm)
 }
 
-fn fail(error: TlbError) -> ! {
-    kprintln!("[user-memory] FAILED reason={}", error.as_str());
-    fatal::halt_system()
+/// Frame dont l'état ne permet plus de la rendre sans risque : elle reste
+/// allouée pour toujours, et la fuite est signalée.
+fn leak(range: FrameRange, reason: UserMemoryError) -> UserMemoryError {
+    kprintln!(
+        "[user-memory] leaked frame={:#018x} reason={}",
+        range.start(),
+        reason.as_str()
+    );
+    let _ = ManuallyDrop::new(range);
+    reason
 }
 
 impl UserPage {
@@ -71,37 +82,41 @@ impl UserPage {
 
     /// Comme `new`, avec une frame déjà prise par `allocate_owned` : la
     /// qualification connaît ainsi la frame avant d'en retirer l'alias. En
-    /// cas d'erreur, la frame retourne au PMM.
+    /// cas d'erreur, la frame retourne au PMM si aucun mappage utilisateur
+    /// ne peut plus l'atteindre, sinon elle reste allouée.
     pub fn from_range(
         range: FrameRange,
         va: u64,
         kind: PageKind,
         init: &[u8],
     ) -> Result<Self, UserMemoryError> {
-        // L'entrée utilisateur doit être libre.
-        let free_entry = paging::user_entry(va).map(|entry| entry == 0);
-        if init.len() as u64 > PAGE_SIZE || free_entry != Ok(true) {
-            let _ = memory::free(range);
-            return Err(match free_entry {
-                Err(error) => error.into(),
-                Ok(false) => UserMemoryError::Page(UserPageError::Leaf),
-                Ok(true) => UserMemoryError::TooLarge,
-            });
+        if init.len() as u64 > PAGE_SIZE {
+            give_back(range)?;
+            return Err(UserMemoryError::TooLarge);
         }
         let frame = range.start();
         // SAFETY: frame neuve et effacée, encore atteinte par son seul alias
         // identité, de taille PAGE_SIZE >= `init.len()`.
         unsafe { copy_nonoverlapping(init.as_ptr(), frame as *mut u8, init.len()) };
         if let Err(error) = paging::remove_identity_alias(frame) {
-            // L'alias est intact : la frame peut retourner au PMM.
-            let _ = memory::free(range);
+            // Alias déjà absent : la frame n'est pas dans l'état attendu, elle
+            // reste allouée. Sinon l'alias est intact et elle peut retourner
+            // au PMM.
+            if error == UserPageError::NotPresent {
+                return Err(leak(range, error.into()));
+            }
+            give_back(range)?;
             return Err(error.into());
         }
-        shootdown_or_halt(frame);
+        tlb::shootdown(frame);
         if let Err(error) = paging::map_user_leaf(va, frame, kind) {
-            if paging::restore_identity_alias(frame).is_ok() {
-                let _ = memory::free(range);
+            // `map_user_leaf` a retiré toute feuille écrite ; une traduction
+            // spéculative ailleurs disparaît avec le shootdown.
+            tlb::shootdown(va);
+            if let Err(restore) = paging::restore_identity_alias(frame) {
+                return Err(leak(range, restore.into()));
             }
+            give_back(range)?;
             return Err(error.into());
         }
         Ok(Self { va, kind, range })
@@ -120,23 +135,25 @@ impl UserPage {
         Ok(())
     }
 
-    /// Page permanente : jamais libérée, sa frame reste au ring 3. Le jeton
-    /// de la frame est abandonné sans `free` : elle reste marquée allouée.
+    /// Page permanente : jamais libérée, sa frame reste au ring 3 et allouée.
     pub fn keep(self) {
-        let Self { range, .. } = self;
-        let _permanent = range;
+        let _ = ManuallyDrop::new(self.range);
     }
 
     /// Retire la page du ring 3 sur tous les CPU, puis rend la frame.
     pub fn release(self) -> Result<(), UserMemoryError> {
         let frame = self.frame();
-        if paging::unmap_user_leaf(self.va)? != frame {
-            return Err(UserMemoryError::Page(UserPageError::Leaf));
+        if let Err(error) = paging::unmap_user_leaf(self.va, frame) {
+            // L'entrée ne désigne pas cette frame : rien n'a été retiré, la
+            // frame reste à son propriétaire actuel.
+            return Err(leak(self.range, error.into()));
         }
         // Aucune traduction utilisateur ne doit survivre au retour de la
         // frame au PMM.
-        shootdown_or_halt(self.va);
-        paging::restore_identity_alias(frame)?;
-        memory::free(self.range).map_err(|_| UserMemoryError::AllocationFailed)
+        tlb::shootdown(self.va);
+        if let Err(error) = paging::restore_identity_alias(frame) {
+            return Err(leak(self.range, error.into()));
+        }
+        give_back(self.range)
     }
 }

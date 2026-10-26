@@ -72,7 +72,7 @@ for index in "${!PROBES[@]}"; do
 done
 
 summary="$(grep -E '^\[usermem\] pages ' <<<"$CLEAN" || true)"
-[[ "$summary" =~ ^\[usermem\]\ pages\ cpus=$CPUS\ user_pages=$PERMANENT_PAGES/$PERMANENT_PAGES\ owned=$PERMANENT_PAGES/$PERMANENT_PAGES\ kernel_identity_user=0\ split_tables=([0-9]+)\ pmm_balanced=1$ ]] \
+[[ "$summary" =~ ^\[usermem\]\ pages\ cpus=$CPUS\ user_pages=$PERMANENT_PAGES/$PERMANENT_PAGES\ owned=$PERMANENT_PAGES/$PERMANENT_PAGES\ kernel_identity_user=0\ split_tables=([0-9]+)\ pmm_balanced=1\ tlb_eoi_errors=0$ ]] \
   || fail "synthèse inattendue: $summary"
 split="${BASH_REMATCH[1]}"
 (( split >= 1 )) || fail "aucune grande page du mappage identité découpée: $summary"

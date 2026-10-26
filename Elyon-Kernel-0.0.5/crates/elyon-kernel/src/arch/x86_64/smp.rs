@@ -456,6 +456,14 @@ extern "sysv64" fn elyon_ap_entry(cpu_index: u64, expected_apic_id: u64) -> ! {
         );
         cpu::halt_forever();
     }
+    // K005-05 : un shootdown lancé avant `mark_online` n'a pas visé ce CPU,
+    // dont la TLB peut déjà tenir des traductions du mappage identité. Les
+    // vider ici (aucune page n'est globale) ferme cette fenêtre : tout
+    // shootdown ultérieur le vise.
+    // SAFETY: recharger CR3 avec sa propre valeur vide la TLB de ce CPU.
+    unsafe {
+        core::arch::asm!("mov {0}, cr3", "mov cr3, {0}", out(reg) _, options(nostack, preserves_flags))
+    };
 
     kprintln!(
         "[smp] AP online cpu={} apic_id={} selector={:#x} tr={:#x}",

@@ -8,14 +8,17 @@
 //! acquitté cette génération après son propre `invlpg`. Une seule invalidation
 //! est en vol à la fois ; un CPU qui attend son tour sert entre-temps celle qui
 //! le vise : deux émetteurs IRQ masquées ne peuvent pas s'interbloquer.
+//! Tout le shootdown tourne IRQ masquées, sur le CPU qui l'a commencé. Un
+//! échec laisse une traduction possible ailleurs : le système s'arrête alors,
+//! invalidation toujours en vol, pour qu'aucun autre CPU ne reprenne.
 
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use elyon_core::user_pages;
 
-use crate::arch::x86_64::{apic, cpu_local, percpu};
-use crate::sched;
+use crate::arch::x86_64::{apic, cpu, cpu_local, percpu};
+use crate::{fatal, kprintln, sched};
 
 pub const TLB_VECTOR: u8 = 0xF3;
 /// Tours de `pause` au plus en attente des acquittements (plusieurs secondes).
@@ -27,6 +30,8 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 /// Dernière génération invalidée par chaque CPU.
 static ACKS: [AtomicU64; sched::MAX_SCHED_CPUS] =
     [const { AtomicU64::new(0) }; sched::MAX_SCHED_CPUS];
+/// EOI refusés par l'APIC dans le gestionnaire d'IPI.
+static EOI_ERRORS: AtomicU64 = AtomicU64::new(0);
 /// IPI de shootdown reçues, par CPU.
 static RECEIVED: [AtomicU64; sched::MAX_SCHED_CPUS] =
     [const { AtomicU64::new(0) }; sched::MAX_SCHED_CPUS];
@@ -58,7 +63,9 @@ fn service(cpu: usize) {
     let generation = GENERATION.load(Ordering::Acquire);
     if cpu < sched::MAX_SCHED_CPUS && ACKS[cpu].load(Ordering::Acquire) < generation {
         invalidate_local(ADDRESS.load(Ordering::Acquire));
-        ACKS[cpu].store(generation, Ordering::Release);
+        // `fetch_max` : un acquittement plus récent, posé entre-temps par
+        // l'IPI, n'est jamais ramené en arrière.
+        ACKS[cpu].fetch_max(generation, Ordering::AcqRel);
     }
 }
 
@@ -69,7 +76,9 @@ extern "C" fn elyon_tlb_ipi_dispatch() {
         RECEIVED[cpu].fetch_add(1, Ordering::AcqRel);
     }
     service(cpu);
-    let _ = apic::eoi();
+    if !apic::eoi() {
+        EOI_ERRORS.fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 fn online_mask() -> u64 {
@@ -78,9 +87,10 @@ fn online_mask() -> u64 {
         .fold(0u64, |mask, index| mask | (1 << index))
 }
 
-/// Invalide `address` sur tous les CPU en ligne. Un échec laisse une
-/// traduction possible ailleurs : l'appelant doit s'arrêter fail-closed.
-pub fn shootdown(address: u64) -> Result<(), TlbError> {
+/// Invalide `address` sur tous les CPU en ligne, ou arrête le système.
+pub fn shootdown(address: u64) {
+    let interrupts = cpu::interrupts_enabled();
+    cpu::disable_interrupts();
     let cpu = cpu_local::index();
     invalidate_local(address);
     while IN_FLIGHT
@@ -90,9 +100,18 @@ pub fn shootdown(address: u64) -> Result<(), TlbError> {
         service(cpu);
         core::hint::spin_loop();
     }
-    let result = broadcast(cpu, address);
+    if let Err(error) = broadcast(cpu, address) {
+        kprintln!(
+            "[tlb] FAILED reason={} address={:#018x}",
+            error.as_str(),
+            address
+        );
+        fatal::halt_system();
+    }
     IN_FLIGHT.store(false, Ordering::Release);
-    result
+    if interrupts {
+        cpu::enable_interrupts();
+    }
 }
 
 fn broadcast(cpu: usize, address: u64) -> Result<(), TlbError> {
@@ -103,6 +122,9 @@ fn broadcast(cpu: usize, address: u64) -> Result<(), TlbError> {
     // L'adresse est publiée avant la génération qui la désigne : un CPU qui
     // voit la nouvelle génération lit cette adresse.
     ADDRESS.store(address, Ordering::Release);
+    // L'écriture `fetch_add` verrouillée est une barrière complète : les
+    // tables modifiées sont visibles avant l'IPI, même en x2APIC où l'écriture
+    // de l'ICR par `wrmsr` ne sérialise pas.
     let generation = GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
     for target in (0..sched::MAX_SCHED_CPUS).filter(|&target| targets & (1 << target) != 0) {
         let apic_id = percpu::snapshot(target).ok_or(TlbError::Ipi)?.apic_id;
@@ -122,4 +144,9 @@ fn broadcast(cpu: usize, address: u64) -> Result<(), TlbError> {
 /// IPI de shootdown reçues par `cpu` depuis le boot.
 pub fn received(cpu: usize) -> u64 {
     RECEIVED[cpu].load(Ordering::Acquire)
+}
+
+/// EOI refusés par l'APIC dans le gestionnaire de shootdown depuis le boot.
+pub fn eoi_errors() -> u64 {
+    EOI_ERRORS.load(Ordering::Acquire)
 }

@@ -1534,13 +1534,15 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
                 consistent &= result.ok(cpu == 0);
             }
             kprintln!(
-                "[usermem] pages cpus={} user_pages={}/4 owned={}/4 kernel_identity_user=0 split_tables={} pmm_balanced={}",
+                "[usermem] pages cpus={} user_pages={}/4 owned={}/4 kernel_identity_user=0 split_tables={} pmm_balanced={} tlb_eoi_errors={}",
                 probe.cpus,
                 probe.user_pages,
                 probe.owned,
                 probe.split_tables,
-                u8::from(probe.pmm_balanced)
+                u8::from(probe.pmm_balanced),
+                tlb::eoi_errors()
             );
+            consistent &= tlb::eoi_errors() == 0;
             if !consistent {
                 kprintln!("[usermem] FAILED reason=user page or identity alias invariant violated");
                 fatal::halt_system();
