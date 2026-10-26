@@ -8,6 +8,11 @@
 //! bornée. Une #PF sur l'instruction de copie, venue du noyau, sur une adresse
 //! utilisateur et avec AC levé, reprend au point de reprise de la copie, qui
 //! rend une erreur ; toute autre faute reste fatale.
+//!
+//! Invariant : la région utilisateur (PML4[1] et au-delà) ne contient jamais
+//! de page superviseur. SMAP n'arrête que les accès aux pages U/S ; une page
+//! du noyau mappée là serait atteinte par une adresse fournie par le ring 3,
+//! `user_range` ne regardant que l'adresse.
 
 use crate::ring3::{self, USER_BASE};
 
@@ -165,6 +170,7 @@ pub struct UserRange {
 }
 
 impl UserRange {
+    /// Fin exclue ; sans débordement pour une plage rendue par `user_range`.
     pub const fn end(self) -> u64 {
         self.start + self.len
     }
@@ -204,11 +210,12 @@ const fn kernel_page_fault(site: &FaultSite) -> bool {
 /// RIP de reprise d'une faute de copie, ou `None` si la faute est fatale.
 /// Seule l'instruction de copie (`access`) est reprise, pour une #PF du
 /// noyau sur une adresse utilisateur, en lecture ou en écriture de données,
-/// pendant la fenêtre `stac`/`clac`.
+/// pendant la fenêtre `stac`/`clac`. Tout autre bit du code d'erreur (RSVD,
+/// PK, SGX, fetch) signale un bogue du noyau, jamais une erreur de copie.
 pub const fn copy_resume(site: &FaultSite, access: u64, fixup: u64) -> Option<u64> {
     if !kernel_page_fault(site)
         || site.rip != access
-        || site.error_code & PF_INSTRUCTION != 0
+        || site.error_code & !(PF_PRESENT | PF_WRITE) != 0
         || site.rflags & RFLAGS_AC == 0
         || !ring3::is_user_address(site.cr2)
     {
