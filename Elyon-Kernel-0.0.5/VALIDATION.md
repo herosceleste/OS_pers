@@ -1,6 +1,6 @@
 # Elyon Kernel 0.0.5 — Validation
 
-**EN COURS — K005-01 et K005-02 sont validés. K005-03 à K005-12 restent à qualifier.**
+**EN COURS — K005-01 à K005-03 sont validés. K005-04 à K005-12 restent à qualifier.**
 
 ## Baseline héritée
 
@@ -12,7 +12,7 @@ La 0.0.5 est dérivée de la Release `v0.0.4`, dont les critères K003-01 à K00
 |---|---|---|
 | K005-01 | Segments utilisateur, `RSP0` par tâche | **PASS** |
 | K005-02 | `swapgs` à chaque entrée depuis le ring 3 | **PASS** |
-| K005-03 | Entrée « paranoïaque » NMI/#DF/#MC | À faire |
+| K005-03 | Entrée « paranoïaque » NMI/#DF/#MC | **PASS** |
 | K005-04 | SMEP, SMAP et copies validées | À faire |
 | K005-05 | Pages utilisateur isolées et rendables | À faire |
 | K005-06 | `syscall`/`sysret` sans fuite de registres | À faire |
@@ -136,3 +136,105 @@ Limites : seuls les stubs d'IRQ et la porte `int 0x81` sont exercés depuis le r
 **K005-02 : PASS.**
 
 Le prochain critère est **K005-03 : entrée « paranoïaque » NMI/#DF/#MC.**
+
+## K005-03 — Entrée « paranoïaque » NMI/#DF/#MC
+
+Une NMI, une #DF ou une #MC peut arriver n'importe où, y compris entre le `swapgs` de sortie et l'`iretq` vers le ring 3 : le CS sauvegardé est alors celui du noyau alors que GS_BASE porte déjà le GS utilisateur. L'entrée de ces trois vecteurs ne se fie donc plus au RPL du CS : elle relit GS_BASE et le compare à la valeur que le noyau a rangée pour ce CPU.
+
+La logique pure est dans `elyon_core::paranoid`, testée sur l'hôte :
+
+- une IST dédiée par vecteur : #DF=1, NMI=2, #MC=3 ;
+- `ist_pointer()` : le pointeur IST du TSS laisse au sommet de chaque pile un emplacement de 16 octets qui contient le GS_BASE noyau du CPU, et refuse une pile nulle, non canonique ou de moins de 16 Kio ;
+- `check_spans()` : toutes les piles IST de tous les CPU sont valides et deux à deux disjointes ;
+- `SLOT_OFFSET` donne la position de ce mot depuis RSP dans le stub ; un test la fige ;
+- `decode_gate()` et `check_gate()` contrôlent une porte relue dans l'IDT chargée. Elle doit être présente, DPL 0, de type interruption (une porte de trappe laisserait IF actif), sur son IST, et viser le bon sélecteur et le bon gestionnaire ;
+- `check_observation()` exige le GS d'entrée attendu (sinon la condition testée n'a pas eu lieu), le GS noyau au moment du dispatch, l'index du CPU lu via GS et un RSP dans l'IST ;
+- `check_mce()` exige CR4.MCE quand CPUID annonce MCE : sans lui, une #MC met le CPU en arrêt ;
+- 22 tests.
+
+Côté noyau :
+
+- les stubs NMI, #DF et #MC (`elyon_paranoid_common` dans `idt.rs`) poussent les registres, lisent le MSR GS_BASE et l'empilent. S'il diffère du mot au sommet de l'IST, ils y écrivent la valeur noyau par `wrmsr`, puis exécutent `lfence` sur les deux chemins. Au retour, ils réécrivent le GS_BASE d'entrée et font `iretq`. Il n'y a pas de `swapgs`, et KERNEL_GS_BASE n'est jamais touché ;
+- `gdt::prepare_for_cpu()` vérifie les trois piles avant de les installer. Il écrit le mot GS noyau puis le pointeur IST du TSS, et s'arrête avec le message d'erreur si une pile est invalide ou en chevauche une autre. Chaque AP reçoit trois piles IST de 16 Kio, et le BSP reçoit des piles statiques ;
+- la sortie vers le ring 3 passe par un point unique : `elyon_return_to_user: swapgs` suivi de `elyon_user_iret: iretq`. Il sert aux stubs d'IRQ (macro `IRET_TO_ORIGIN`) et à `elyon_enter_user`. Une faute de cet `iretq` arrive avec un CS noyau et le GS utilisateur : `elyon_exception_common` fait donc `swapgs` quand le RIP sauvegardé est `elyon_user_iret`, en plus du cas RPL 3 ;
+- CR4.MCE est activé sur le BSP après l'IDT, et sur chaque AP après le chargement de l'IDT ;
+- `apic::send_nmi()` envoie une vraie NMI à un AP.
+
+La qualification s'exécute après K005-02. Sur chaque AP, le BSP envoie une vraie NMI pendant que l'AP est en mode noyau. Il en envoie une deuxième pendant que l'AP attend dans une fenêtre qui reproduit la sortie : GS_BASE est remplacé par un GS utilisateur non mappé propre au CPU, après le `swapgs` et avant l'`iretq`. L'AP exécute ensuite `int 18` dans la même fenêtre. Sur le BSP, `int 2` et `int 18` sont exécutés dans la fenêtre. Chaque événement est vérifié par les MSR, sans passer par GS : GS d'entrée, GS noyau pendant le dispatch, index du CPU, RSP dans l'IST dédiée, puis GS d'entrée restauré après `iretq`. Le gestionnaire de sonde n'accepte qu'un seul événement à la fois, uniquement sur le CPU sondé, et refuse une vraie #MC matérielle (MCG_STATUS.MCIP). La qualification relit aussi les portes 2, 8 et 18 dans l'IDT chargée, les 12 mots GS au sommet des IST et CR4.MCE sur chaque CPU.
+
+Deux régressions complètent la qualification :
+
+- `test-df-qemu.sh` lève une #DF avec un GS utilisateur dans GS_BASE ;
+- `test-user-iret-qemu.sh` fait échouer l'`iretq` de sortie avec un CS invalide (#GP 0x38). Le diagnostic doit se faire avec le GS noyau et en une seule exception.
+
+Six injections de faute ont été détectées :
+
+| Injection | Détection |
+|---|---|
+| `wrmsr` d'entrée retiré | DispatchGs sur les événements de la fenêtre |
+| GS d'entrée non restauré à la sortie | `restored=1` |
+| NMI sans IST | `gates_ok=0` |
+| CR4.MCE absent sur les AP | `cr4_mce=0` |
+| Contrôle du RIP `elyon_user_iret` retiré | cascade de #PF et échec de la régression `iretq` |
+| #DF fondée sur le CS au lieu de GS_BASE | `replaced=0` et échec de la régression #DF |
+
+Le script `test-paranoid-qemu.sh` exige :
+
+- la ligne BSP ;
+- une ligne par AP, dans l'ordre ;
+- le résumé ;
+- l'ordre des marqueurs.
+
+Il relit aussi CR4 en fin de boot, de façon indépendante.
+
+Le code a été relu par les agents ECC rust-reviewer et security-reviewer, sans point bloquant. Corrections retenues :
+
+- gestionnaire de sonde à un seul événement, lié au CPU et au GS de la sonde ;
+- refus d'une #MC matérielle ;
+- sonde BSP à l'exécution ;
+- commentaire SAFETY et message d'erreur dans `prepare_for_cpu` ;
+- recompilation forcée et variables de test effacées dans `build.sh` ;
+- invariants du chemin paranoïaque documentés dans l'asm.
+
+La qualification a été exécutée sur le commit `41589af0a684` : run GitHub Actions **#11** du workflow Elyon 0.0.5, et en local sous QEMU 8.2.2 / OVMF, 4 vCPU, avec la suite complète de 35 tests (34 rejoués sur `a69deeb`, `test-df-qemu.sh` sur `41589af`). Les sondes paranoïaque et `iretq` ont été rejouées sur `a69deeb`, dont le code noyau est identique ; `41589af` ne modifie que `test-df-qemu.sh`, rejoué sur ce commit.
+
+Preuves :
+
+```text
+[paranoid] bsp nmi_soft_window=1 mc_window=1 replaced=2 restored=2
+[paranoid] cpu=1 nmi_kernel=1 nmi_window=1 mc_window=1 replaced=2 restored=3 gates_ok=1 cr4_mce=1
+[paranoid] cpu=2 nmi_kernel=1 nmi_window=1 mc_window=1 replaced=2 restored=3 gates_ok=1 cr4_mce=1
+[paranoid] cpu=3 nmi_kernel=1 nmi_window=1 mc_window=1 replaced=2 restored=3 gates_ok=1 cr4_mce=1
+[paranoid] entry aps=3 cpus=4 ist_df=1 ist_nmi=2 ist_mc=3 slots_ok=12/12 bsp_gates_ok=1 bsp_cr4_mce=1
+ELYON_PARANOID_ENTRY_READY
+[PASS] K005-03 paranoid: sur 3 AP, NMI en mode noyau puis NMI et #MC dans la fenêtre swapgs/iretq servis avec le GS noyau sur leur IST dédiée, GS d'entrée restauré ; BSP : int 2 et int 18 dans la fenêtre ; 12 piles IST disjointes (#DF=1, NMI=2, #MC=3) ; CR4.MCE actif (0x0000000000040668)
+[EXCEPTION] paranoid entry_gs=0x0000008000300000 gs_base=0x000000000020f040 replaced=1
+[PASS] #DF pris en charge sur l'IST dédiée, GS utilisateur 0x0000008000300000 remplacé par l'entrée paranoïaque, puis arrêt fail-closed (qemu rc=124)
+[EXCEPTION] user iret fault gs_base=0x000000000020f040 kernel_gs=1
+[PASS] K005-03 iretq: #GP de l'iretq de sortie (0x00000000002012b3) diagnostiqué avec le GS noyau, GS utilisateur 0x0000008000300000 écarté, arrêt fail-closed (qemu rc=124)
+```
+
+Validation croisée sous VMware Workstation Pro, UEFI, 4 vCPU, même build (ISO sha256 `9cdb1b0c09de53067891339a97782390c2e69000c807d2e271bb28adbadd1b88`) :
+
+```text
+[kernel] build_id=41589af0a684
+[paranoid] bsp nmi_soft_window=1 mc_window=1 replaced=2 restored=2
+[paranoid] cpu=1 nmi_kernel=1 nmi_window=1 mc_window=1 replaced=2 restored=3 gates_ok=1 cr4_mce=1
+[paranoid] cpu=2 nmi_kernel=1 nmi_window=1 mc_window=1 replaced=2 restored=3 gates_ok=1 cr4_mce=1
+[paranoid] cpu=3 nmi_kernel=1 nmi_window=1 mc_window=1 replaced=2 restored=3 gates_ok=1 cr4_mce=1
+[paranoid] entry aps=3 cpus=4 ist_df=1 ist_nmi=2 ist_mc=3 slots_ok=12/12 bsp_gates_ok=1 bsp_cr4_mce=1
+ELYON_PARANOID_ENTRY_READY
+[PASS] VMware 4 vCPU: Elyon 0.0.5 K003-01..12, K004-01..11 et K005-01..03 validés sur build_id=41589af0a684
+```
+
+Limites :
+
+- les piles IST n'ont pas de page de garde : un débordement écrase la mémoire voisine sans faute ;
+- une NMI imbriquée (une NMI arrivée après un `iretq` qui rouvre la fenêtre NMI pendant le gestionnaire) réutiliserait la même IST : le dispatch paranoïaque ne fait donc ni `sti`, ni `iretq`, ni faute récupérable ;
+- la #MC n'est exercée que par `int 18`, pas par une vraie erreur machine ;
+- une NMI hors sonde (watchdog, panne) reste fatale : elle est diagnostiquée puis le CPU s'arrête ;
+- les cadres alloués au boot ne sont pas rendus si une allocation IST échoue, ce qui arrête le boot.
+
+**K005-03 : PASS.**
+
+Le prochain critère est **K005-04 : SMEP et SMAP actifs ; copie validée entre espace utilisateur et noyau (`stac`/`clac`).**
