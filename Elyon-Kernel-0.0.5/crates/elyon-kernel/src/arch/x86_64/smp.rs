@@ -69,7 +69,10 @@ elyon_ap_trampoline_pm32:
 
     mov ecx, 0xc0000080
     rdmsr
-    or eax, 0x100
+    // LME et NXE (K005-05) : les tables partagées portent déjà des entrées NX,
+    // que ce CPU lira dès la pagination activée. Le BSP a vérifié NX par CPUID
+    // avant de démarrer les AP.
+    or eax, 0x900
     wrmsr
 
     mov eax, cr0
@@ -397,6 +400,10 @@ extern "sysv64" fn elyon_ap_entry(cpu_index: u64, expected_apic_id: u64) -> ! {
         kprintln!("[smp] AP FAILED cpu={} reason={}", index, error.as_str());
         cpu::halt_forever();
     }
+    if let Err(error) = elyon_core::user_pages::check_efer(cpu::read_efer()) {
+        kprintln!("[smp] AP FAILED cpu={} reason={}", index, error.as_str());
+        cpu::halt_forever();
+    }
     idt::load();
     // K005-03 : le trampoline ne laisse que CR4.PAE ; sans MCE, un #MC
     // arrêterait cet AP au lieu d'entrer dans le gestionnaire.
@@ -449,6 +456,14 @@ extern "sysv64" fn elyon_ap_entry(cpu_index: u64, expected_apic_id: u64) -> ! {
         );
         cpu::halt_forever();
     }
+    // K005-05 : un shootdown lancé avant `mark_online` n'a pas visé ce CPU,
+    // dont la TLB peut déjà tenir des traductions du mappage identité. Les
+    // vider ici (aucune page n'est globale) ferme cette fenêtre : tout
+    // shootdown ultérieur le vise.
+    // SAFETY: recharger CR3 avec sa propre valeur vide la TLB de ce CPU.
+    unsafe {
+        core::arch::asm!("mov {0}, cr3", "mov cr3, {0}", out(reg) _, options(nostack, preserves_flags))
+    };
 
     kprintln!(
         "[smp] AP online cpu={} apic_id={} selector={:#x} tr={:#x}",

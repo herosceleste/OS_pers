@@ -23,6 +23,7 @@ pub mod sync;
 pub mod task_stack;
 pub mod timer_queue;
 pub mod user_access;
+pub mod user_pages;
 
 #[cfg(test)]
 mod tests {

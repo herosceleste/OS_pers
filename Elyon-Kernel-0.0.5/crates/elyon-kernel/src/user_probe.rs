@@ -13,18 +13,19 @@
 //! tâche.
 
 use core::arch::{asm, global_asm};
-use core::ptr::{copy_nonoverlapping, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use elyon_abi::PAGE_SIZE;
 use elyon_core::ring3::{self, Ring3Error};
 use elyon_core::task_stack::StackRegion;
 use elyon_core::user_access;
+use elyon_core::user_pages::PageKind;
 
 use crate::arch::x86_64::{cpu, cpu_local, idt, paging};
 use crate::sched::{self, ReapOutcome, SchedError};
 use crate::task::{self, TaskState};
-use crate::{memory, timer};
+use crate::user_memory::{UserMemoryError, UserPage};
+use crate::{timer, user_copy};
 
 const IA32_GS_BASE: u32 = 0xC000_0101;
 const IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
@@ -80,7 +81,9 @@ unsafe extern "C" {
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static PROBE_CPU: AtomicU64 = AtomicU64::new(u64::MAX);
 static EXPECTED_USER_GS: AtomicU64 = AtomicU64::new(0);
-static FLAG_FRAME: AtomicU64 = AtomicU64::new(0);
+/// K005-05 : frames des pages de code et de pile, pour la qualification.
+static CODE_FRAME: AtomicU64 = AtomicU64::new(0);
+static STACK_FRAME: AtomicU64 = AtomicU64::new(0);
 static USER_ENTRIES: AtomicU64 = AtomicU64::new(0);
 static GS_FAILURES: AtomicU64 = AtomicU64::new(0);
 static EXITS: AtomicU64 = AtomicU64::new(0);
@@ -98,6 +101,7 @@ pub enum ProbeError {
     Sched(SchedError),
     Ring3(Ring3Error),
     AllocationFailed,
+    Memory(UserMemoryError),
     /// La sonde n'est pas sortie du ring 3 dans le délai.
     Timeout,
 }
@@ -108,6 +112,7 @@ impl ProbeError {
             Self::Sched(error) => error.as_str(),
             Self::Ring3(error) => error.as_str(),
             Self::AllocationFailed => "PMM could not allocate the ring 3 probe pages",
+            Self::Memory(error) => error.as_str(),
             Self::Timeout => "ring 3 probe did not exit in time",
         }
     }
@@ -182,9 +187,11 @@ pub fn note_entry(saved_cs: u64) {
         AC_LEAKS.fetch_add(1, Ordering::AcqRel);
     }
     if USER_ENTRIES.fetch_add(1, Ordering::AcqRel) + 1 >= TARGET_ENTRIES {
-        // SAFETY: la page de pile de la sonde, mappée en identité, n'est lue
-        // que par la boucle utilisateur de ce CPU.
-        unsafe { write_volatile(FLAG_FRAME.load(Ordering::Acquire) as *mut u64, 1) };
+        // K005-05 : la page de pile n'a plus d'alias identité ; le drapeau
+        // passe par la copie validée, comme toute écriture vers le ring 3.
+        // Un échec laisse la boucle utilisateur tourner : la sonde dépasse
+        // alors son délai et la qualification échoue.
+        let _ = user_copy::copy_to_user(ring3::USER_STACK_VA, &1u64.to_ne_bytes());
     }
 }
 
@@ -279,23 +286,21 @@ pub fn qualify(
         end: bsp_stack_end,
     };
 
-    // Pages permanentes de la sonde : code (lecture seule pour le ring 3) et pile.
-    let code = memory::allocate_frame().ok_or(ProbeError::AllocationFailed)?;
-    let stack = memory::allocate_frame().ok_or(ProbeError::AllocationFailed)?;
-    // SAFETY: le code de la sonde est une plage statique du noyau, plus petite
-    // qu'une page ; la page de code vient d'être allouée et est mappée en identité.
-    unsafe {
-        let start = (&raw const elyon_user_probe_code_start) as usize;
-        let end = (&raw const elyon_user_probe_code_end) as usize;
-        let len = end - start;
-        if len > PAGE_SIZE as usize {
-            return Err(ProbeError::AllocationFailed);
-        }
-        copy_nonoverlapping(start as *const u8, code as *mut u8, len);
-    }
-    paging::map_user_probe(code, stack)?;
-    paging::check_user_probe()?;
-    FLAG_FRAME.store(stack, Ordering::Release);
+    // Pages permanentes de la sonde (K005-05 : prises par `allocate_owned`,
+    // sans alias identité) : code en lecture seule, pile non exécutable.
+    let start = (&raw const elyon_user_probe_code_start) as usize;
+    let end = (&raw const elyon_user_probe_code_end) as usize;
+    // SAFETY: plage statique du noyau, de `start` à `end`.
+    let code_bytes = unsafe { core::slice::from_raw_parts(start as *const u8, end - start) };
+    let code = UserPage::new(ring3::USER_CODE_VA, PageKind::Code, code_bytes)
+        .map_err(ProbeError::Memory)?;
+    let stack =
+        UserPage::new(ring3::USER_STACK_VA, PageKind::Data, &[]).map_err(ProbeError::Memory)?;
+    paging::check_kernel_identity()?;
+    CODE_FRAME.store(code.frame(), Ordering::Release);
+    STACK_FRAME.store(stack.frame(), Ordering::Release);
+    code.keep();
+    stack.keep();
 
     let entry = elyon_user_probe_task_entry as *const () as usize as u64;
     let mut probes = [CpuProbe::default(); MAX_PROBED_CPUS];
@@ -312,8 +317,9 @@ pub fn qualify(
         ] {
             counter.store(0, Ordering::Release);
         }
-        // SAFETY: page de pile de la sonde, mappée en identité ; aucune sonde ne tourne.
-        unsafe { write_volatile(stack as *mut u64, 0) };
+        // Aucune sonde ne tourne : le drapeau est remis à zéro.
+        user_copy::copy_to_user(ring3::USER_STACK_VA, &0u64.to_ne_bytes())
+            .map_err(|_| ProbeError::AllocationFailed)?;
         DONE.store(false, Ordering::Release);
         PROBE_CPU.store(ap as u64, Ordering::Release);
         EXPECTED_USER_GS.store(user_gs(ap), Ordering::Release);
@@ -377,4 +383,21 @@ pub fn qualify(
         probes,
         cr4_fsgsbase: cpu::read_cr4() & CR4_FSGSBASE != 0,
     }))
+}
+
+/// K005-05 : pages permanentes de la sonde (adresse, frame, type), frame
+/// nulle tant que la sonde n'a pas tourné.
+pub fn pages() -> [(u64, u64, PageKind); 2] {
+    [
+        (
+            ring3::USER_CODE_VA,
+            CODE_FRAME.load(Ordering::Acquire),
+            PageKind::Code,
+        ),
+        (
+            ring3::USER_STACK_VA,
+            STACK_FRAME.load(Ordering::Acquire),
+            PageKind::Data,
+        ),
+    ]
 }

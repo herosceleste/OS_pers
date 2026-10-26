@@ -310,6 +310,47 @@ elyon_resched_ipi:
     pop rax
     IRET_TO_ORIGIN 8
 
+// K005-05 : IPI de TLB shootdown, même cadre que les autres IPI.
+.global elyon_tlb_ipi
+elyon_tlb_ipi:
+    SWAPGS_ON_ENTRY 8
+    cld
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rsp
+    and rsp, -16
+    call elyon_tlb_ipi_dispatch
+    mov rsp, r12
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    IRET_TO_ORIGIN 8
+
 .global elyon_test_double_fault
 elyon_test_double_fault:
     // K005-03 : le #DF part avec le GS utilisateur (KERNEL_GS_BASE préparé).
@@ -556,6 +597,7 @@ unsafe extern "C" {
     fn elyon_apic_timer_interrupt();
     fn elyon_smp_stability_ipi();
     fn elyon_resched_ipi();
+    fn elyon_tlb_ipi();
     fn elyon_user_probe_exit();
     fn elyon_enter_user(frame: *const elyon_core::ring3::IretFrame) -> !;
     fn elyon_user_iret();
@@ -650,6 +692,10 @@ extern "C" fn elyon_exception_dispatch(context: *mut ExceptionContext) {
         if let Some((rip, rsp)) = crate::user_access_probe::on_fault(&site, context.rsp) {
             context.rip = rip;
             context.rsp = rsp;
+            return;
+        }
+        if let Some(rip) = crate::user_memory_probe::on_fault(&site) {
+            context.rip = rip;
             return;
         }
     }
@@ -868,4 +914,8 @@ pub fn smp_stability_ipi_handler() -> u64 {
 
 pub fn resched_ipi_handler() -> u64 {
     elyon_resched_ipi as *const () as usize as u64
+}
+
+pub fn tlb_ipi_handler() -> u64 {
+    elyon_tlb_ipi as *const () as usize as u64
 }

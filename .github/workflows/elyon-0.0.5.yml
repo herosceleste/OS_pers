@@ -183,6 +183,10 @@ jobs:
         working-directory: Elyon-Kernel-0.0.5
         run: bash scripts/test-user-access-qemu.sh
 
+      - name: K005-05 owned user pages without identity alias test
+        working-directory: Elyon-Kernel-0.0.5
+        run: bash scripts/test-user-pages-qemu.sh
+
       - name: IOAPIC regression
         working-directory: Elyon-Kernel-0.0.5
         run: bash scripts/test-ioapic-qemu.sh
@@ -210,3 +214,7 @@ jobs:
       - name: K005-04 direct kernel access to a user page regression
         working-directory: Elyon-Kernel-0.0.5
         run: bash scripts/test-smap-violation-qemu.sh
+
+      - name: K005-05 kernel access through the identity alias regression
+        working-directory: Elyon-Kernel-0.0.5
+        run: bash scripts/test-user-alias-qemu.sh
