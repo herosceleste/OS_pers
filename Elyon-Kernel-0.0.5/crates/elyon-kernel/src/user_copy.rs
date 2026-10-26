@@ -58,7 +58,8 @@ fn address(function: unsafe extern "C" fn()) -> u64 {
     function as *const () as usize as u64
 }
 
-/// Copie `dst.len()` octets depuis l'adresse utilisateur `src`.
+/// Copie `dst.len()` octets depuis l'adresse utilisateur `src`. Sur `Err`,
+/// `dst` peut contenir une partie des octets : l'appelant doit l'ignorer.
 pub fn copy_from_user(dst: &mut [u8], src: u64) -> Result<(), UserAccessError> {
     let range = user_access::user_range(src, dst.len() as u64)?;
     // SAFETY: `range` est entièrement dans la région utilisateur, jamais
@@ -71,7 +72,8 @@ pub fn copy_from_user(dst: &mut [u8], src: u64) -> Result<(), UserAccessError> {
     Ok(())
 }
 
-/// Copie `src` vers l'adresse utilisateur `dst`.
+/// Copie `src` vers l'adresse utilisateur `dst`. Sur `Err`, les octets
+/// d'avant la faute ont pu être écrits.
 pub fn copy_to_user(dst: u64, src: &[u8]) -> Result<(), UserAccessError> {
     let range = user_access::user_range(dst, src.len() as u64)?;
     // SAFETY: comme `copy_from_user`, sens inverse ; `src` est un tampon
@@ -101,10 +103,12 @@ pub fn resume(site: &FaultSite) -> Option<u64> {
     Some(resume)
 }
 
+/// Fautes de copie reprises sur `cpu` depuis le boot.
 pub fn faults(cpu: usize) -> u64 {
     FAULTS[cpu].load(Ordering::Acquire)
 }
 
+/// Fautes de copie reprises sur `cpu` avec RFLAGS.AC levé dans le gestionnaire.
 pub fn handler_ac(cpu: usize) -> u64 {
     HANDLER_AC[cpu].load(Ordering::Acquire)
 }

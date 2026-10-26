@@ -265,10 +265,10 @@ pub fn on_fault(site: &FaultSite, rsp: u64) -> Option<(u64, u64)> {
         return None;
     }
     let resume = match armed {
-        ARMED_SMAP if site.rip == address(elyon_smap_probe_access) => {
+        ARMED_SMAP if site.rip == address(elyon_smap_probe_access) && site.cr2 == PROBE_DATA_VA => {
             (address(elyon_smap_probe_resume), rsp)
         }
-        ARMED_SMEP if site.rip == PROBE_CODE_VA => {
+        ARMED_SMEP if site.rip == PROBE_CODE_VA && rsp & 7 == 0 => {
             // SAFETY: CS noyau : `rsp` est la pile noyau du code interrompu, où
             // le `call` d'elyon_smep_probe vient de pousser son adresse de retour.
             let ret = unsafe { read_volatile(rsp as *const u64) };

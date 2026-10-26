@@ -390,17 +390,18 @@ extern "sysv64" fn elyon_ap_entry(cpu_index: u64, expected_apic_id: u64) -> ! {
     // observé, vérifié contre celui attendu pour ce slot.
     super::cpu_local::init(index);
     let code_selector = gdt::load_for_cpu(index);
-    idt::load();
-    // K005-03 : le trampoline ne laisse que CR4.PAE ; sans MCE, un #MC
-    // arrêterait cet AP au lieu d'entrer dans le gestionnaire.
-    cpu::enable_machine_check();
-    // K005-04 : SMEP, SMAP et UMIP, comme sur le BSP. Les stubs d'entrée
-    // exécutent `clac` : un AP sans SMAP s'arrête ici, IRQ masquées.
+    // K005-04 : avant l'IDT, dont les stubs exécutent `clac` : sur un AP sans
+    // SMAP, la première exception lèverait #UD en boucle (triple faute).
     let protection = cpu::supervisor_protection();
     if let Err(error) = user_access::check_support(protection) {
         kprintln!("[smp] AP FAILED cpu={} reason={}", index, error.as_str());
         cpu::halt_forever();
     }
+    idt::load();
+    // K005-03 : le trampoline ne laisse que CR4.PAE ; sans MCE, un #MC
+    // arrêterait cet AP au lieu d'entrer dans le gestionnaire.
+    cpu::enable_machine_check();
+    // K005-04 : SMEP, SMAP, UMIP et CR0.WP, comme sur le BSP.
     cpu::enable_supervisor_protection(protection);
 
     let observed_apic_id = match apic::init_secondary() {

@@ -96,6 +96,11 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         kprintln!("[cpu] FAILED reason={}", error.as_str());
         cpu::halt_forever();
     }
+    // Le firmware ne garantit pas RFLAGS.AC nul : SMAP serait levé dès son
+    // activation.
+    // SAFETY: SMAP est pris en charge (contrôlé ci-dessus) ; `clac` n'efface
+    // que RFLAGS.AC.
+    unsafe { core::arch::asm!("clac", options(nomem, nostack)) };
 
     let code_selector = gdt::init();
     kprintln!(
