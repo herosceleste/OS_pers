@@ -390,6 +390,9 @@ extern "sysv64" fn elyon_ap_entry(cpu_index: u64, expected_apic_id: u64) -> ! {
     super::cpu_local::init(index);
     let code_selector = gdt::load_for_cpu(index);
     idt::load();
+    // K005-03 : le trampoline ne laisse que CR4.PAE ; sans MCE, un #MC
+    // arrêterait cet AP au lieu d'entrer dans le gestionnaire.
+    cpu::enable_machine_check();
 
     let observed_apic_id = match apic::init_secondary() {
         Ok(value) => value,

@@ -1,7 +1,9 @@
 use core::arch::{asm, global_asm};
-use core::ptr::addr_of_mut;
+use core::ptr::{addr_of_mut, read_volatile};
 
-use crate::arch::x86_64::{cpu, gdt};
+use elyon_core::paranoid;
+
+use crate::arch::x86_64::{cpu, cpu_local, gdt};
 use crate::kprintln;
 
 const IDT_LEN: usize = 256;
@@ -74,6 +76,16 @@ struct ExceptionContext {
     rflags: u64,
 }
 
+/// Cadre du stub paranoïaque : GS_BASE relu à l'entrée, puis le même cadre
+/// que les autres exceptions.
+#[repr(C)]
+struct ParanoidContext {
+    entry_gs_base: u64,
+    frame: ExceptionContext,
+}
+
+const IA32_GS_BASE: u32 = 0xC000_0101;
+
 static mut IDT: [IdtEntry; IDT_LEN] = [IdtEntry::MISSING; IDT_LEN];
 
 global_asm!(
@@ -91,11 +103,12 @@ global_asm!(
     lfence
 .endm
 
-.macro SWAPGS_ON_EXIT cs_offset
+// K005-03 : toute sortie vers le ring 3 passe par le seul `iretq` précédé de
+// `swapgs` (elyon_user_iret), que le stub d'exception sait reconnaître.
+.macro IRET_TO_ORIGIN cs_offset
     test byte ptr [rsp + \cs_offset], 3
-    jz .Lexit_to_kernel_\@
-    swapgs
-.Lexit_to_kernel_\@:
+    jnz elyon_return_to_user
+    iretq
 .endm
 
 .macro EXC_NOERR n
@@ -113,15 +126,31 @@ elyon_exc_\n:
     jmp elyon_exception_common
 .endm
 
+// K005-03 : NMI, #DF et #MC, chacun sur sa pile IST (`paranoid::ist_for_vector`).
+.macro PARANOID_NOERR n
+.global elyon_exc_\n
+elyon_exc_\n:
+    push 0
+    push \n
+    jmp elyon_paranoid_common
+.endm
+
+.macro PARANOID_ERR n
+.global elyon_exc_\n
+elyon_exc_\n:
+    push \n
+    jmp elyon_paranoid_common
+.endm
+
 EXC_NOERR 0
 EXC_NOERR 1
-EXC_NOERR 2
+PARANOID_NOERR 2
 EXC_NOERR 3
 EXC_NOERR 4
 EXC_NOERR 5
 EXC_NOERR 6
 EXC_NOERR 7
-EXC_ERR   8
+PARANOID_ERR   8
 EXC_NOERR 9
 EXC_ERR   10
 EXC_ERR   11
@@ -131,7 +160,7 @@ EXC_ERR   14
 EXC_NOERR 15
 EXC_NOERR 16
 EXC_ERR   17
-EXC_NOERR 18
+PARANOID_NOERR 18
 EXC_NOERR 19
 EXC_NOERR 20
 EXC_ERR   21
@@ -188,8 +217,7 @@ elyon_smp_stability_ipi:
     pop rcx
     pop rbx
     pop rax
-    SWAPGS_ON_EXIT 8
-    iretq
+    IRET_TO_ORIGIN 8
 
 .global elyon_apic_timer_interrupt
 elyon_apic_timer_interrupt:
@@ -230,8 +258,7 @@ elyon_apic_timer_interrupt:
     pop rcx
     pop rbx
     pop rax
-    SWAPGS_ON_EXIT 8
-    iretq
+    IRET_TO_ORIGIN 8
 
 .global elyon_resched_ipi
 elyon_resched_ipi:
@@ -272,11 +299,12 @@ elyon_resched_ipi:
     pop rcx
     pop rbx
     pop rax
-    SWAPGS_ON_EXIT 8
-    iretq
+    IRET_TO_ORIGIN 8
 
 .global elyon_test_double_fault
 elyon_test_double_fault:
+    // K005-03 : le #DF part avec le GS utilisateur (KERNEL_GS_BASE préparé).
+    swapgs
     mov rax, 0x0000001000000000
     mov rsp, rax
     int3
@@ -287,7 +315,21 @@ elyon_test_double_fault:
 .global elyon_exception_common
 elyon_exception_common:
     cli
-    SWAPGS_ON_ENTRY 24
+    // [rsp] vecteur, +8 code d'erreur, +16 RIP, +24 CS.
+    test byte ptr [rsp + 24], 3
+    jnz .Lexception_swapgs
+    // K005-03 : une faute de l'`iretq` de sortie vers le ring 3 (cadre refusé)
+    // arrive avec un CS noyau, mais après `swapgs` : GS est déjà celui du
+    // ring 3. Le RIP sauvegardé est alors exactement elyon_user_iret.
+    push rax
+    lea rax, [rip + elyon_user_iret]
+    cmp qword ptr [rsp + 24], rax
+    pop rax
+    jne .Lexception_kernel_gs
+.Lexception_swapgs:
+    swapgs
+.Lexception_kernel_gs:
+    lfence
     cld
     push rax
     push rbx
@@ -325,9 +367,88 @@ elyon_user_probe_exit:
     hlt
     jmp 2b
 
-// Limite (revue ECC K005-02) : une NMI ou une #MC entre `swapgs` et `iretq`
-// trouve un CS noyau et ne refait pas `swapgs` ; son diagnostic tournerait
-// avec le GS utilisateur. L'entrée « paranoïaque » de K005-03 le traitera.
+// K005-03 : entrée « paranoïaque » de NMI, #DF et #MC. Ils arrivent
+// n'importe où, y compris entre `swapgs` et `iretq` (CS noyau, GS
+// utilisateur) : le CS sauvegardé ne dit rien de GS. Le stub relit le MSR
+// GS_BASE, le compare au GS_BASE noyau rangé par `gdt::prepare_for_cpu` au
+// sommet de la pile IST (à `slot` de RSP une fois le GS d'entrée poussé), et
+// l'écrit s'il diffère ; il remet la valeur d'entrée avant `iretq`.
+// KERNEL_GS_BASE n'est jamais touché : aucun `swapgs` ici.
+.global elyon_paranoid_common
+elyon_paranoid_common:
+    cld
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    mov ecx, {gs_base_msr}
+    rdmsr
+    shl rdx, 32
+    or rax, rdx
+    push rax
+    mov rdx, qword ptr [rsp + {slot}]
+    cmp rax, rdx
+    je .Lparanoid_entry_gs_ok
+    mov eax, edx
+    shr rdx, 32
+    wrmsr
+.Lparanoid_entry_gs_ok:
+    lfence
+    mov r12, rsp
+    mov rdi, rsp
+    and rsp, -16
+    call elyon_paranoid_dispatch
+    mov rsp, r12
+    // Le code interrompu (fenêtre `swapgs`/`iretq`, ring 3) reprend avec le
+    // GS_BASE qu'il avait.
+    mov rax, qword ptr [rsp]
+    cmp rax, qword ptr [rsp + {slot}]
+    je .Lparanoid_exit_gs_ok
+    mov rdx, rax
+    shr rdx, 32
+    mov ecx, {gs_base_msr}
+    wrmsr
+.Lparanoid_exit_gs_ok:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    add rsp, 16
+    iretq
+
+// Unique retour vers le ring 3 : `swapgs` vers le GS utilisateur, `iretq`.
+// Une NMI ou une #MC entre les deux est couverte par l'entrée paranoïaque ;
+// une faute de l'`iretq` lui-même, par le test de RIP du stub d'exception.
+.global elyon_return_to_user
+elyon_return_to_user:
+    swapgs
+.global elyon_user_iret
+elyon_user_iret:
+    iretq
+
 // void elyon_enter_user(const IretFrame *frame) -> !
 // Entre en ring 3 : IRQ masquées jusqu'à `iretq`, `swapgs` vers le GS
 // utilisateur (préparé dans KERNEL_GS_BASE), registres généraux effacés pour
@@ -355,9 +476,10 @@ elyon_enter_user:
     xor r13d, r13d
     xor r14d, r14d
     xor r15d, r15d
-    swapgs
-    iretq
-"#
+    jmp elyon_return_to_user
+"#,
+    gs_base_msr = const IA32_GS_BASE,
+    slot = const paranoid::SLOT_OFFSET,
 );
 
 unsafe extern "C" {
@@ -400,6 +522,7 @@ unsafe extern "C" {
     fn elyon_resched_ipi();
     fn elyon_user_probe_exit();
     fn elyon_enter_user(frame: *const elyon_core::ring3::IretFrame) -> !;
+    fn elyon_user_iret();
 }
 
 pub fn init(code_selector: u16) {
@@ -441,11 +564,8 @@ pub fn init(code_selector: u16) {
     let base = addr_of_mut!(IDT) as *mut IdtEntry;
 
     for (vector, handler) in handlers.iter().enumerate() {
-        let ist = if vector == 8 {
-            gdt::DOUBLE_FAULT_IST_INDEX + 1
-        } else {
-            0
-        };
+        // NMI, #DF et #MC sur leur pile IST dédiée (K005-03).
+        let ist = paranoid::ist_for_vector(vector as u8).unwrap_or(0);
         unsafe {
             base.add(vector)
                 .write(IdtEntry::new(*handler, code_selector, ist));
@@ -474,10 +594,67 @@ pub fn load() {
 #[unsafe(no_mangle)]
 extern "C" fn elyon_exception_dispatch(context: *const ExceptionContext) -> ! {
     let context = unsafe { &*context };
-    // NMI d'arrêt système envoyé par un autre CPU : arrêt silencieux.
-    if context.vector == 2 {
+    report(context);
+    if context.rip == user_iret_address() {
+        // K005-03 : faute de l'`iretq` vers le ring 3 ; le stub a refait
+        // `swapgs`, ce diagnostic tourne donc avec le GS du noyau.
+        let gs_base = read_gs_base();
+        kprintln!(
+            "[EXCEPTION] user iret fault gs_base={:#018x} kernel_gs={}",
+            gs_base,
+            u8::from(gs_base == cpu_local::area_address(cpu_local::index()))
+        );
+    }
+    halt()
+}
+
+/// NMI, #DF et #MC (K005-03), entrés par `elyon_paranoid_common` avec le
+/// GS_BASE noyau. Revient seulement pour un événement de la qualification ;
+/// le stub remet alors le GS_BASE d'entrée avant `iretq`.
+#[unsafe(no_mangle)]
+extern "C" fn elyon_paranoid_dispatch(context: *const ParanoidContext) {
+    // SAFETY: le stub passe son propre cadre, sur la pile IST de ce vecteur.
+    let context = unsafe { &*context };
+    let frame = &context.frame;
+    if frame.vector == u64::from(paranoid::VECTOR_NMI) {
+        // NMI d'arrêt système envoyé par un autre CPU : arrêt silencieux.
         crate::fatal::on_nmi();
     }
+    if frame.vector != u64::from(paranoid::VECTOR_DOUBLE_FAULT)
+        && crate::paranoid_probe::on_event(frame.vector, frame.rip, context.entry_gs_base)
+    {
+        return;
+    }
+
+    report(frame);
+    let gs_base = read_gs_base();
+    kprintln!(
+        "[EXCEPTION] paranoid entry_gs={:#018x} gs_base={:#018x} replaced={}",
+        context.entry_gs_base,
+        gs_base,
+        u8::from(context.entry_gs_base != gs_base)
+    );
+    if frame.vector == u64::from(paranoid::VECTOR_DOUBLE_FAULT) {
+        let rsp = cpu::read_rsp();
+        let (ist_start, ist_end) = gdt::double_fault_stack_span_for(cpu_local::index());
+        let active = rsp >= ist_start && rsp < ist_end;
+        kprintln!(
+            "[EXCEPTION] #DF IST rsp={:#018x} span={:#018x}..{:#018x} active={}",
+            rsp,
+            ist_start,
+            ist_end,
+            if active { 1 } else { 0 }
+        );
+    }
+    halt()
+}
+
+fn read_gs_base() -> u64 {
+    // SAFETY: IA32_GS_BASE existe sur tout x86_64.
+    unsafe { cpu::read_msr(IA32_GS_BASE) }
+}
+
+fn report(context: &ExceptionContext) {
     let name = exception_name(context.vector);
 
     kprintln!("");
@@ -500,23 +677,9 @@ extern "C" fn elyon_exception_dispatch(context: *const ExceptionContext) -> ! {
     if context.vector == 14 {
         kprintln!("[EXCEPTION] CR2={:#018x}", cpu::read_cr2());
     }
+}
 
-    if context.vector == 8 {
-        let rsp: u64;
-        unsafe {
-            asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags));
-        }
-        let (ist_start, ist_end) = gdt::double_fault_stack_span();
-        let active = rsp >= ist_start && rsp < ist_end;
-        kprintln!(
-            "[EXCEPTION] #DF IST rsp={:#018x} span={:#018x}..{:#018x} active={}",
-            rsp,
-            ist_start,
-            ist_end,
-            if active { 1 } else { 0 }
-        );
-    }
-
+fn halt() -> ! {
     kprintln!("[EXCEPTION] fail-closed halt");
     // Tous les CPU : un CPU arrêté seul pourrait tenir un verrou que les autres
     // attendraient sans fin. Un NMI inattendu passe aussi par ici.
@@ -572,6 +735,47 @@ pub fn install_user_gate(vector: u8, code_selector: u16, handler: u64) {
     // SAFETY: entrée de l'IDT statique, déjà chargée par `lidt` ; appelé par
     // le BSP avant le démarrage des AP, donc avant que le vecteur puisse servir.
     unsafe { base.add(vector as usize).write(entry) };
+}
+
+/// Adresse de l'unique `iretq` de sortie vers le ring 3.
+pub fn user_iret_address() -> u64 {
+    elyon_user_iret as *const () as usize as u64
+}
+
+/// Stub installé pour un vecteur paranoïaque (NMI, #DF, #MC), 0 sinon.
+pub fn paranoid_handler(vector: u8) -> u64 {
+    match vector {
+        2 => elyon_exc_2 as *const () as usize as u64,
+        8 => elyon_exc_8 as *const () as usize as u64,
+        18 => elyon_exc_18 as *const () as usize as u64,
+        _ => 0,
+    }
+}
+
+/// Porte `vector` relue dans l'IDT chargée sur ce CPU (`sidt`) : 64 bits bas
+/// et hauts.
+pub fn loaded_gate(vector: u8) -> Option<(u64, u64)> {
+    let mut idtr = Idtr { limit: 0, base: 0 };
+    // SAFETY: `sidt` écrit 10 octets dans `idtr`, sans autre effet.
+    unsafe {
+        asm!(
+            "sidt [{}]",
+            in(reg) &mut idtr,
+            options(nostack, preserves_flags)
+        );
+    }
+    let limit = idtr.limit;
+    let offset = usize::from(vector) * 16;
+    if usize::from(limit) < offset + 15 {
+        return None;
+    }
+    let base = idtr.base as *const u64;
+    // SAFETY: l'IDT chargée est la table statique du noyau, mappée en
+    // identité ; la limite couvre cette porte.
+    unsafe {
+        let gate = base.add(usize::from(vector) * 2);
+        Some((read_volatile(gate), read_volatile(gate.add(1))))
+    }
 }
 
 pub fn user_probe_exit_handler() -> u64 {

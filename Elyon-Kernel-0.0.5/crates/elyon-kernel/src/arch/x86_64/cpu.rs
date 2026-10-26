@@ -52,6 +52,27 @@ pub fn read_cr4() -> u64 {
     value
 }
 
+const CR4_MCE: u64 = 1 << 6;
+const CPUID_EDX_MCE: u32 = 1 << 7;
+
+/// CPUID.01H:EDX, où se lit la prise en charge de #MC.
+pub fn cpuid_1_edx() -> u32 {
+    core::arch::x86_64::__cpuid(1).edx
+}
+
+/// Active CR4.MCE quand le CPU gère #MC (K005-03). Un AP sort du trampoline
+/// avec CR4 = PAE seul : sans MCE, un #MC le mettrait en arrêt (shutdown)
+/// au lieu d'entrer dans le gestionnaire.
+pub fn enable_machine_check() {
+    if cpuid_1_edx() & CPUID_EDX_MCE == 0 {
+        return;
+    }
+    let cr4 = read_cr4() | CR4_MCE;
+    // SAFETY: CR4.MCE n'active que la livraison de #MC, dont la porte et la
+    // pile IST sont en place avant l'appel.
+    unsafe { asm!("mov cr4, {}", in(reg) cr4, options(nostack, preserves_flags)) }
+}
+
 pub struct CpuVendor {
     bytes: [u8; 12],
 }

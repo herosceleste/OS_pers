@@ -373,6 +373,11 @@ pub fn send_nmi_to_others() -> Result<(), ApicError> {
     )
 }
 
+/// NMI vers un seul CPU (qualification de l'entrée paranoïaque, K005-03).
+pub fn send_nmi(apic_id: u32) -> Result<(), ApicError> {
+    send_icr(apic_id, ICR_DELIVERY_NMI | ICR_LEVEL_ASSERT)
+}
+
 pub fn send_init(apic_id: u32) -> Result<(), ApicError> {
     send_icr(
         apic_id,
