@@ -2,6 +2,7 @@ use core::arch::{asm, global_asm};
 use core::ptr::{addr_of_mut, read_volatile};
 
 use elyon_core::paranoid;
+use elyon_core::user_access::{self, FaultSite};
 
 use crate::arch::x86_64::{cpu, cpu_local, gdt};
 use crate::kprintln;
@@ -74,6 +75,9 @@ struct ExceptionContext {
     rip: u64,
     cs: u64,
     rflags: u64,
+    /// Toujours empilés en mode 64 bits, même sans changement de privilège.
+    rsp: u64,
+    ss: u64,
 }
 
 /// Cadre du stub paranoïaque : GS_BASE relu à l'entrée, puis le même cadre
@@ -95,7 +99,12 @@ global_asm!(
 // zone per-CPU ; la sortie vers le ring 3 les rééchange juste avant `iretq`.
 // `lfence` sur les deux chemins de l'entrée : aucune lecture spéculative via
 // GS ne part avec le mauvais GS (variante Spectre SWAPGS).
+// K005-04 : `clac` en tête de chaque entrée. Une porte d'interruption
+// n'efface pas RFLAGS.AC : sans lui, une IRQ venue du ring 3 (qui peut lever
+// AC par `popfq`) ou de la fenêtre de copie ferait tourner le noyau avec SMAP
+// levé. `iretq` rend au code interrompu son propre AC.
 .macro SWAPGS_ON_ENTRY cs_offset
+    clac
     test byte ptr [rsp + \cs_offset], 3
     jz .Lentry_from_kernel_\@
     swapgs
@@ -314,6 +323,7 @@ elyon_test_double_fault:
 
 .global elyon_exception_common
 elyon_exception_common:
+    clac
     cli
     // [rsp] vecteur, +8 code d'erreur, +16 RIP, +24 CS.
     test byte ptr [rsp + 24], 3
@@ -347,11 +357,30 @@ elyon_exception_common:
     push r14
     push r15
     mov rdi, rsp
+    mov r12, rsp
     and rsp, -16
     call elyon_exception_dispatch
-1:
-    hlt
-    jmp 1b
+    // K005-04 : le dispatcher ne revient que pour une faute du noyau reprise
+    // (copie utilisateur ou sonde), RIP réécrit vers un point de reprise du
+    // noyau : retour sans `swapgs`, le CS sauvegardé est celui du noyau.
+    mov rsp, r12
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    add rsp, 16
+    iretq
 
 // K005-02 : sortie de la sonde ring 3 (`int 0x81`, porte DPL 3). Le CS
 // sauvegardé est passé au dispatcher, qui ne revient jamais : la tâche se
@@ -361,6 +390,7 @@ elyon_user_probe_exit:
     SWAPGS_ON_ENTRY 8
     cld
     mov rdi, qword ptr [rsp + 8]
+    mov rsi, qword ptr [rsp + 16]
     and rsp, -16
     call elyon_user_probe_exit_dispatch
 2:
@@ -379,6 +409,7 @@ elyon_user_probe_exit:
 // écraserait ce cadre. Pas de page de garde sous les piles IST (limite).
 .global elyon_paranoid_common
 elyon_paranoid_common:
+    clac
     cld
     push rax
     push rbx
@@ -596,9 +627,32 @@ pub fn load() {
     }
 }
 
+/// Revient seulement pour une #PF du noyau reprise (K005-04), après avoir
+/// réécrit RIP, et RSP pour la sonde SMEP, vers un point de reprise du
+/// noyau ; toute autre exception est diagnostiquée puis arrête le système.
 #[unsafe(no_mangle)]
-extern "C" fn elyon_exception_dispatch(context: *const ExceptionContext) -> ! {
-    let context = unsafe { &*context };
+extern "C" fn elyon_exception_dispatch(context: *mut ExceptionContext) {
+    // SAFETY: le stub passe son propre cadre, sur la pile de ce CPU.
+    let context = unsafe { &mut *context };
+    if context.vector == user_access::VECTOR_PAGE_FAULT {
+        let site = FaultSite {
+            vector: context.vector,
+            cs: context.cs,
+            rip: context.rip,
+            error_code: context.error_code,
+            cr2: cpu::read_cr2(),
+            rflags: context.rflags,
+        };
+        if let Some(resume) = crate::user_copy::resume(&site) {
+            context.rip = resume;
+            return;
+        }
+        if let Some((rip, rsp)) = crate::user_access_probe::on_fault(&site, context.rsp) {
+            context.rip = rip;
+            context.rsp = rsp;
+            return;
+        }
+    }
     report(context);
     if context.rip == user_iret_address() {
         // K005-03 : faute de l'`iretq` vers le ring 3 ; le stub a refait

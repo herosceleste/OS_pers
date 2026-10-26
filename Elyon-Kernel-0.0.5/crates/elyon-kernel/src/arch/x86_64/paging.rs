@@ -141,6 +141,50 @@ pub fn map_user_probe(code_frame: u64, stack_frame: u64) -> Result<(), Ring3Erro
     Ok(())
 }
 
+/// K005-04 : mappe une page de plus dans la table de la sonde (les 2 premiers
+/// Mio de la région utilisateur), après `map_user_probe`. Le BSP l'appelle
+/// avant que les sondes ne touchent la page ; l'entrée était absente.
+pub fn map_user_page(va: u64, frame: u64, writable: bool) -> Result<(), Ring3Error> {
+    let [pml4_index, pdpt_index, pd_index, pt_index] = ring3::indices(va);
+    if ring3::indices(ring3::USER_CODE_VA)[..3] != [pml4_index, pdpt_index, pd_index] {
+        return Err(Ring3Error::NotUserAddress);
+    }
+    let entry = ring3::table_entry(frame, true, writable)?;
+    // SAFETY: table statique mappée en identité, écrite par le seul BSP ;
+    // `invlpg` écarte toute traduction de cette adresse sur ce CPU.
+    unsafe {
+        (*addr_of_mut!(USER_PT)).0[pt_index] = entry;
+        asm!("invlpg [{}]", in(reg) va, options(nostack, preserves_flags));
+    }
+    check_user_page(va, writable)
+}
+
+/// Chemin complet vers la page utilisateur `va` : bit U/S à chaque niveau,
+/// bit W exactement comme demandé sur la page. Une adresse jamais mappée
+/// rend `NotPresent`.
+pub fn check_user_page(va: u64, writable: bool) -> Result<(), Ring3Error> {
+    let [pml4_index, pdpt_index, pd_index, pt_index] = ring3::indices(va);
+    if ring3::indices(ring3::USER_CODE_VA)[..3] != [pml4_index, pdpt_index, pd_index] {
+        return Err(Ring3Error::NotUserAddress);
+    }
+    // SAFETY: lecture des tables statiques.
+    unsafe {
+        let pml4 = &*addr_of!(PML4);
+        let pdpt = &*addr_of!(USER_PDPT);
+        let pd = &*addr_of!(USER_PD);
+        let pt = &*addr_of!(USER_PT);
+        ring3::check_user_entry(pml4.0[pml4_index], true)?;
+        ring3::check_user_entry(pdpt.0[pdpt_index], true)?;
+        ring3::check_user_entry(pd.0[pd_index], true)?;
+        let entry = pt.0[pt_index];
+        ring3::check_user_entry(entry, writable)?;
+        if !writable && entry & ring3::PTE_WRITABLE != 0 {
+            return Err(Ring3Error::NotWritable);
+        }
+    }
+    Ok(())
+}
+
 /// Relit les deux chemins : la région utilisateur porte le bit U/S à chaque
 /// niveau, le mappage identité du noyau ne le porte à aucun.
 pub fn check_user_probe() -> Result<(), Ring3Error> {

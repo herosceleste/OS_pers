@@ -1,6 +1,6 @@
 # Elyon Kernel 0.0.5 — Validation
 
-**EN COURS — K005-01 à K005-03 sont validés. K005-04 à K005-12 restent à qualifier.**
+**EN COURS — K005-01 à K005-04 sont validés. K005-05 à K005-12 restent à qualifier.**
 
 ## Baseline héritée
 
@@ -13,7 +13,7 @@ La 0.0.5 est dérivée de la Release `v0.0.4`, dont les critères K003-01 à K00
 | K005-01 | Segments utilisateur, `RSP0` par tâche | **PASS** |
 | K005-02 | `swapgs` à chaque entrée depuis le ring 3 | **PASS** |
 | K005-03 | Entrée « paranoïaque » NMI/#DF/#MC | **PASS** |
-| K005-04 | SMEP, SMAP et copies validées | À faire |
+| K005-04 | SMEP, SMAP et copies validées | **PASS** |
 | K005-05 | Pages utilisateur isolées et rendables | À faire |
 | K005-06 | `syscall`/`sysret` sans fuite de registres | À faire |
 | K005-07 | Premier processus utilisateur | À faire |
@@ -238,3 +238,132 @@ Limites :
 **K005-03 : PASS.**
 
 Le prochain critère est **K005-04 : SMEP et SMAP actifs ; copie validée entre espace utilisateur et noyau (`stac`/`clac`).**
+
+## K005-04 — SMEP et SMAP actifs ; copie validée entre espace utilisateur et noyau
+
+SMEP interdit au noyau d'exécuter une page utilisateur. SMAP lui interdit d'y lire ou d'y écrire, sauf entre `stac` et `clac` (RFLAGS.AC). Le noyau n'ouvre cette fenêtre qu'à un seul endroit : l'instruction de copie de `elyon_user_copy`, atteinte seulement avec une plage validée.
+
+La logique pure est dans `elyon_core::user_access`, testée sur l'hôte :
+
+- `features()`, `check_support()`, `cr4_bits()` et `check_cr4()` : SMEP et SMAP sont lus dans la feuille CPUID 7, ignorée si le CPU ne l'annonce pas. Ils sont exigés. UMIP est activé quand le CPU le gère ;
+- `check_write_protect()` : CR0.WP doit être actif, sinon le noyau écrirait sur une page en lecture seule ;
+- `user_range()` : une plage est acceptée si elle est non vide, de 1 Mio au plus, sans débordement, et entièrement dans la région utilisateur `[USER_BASE, USER_LIMIT)` ;
+- `copy_resume()` : une #PF n'est reprise au point de reprise de la copie que si toutes ces conditions sont réunies :
+  - elle vient du noyau ;
+  - elle a eu lieu sur l'instruction de copie ;
+  - son code d'erreur ne porte que les bits P et W ;
+  - AC était levé au moment de la faute ;
+  - CR2 est dans la région utilisateur.
+
+  Toute autre faute (tampon noyau, RSVD, PK, SGX, exécution, faute sans AC) reste fatale ;
+- `check_smap_fault()` et `check_smep_fault()` : signatures exactes d'une violation SMAP (lecture de données, page présente, mode superviseur, AC nul) et SMEP (exécution, page présente, RIP = CR2 = cible) ;
+- 26 tests.
+
+Côté noyau :
+
+- SMEP et SMAP sont exigés avant le chargement de l'IDT, sur le BSP comme sur chaque AP : les stubs d'entrée exécutent `clac`, qui lève #UD sur un CPU sans SMAP. Le BSP exécute aussi un `clac` explicite, puisque le firmware ne garantit pas AC nul ;
+- `cpu::enable_supervisor_protection()` active CR4.SMEP, CR4.SMAP, CR4.UMIP (si pris en charge) et CR0.WP. Sur le BSP, l'appel a lieu après l'installation des tables d'Elyon, dont le mappage identité ne porte jamais le bit U/S. Sur chaque AP, il a lieu après le chargement de l'IDT ;
+- `clac` est la première instruction de chaque entrée : macro `SWAPGS_ON_ENTRY` (IRQ et `int 0x81`), `elyon_exception_common` et `elyon_paranoid_common`. Une porte d'interruption n'efface pas AC, et le ring 3 peut le lever par `popfq` ; `iretq` rend au code interrompu son propre AC ;
+- `user_copy::copy_from_user()` et `copy_to_user()` valident la plage, puis appellent `elyon_user_copy` (`stac ; rep movsb ; clac`). Une #PF reprise saute au point de reprise, qui refait `clac` et rend les octets restants. La copie échoue alors avec `Fault`, sans arrêter le système. Après une erreur, une partie des octets a pu être copiée ;
+- `elyon_exception_common` peut maintenant revenir par `iretq`, mais seulement pour une faute du noyau reprise. Le RIP est réécrit vers un point de reprise du noyau, sans `swapgs`.
+
+Un défaut antérieur a été trouvé par la qualification : le trampoline des AP ne pose que PE et PG dans CR0. Avec CR0.WP nul, le noyau pouvait écrire, sur les AP, dans n'importe quelle page en lecture seule, utilisateur ou noyau, et une copie vers une page utilisateur en lecture seule réussissait sur les CPU 1 à 3. CR0.WP est maintenant forcé sur chaque CPU et contrôlé par la sonde.
+
+La qualification s'exécute après K005-03. Le BSP mappe, dans la table de la sonde K005-02, trois pages :
+
+- une page de code en lecture seule (`mov eax, 2 ; ret`) ;
+- une page de données ;
+- une page jamais mappée.
+
+Sur chaque CPU, le BSP d'abord puis chaque AP dans une tâche, IRQ masquées, la sonde vérifie :
+
+- CR4 et CR0.WP ;
+- une lecture directe de la page de données sans `stac` : elle doit lever une #PF de signature SMAP ;
+- un appel direct de la page de code : il doit lever une #PF de signature SMEP (sans SMEP, la page rendrait 2) ;
+- un aller-retour `copy_to_user` puis `copy_from_user` d'un motif propre au CPU, relu aussi par le mappage identité ;
+- trois fautes de copie reprises : écriture sur la page de code (page intacte), lecture de la page jamais mappée, lecture qui déborde sur elle (les 8 octets d'avant la faute sont copiés) ;
+- cinq plages refusées sans aucun accès : adresse noyau, plage vide, plage sous `USER_BASE`, plage au-delà de `USER_LIMIT`, débordement ;
+- AC nul après la sonde et dans le gestionnaire des fautes de copie, prises pourtant AC levé.
+
+La sonde ring 3 de K005-02 lève maintenant AC par `popfq` avant sa boucle : chaque entrée dans le noyau doit le trouver effacé, et la sortie `int 0x81` vérifie que le ring 3 l'avait bien levé.
+
+Le script `test-user-access-qemu.sh` exige :
+
+- la ligne CPUID ;
+- une ligne par CPU, dans l'ordre ;
+- une ligne ring 3 par AP ;
+- le résumé ;
+- l'ordre des marqueurs.
+
+Il relit aussi CR0 et CR4 en fin de boot, de façon indépendante. La régression `test-smap-violation-qemu.sh` (mode `ELYON_TEST_SMAP`) lit directement la page de données hors de la copie, après la qualification. Elle exige une seule exception, une #PF error=0x1 sur cette adresse, sans reprise, puis un arrêt fail-closed.
+
+Sept injections de faute ont été détectées :
+
+| Injection | Détection |
+|---|---|
+| `clac` retiré des entrées d'IRQ | `ac_leaks=21` sur chaque AP |
+| `clac` retiré de l'entrée des exceptions | `handler_ac=3` |
+| CR4.SMAP non activé | `smap=0`, `cr4_ok=0` |
+| CR4.SMEP non activé | `smep=0`, `cr4_ok=0` |
+| CR0.WP non forcé | `cr0_wp=0` et `ro_refused=0` sur les AP |
+| validation de plage retirée | #PF fatale à `CR2=0x7ffffffff8`, sous la région utilisateur |
+| `stac` retiré | #PF fatale (error=0x3) dans la copie |
+
+Le code a été relu par les agents ECC rust-reviewer et security-reviewer, sans point bloquant. Corrections retenues :
+
+- seuls les bits P et W du code d'erreur autorisent une reprise ;
+- SMEP et SMAP sont contrôlés avant l'IDT sur les AP ;
+- `clac` explicite au boot ;
+- gestionnaires de sonde plus stricts (CR2 pour SMAP, RSP aligné pour SMEP) ;
+- copies partielles et invariant « jamais de page superviseur dans la région utilisateur » documentés.
+
+La qualification a été exécutée sur le commit `c76338e541db`, en local sous QEMU 8.2.2 / OVMF, 4 vCPU (`-cpu max`). La suite complète de 37 tests est passée sur le commit précédant les corrections de revue. Sur le commit final, les deux tests K005-04 ont été rejoués et passent ; le workflow GitHub Actions Elyon 0.0.5 rejoue la suite complète.
+
+Preuves :
+
+```text
+[cpu] smep=1 smap=1 umip=1
+[uaccess] cpu=0 cr4_ok=1 cr0_wp=1 smap=1 smep=1 copy=1 ro_refused=1 unmapped_refused=1 partial=1 faults=3 rejects=5 handler_ac=0 ac_clear=1
+[uaccess] cpu=1 cr4_ok=1 cr0_wp=1 smap=1 smep=1 copy=1 ro_refused=1 unmapped_refused=1 partial=1 faults=3 rejects=5 handler_ac=0 ac_clear=1
+[uaccess] cpu=2 cr4_ok=1 cr0_wp=1 smap=1 smep=1 copy=1 ro_refused=1 unmapped_refused=1 partial=1 faults=3 rejects=5 handler_ac=0 ac_clear=1
+[uaccess] cpu=3 cr4_ok=1 cr0_wp=1 smap=1 smep=1 copy=1 ro_refused=1 unmapped_refused=1 partial=1 faults=3 rejects=5 handler_ac=0 ac_clear=1
+[uaccess] ring3 cpu=1 user_ac=1 entries=20 ac_leaks=0
+[uaccess] ring3 cpu=2 user_ac=1 entries=20 ac_leaks=0
+[uaccess] ring3 cpu=3 user_ac=1 entries=20 ac_leaks=0
+[uaccess] protection cpus=4 smep=1 smap=1 umip=1 pages_ok=1 ring3_entries=60 max_copy=1048576
+ELYON_USER_ACCESS_READY
+[PASS] K005-04 user access: sur 4 CPU, SMEP et SMAP actifs (UMIP=1, CR0.WP), lecture et exécution directes d'une page utilisateur refusées par #PF, copies validées aller-retour, 3 fautes de copie reprises et 5 plages refusées par CPU ; AC effacé à 60 entrées depuis le ring 3 (CR0=0x0000000080010033 CR4=0x0000000000340e68)
+[EXCEPTION] error=0x1 rip=0x000000000020bab2 cs=0x8 rflags=0x6
+[EXCEPTION] CR2=0x0000008000005000
+[PASS] K005-04 SMAP: lecture directe de la page utilisateur 0x0000008000005000 refusée par #PF (error=0x1), non reprise, arrêt fail-closed (qemu rc=124)
+```
+
+Validation croisée sous VMware Workstation Pro, UEFI, 4 vCPU (GenuineIntel), même build (ISO sha256 `9b32963d0d8b8ace78bf0cad1f99612fbccca61d7d2d005d7ca35fb7212c97f7`) :
+
+```text
+[kernel] build_id=c76338e541db
+[cpu] smep=1 smap=1 umip=1
+[uaccess] cpu=0 cr4_ok=1 cr0_wp=1 smap=1 smep=1 copy=1 ro_refused=1 unmapped_refused=1 partial=1 faults=3 rejects=5 handler_ac=0 ac_clear=1
+[uaccess] cpu=1 cr4_ok=1 cr0_wp=1 smap=1 smep=1 copy=1 ro_refused=1 unmapped_refused=1 partial=1 faults=3 rejects=5 handler_ac=0 ac_clear=1
+[uaccess] cpu=2 cr4_ok=1 cr0_wp=1 smap=1 smep=1 copy=1 ro_refused=1 unmapped_refused=1 partial=1 faults=3 rejects=5 handler_ac=0 ac_clear=1
+[uaccess] cpu=3 cr4_ok=1 cr0_wp=1 smap=1 smep=1 copy=1 ro_refused=1 unmapped_refused=1 partial=1 faults=3 rejects=5 handler_ac=0 ac_clear=1
+[uaccess] ring3 cpu=1 user_ac=1 entries=20 ac_leaks=0
+[uaccess] ring3 cpu=2 user_ac=1 entries=20 ac_leaks=0
+[uaccess] ring3 cpu=3 user_ac=1 entries=20 ac_leaks=0
+[uaccess] protection cpus=4 smep=1 smap=1 umip=1 pages_ok=1 ring3_entries=60 max_copy=1048576
+ELYON_USER_ACCESS_READY
+[PASS] VMware 4 vCPU: Elyon 0.0.5 K003-01..12, K004-01..11 et K005-01..04 validés sur build_id=c76338e541db
+```
+
+Limites :
+
+- un CPU sans SMEP ou sans SMAP n'est plus pris en charge : le boot s'arrête (QEMU doit tourner avec `-cpu max` ou équivalent) ;
+- NX n'est pas encore actif (K005-05) : les pages utilisateur restent exécutables par le ring 3 ;
+- la reprise accepte toute adresse de la région utilisateur, pas seulement la plage de la copie en cours : seule l'instruction de copie peut y fauter ;
+- `user_range` ne contrôle que l'adresse : la région utilisateur ne doit jamais contenir de page superviseur (invariant à tenir dès K005-05) ;
+- la qualification est sautée sur un boot à un seul CPU, comme celles de K005-02 et K005-03 ;
+- le ring 3 n'entre encore dans le noyau que par les IRQ et `int 0x81` : une exception venue du ring 3 avec AC levé passe par le même `clac`, mais n'est pas exercée.
+
+**K005-04 : PASS.**
+
+Le prochain critère est **K005-05 : pages utilisateur prises par `allocate_owned`, bit U/S strict, jamais d'accès noyau par l'identity map.**
