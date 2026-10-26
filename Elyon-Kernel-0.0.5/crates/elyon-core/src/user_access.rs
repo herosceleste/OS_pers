@@ -20,6 +20,8 @@ pub const CPUID7_EBX_SMAP: u32 = 1 << 20;
 pub const CPUID7_ECX_UMIP: u32 = 1 << 2;
 const CPUID_LEAF_7: u32 = 7;
 pub const RFLAGS_AC: u64 = 1 << 18;
+/// CR0.WP : le noyau respecte le bit W des pages, utilisateur comme noyau.
+pub const CR0_WP: u64 = 1 << 16;
 
 pub const VECTOR_PAGE_FAULT: u64 = 14;
 /// Bits du code d'erreur d'une #PF.
@@ -46,6 +48,8 @@ pub enum UserAccessError {
     SmapDisabled,
     /// Le CPU gère UMIP mais CR4.UMIP est nul.
     UmipDisabled,
+    /// CR0.WP est nul : le noyau écrirait sur une page en lecture seule.
+    WriteProtectDisabled,
     Empty,
     TooLong,
     /// La fin de la plage dépasse 2^64.
@@ -68,6 +72,7 @@ impl UserAccessError {
             Self::SmepDisabled => "CR4.SMEP is clear",
             Self::SmapDisabled => "CR4.SMAP is clear",
             Self::UmipDisabled => "CPU supports UMIP but CR4.UMIP is clear",
+            Self::WriteProtectDisabled => "CR0.WP is clear",
             Self::Empty => "user range is empty",
             Self::TooLong => "user range exceeds the copy limit",
             Self::Overflow => "user range wraps around",
@@ -139,6 +144,14 @@ pub const fn check_cr4(cr4: u64, features: Features) -> Result<(), UserAccessErr
     }
     if features.umip && cr4 & CR4_UMIP == 0 {
         return Err(UserAccessError::UmipDisabled);
+    }
+    Ok(())
+}
+
+/// Sans CR0.WP, une copie vers une page utilisateur en lecture seule réussit.
+pub const fn check_write_protect(cr0: u64) -> Result<(), UserAccessError> {
+    if cr0 & CR0_WP == 0 {
+        return Err(UserAccessError::WriteProtectDisabled);
     }
     Ok(())
 }
