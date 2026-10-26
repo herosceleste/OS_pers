@@ -13,7 +13,10 @@ const IDENTITY_LIMIT: u64 = 4 * GIB;
 #[test]
 fn a_code_page_is_user_present_read_only_and_executable() {
     let entry = user_pages::user_leaf(FRAME, PageKind::Code).unwrap();
-    assert_eq!(entry, FRAME | user_pages::PTE_PRESENT | user_pages::PTE_USER);
+    assert_eq!(
+        entry,
+        FRAME | user_pages::PTE_PRESENT | user_pages::PTE_USER
+    );
 }
 
 #[test]
@@ -108,10 +111,7 @@ fn efer_must_enable_nx() {
 
 #[test]
 fn a_frame_is_located_in_the_identity_map() {
-    assert_eq!(
-        user_pages::identity_slot(0, IDENTITY_LIMIT),
-        Ok((0, 0, 0))
-    );
+    assert_eq!(user_pages::identity_slot(0, IDENTITY_LIMIT), Ok((0, 0, 0)));
     // 1 Gio + 2 Mio + 3 pages.
     let phys = GIB + 2 * 1024 * 1024 + 3 * 0x1000;
     assert_eq!(
@@ -159,7 +159,8 @@ fn a_huge_page_splits_into_the_same_small_pages() {
 #[test]
 fn a_split_keeps_the_cache_attributes_and_moves_pat() {
     // MMIO non cacheable (PWT|PCD) et PAT : bit 12 d'une PDE, bit 7 d'une PTE.
-    let pde = BASE_2M | user_pages::PTE_PRESENT | user_pages::PTE_WRITABLE | HUGE | PWT | PCD | PAT_2M;
+    let pde =
+        BASE_2M | user_pages::PTE_PRESENT | user_pages::PTE_WRITABLE | HUGE | PWT | PCD | PAT_2M;
     assert_eq!(
         user_pages::small_entry(pde, 2),
         Ok((BASE_2M + 0x2000)
@@ -187,10 +188,7 @@ fn only_a_present_supervisor_huge_page_is_split() {
         user_pages::small_entry(pde | user_pages::PTE_USER, 0),
         Err(UserPageError::Leaf)
     );
-    assert_eq!(
-        user_pages::small_entry(pde, 512),
-        Err(UserPageError::Frame)
-    );
+    assert_eq!(user_pages::small_entry(pde, 512), Err(UserPageError::Frame));
 }
 
 // --- TLB shootdown ------------------------------------------------------------------
