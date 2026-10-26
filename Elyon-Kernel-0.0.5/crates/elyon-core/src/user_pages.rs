@@ -24,7 +24,8 @@ const PTE_PAT_4K: u64 = 1 << 7;
 pub const PTE_GLOBAL: u64 = 1 << 8;
 const PDE_PAT_2M: u64 = 1 << 12;
 pub const PTE_NX: u64 = 1 << 63;
-const FRAME_4K: u64 = 0x000F_FFFF_FFFF_F000;
+/// Bits 51:12 d'une entrée : adresse physique d'une page ou d'une table.
+pub const PTE_FRAME: u64 = 0x000F_FFFF_FFFF_F000;
 const FRAME_2M: u64 = 0x000F_FFFF_FFE0_0000;
 
 const PAGE_SIZE: u64 = 0x1000;
@@ -60,6 +61,8 @@ pub enum UserPageError {
     AliasPresent,
     NxUnsupported,
     NxDisabled,
+    /// Plus de frame pour une table de découpe.
+    OutOfMemory,
 }
 
 impl UserPageError {
@@ -73,13 +76,14 @@ impl UserPageError {
             Self::AliasPresent => "user frame is still reachable through the identity map",
             Self::NxUnsupported => "CPU does not support NX",
             Self::NxDisabled => "EFER.NXE is clear",
+            Self::OutOfMemory => "PMM could not allocate a page table",
         }
     }
 }
 
 /// Entrée de la page utilisateur `frame` : U/S, présente, droits de `kind`.
 pub const fn user_leaf(frame: u64, kind: PageKind) -> Result<u64, UserPageError> {
-    if frame & !FRAME_4K != 0 {
+    if frame & !PTE_FRAME != 0 {
         return Err(UserPageError::Frame);
     }
     let rights = match kind {
