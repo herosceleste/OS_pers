@@ -52,16 +52,17 @@ grep -Fq "[EXCEPTION] vector=8 #DF double fault" "$LOG" || {
 
 # K005-03 : le #DF part avec le GS utilisateur injecté ; l'entrée paranoïaque
 # doit l'avoir vu puis remplacé par le GS_BASE noyau.
-user_gs="$(sed -nE 's/^\[test\] injecting #DF .* user_gs=(0x[0-9a-f]+)\r?$/\1/p' "$LOG")"
+CLEAN="$(tr -d '\r' <"$LOG")"
+user_gs="$(sed -nE 's/^\[test\] injecting #DF .* user_gs=(0x[0-9a-f]+)$/\1/p' <<<"$CLEAN")"
 [[ -n "$user_gs" ]] || {
   echo "[FAIL] GS utilisateur injecté absent" >&2
   exit 1
 }
-grep -Eq "^\[EXCEPTION\] paranoid entry_gs=$user_gs gs_base=0x[0-9a-f]+ replaced=1\r?$" "$LOG" || {
+grep -Eq "^\[EXCEPTION\] paranoid entry_gs=$user_gs gs_base=0x[0-9a-f]+ replaced=1$" <<<"$CLEAN" || {
   echo "[FAIL] entrée paranoïaque #DF : GS utilisateur non vu ou non remplacé" >&2
   exit 1
 }
-if grep -Eq "^\[EXCEPTION\] paranoid .* gs_base=$user_gs " "$LOG"; then
+if grep -Eq "^\[EXCEPTION\] paranoid .* gs_base=$user_gs " <<<"$CLEAN"; then
   echo "[FAIL] diagnostic #DF exécuté avec le GS utilisateur" >&2
   exit 1
 fi
