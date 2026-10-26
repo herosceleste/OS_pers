@@ -91,10 +91,16 @@ fn disjoint_ist_spans_are_accepted() {
 #[test]
 fn overlapping_ist_spans_are_refused() {
     let spans = [(0x0040_0000, 0x0040_4000), (0x0040_3000, 0x0040_7000)];
-    assert_eq!(paranoid::check_spans(&spans), Err(ParanoidError::IstOverlap));
+    assert_eq!(
+        paranoid::check_spans(&spans),
+        Err(ParanoidError::IstOverlap)
+    );
     // Deux CPU partageant la même pile NMI.
     let shared = [(0x0040_0000, 0x0040_4000), (0x0040_0000, 0x0040_4000)];
-    assert_eq!(paranoid::check_spans(&shared), Err(ParanoidError::IstOverlap));
+    assert_eq!(
+        paranoid::check_spans(&shared),
+        Err(ParanoidError::IstOverlap)
+    );
 }
 
 #[test]
