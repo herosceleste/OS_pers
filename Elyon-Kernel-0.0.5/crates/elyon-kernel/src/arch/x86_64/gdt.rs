@@ -65,16 +65,20 @@ pub fn prepare_for_cpu(cpu_index: usize, spans: IstSpans) {
     ordered[DOUBLE_FAULT_IST_INDEX as usize] = spans.double_fault;
     ordered[NMI_IST_INDEX as usize] = spans.nmi;
     ordered[MACHINE_CHECK_IST_INDEX as usize] = spans.machine_check;
-    assert!(paranoid::check_spans(&ordered).is_ok());
+    if let Err(error) = paranoid::check_spans(&ordered) {
+        panic!("invalid IST stacks: {}", error.as_str());
+    }
 
+    // SAFETY: appelé avant que ce CPU charge son TSS ; les piles IST sont des
+    // statiques du noyau (BSP) ou des cadres que `percpu::prepare` a alloués et
+    // vérifiés sous la limite du mappage identité, disjoints (`check_spans`) ;
+    // le mot GS est écrit sous leur sommet, dans la pile elle-même.
     unsafe {
         let tss_table = addr_of_mut!(TSS_TABLE);
         (*tss_table)[cpu_index] = TaskStateSegment::new();
         for (index, &(start, end)) in ordered.iter().enumerate() {
-            let pointer = match paranoid::ist_pointer(start, end) {
-                Ok(pointer) => pointer,
-                Err(_) => panic!("invalid IST stack"),
-            };
+            let pointer = paranoid::ist_pointer(start, end)
+                .unwrap_or_else(|error| panic!("invalid IST stack: {}", error.as_str()));
             // K005-03 : le stub paranoïaque relit ici le GS_BASE noyau de ce
             // CPU, sans passer par GS ni se fier au CS sauvegardé.
             let slot = pointer as *mut u64;

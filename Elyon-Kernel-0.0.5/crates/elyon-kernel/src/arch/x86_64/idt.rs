@@ -374,6 +374,9 @@ elyon_user_probe_exit:
 // sommet de la pile IST (à `slot` de RSP une fois le GS d'entrée poussé), et
 // l'écrit s'il diffère ; il remet la valeur d'entrée avant `iretq`.
 // KERNEL_GS_BASE n'est jamais touché : aucun `swapgs` ici.
+// Invariant de l'IST : le dispatch ne fait ni `sti`, ni `iretq`, ni faute
+// rattrapable ; sinon une NMI imbriquée réutiliserait la même pile et
+// écraserait ce cadre. Pas de page de garde sous les piles IST (limite).
 .global elyon_paranoid_common
 elyon_paranoid_common:
     cld
@@ -440,6 +443,8 @@ elyon_paranoid_common:
     iretq
 
 // Unique retour vers le ring 3 : `swapgs` vers le GS utilisateur, `iretq`.
+// Atteint IRQ masquées (porte d'interruption, `cli` d'elyon_enter_user) :
+// aucune IRQ ne peut tomber entre les deux et entrer avec le GS utilisateur.
 // Une NMI ou une #MC entre les deux est couverte par l'entrée paranoïaque ;
 // une faute de l'`iretq` lui-même, par le test de RIP du stub d'exception.
 .global elyon_return_to_user

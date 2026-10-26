@@ -7,6 +7,10 @@
 //!    déjà utilisateur, exactement l'état de `elyon_return_to_user` ;
 //! 3. `int 18` dans la même fenêtre : même porte et même pile IST qu'un #MC.
 //!
+//! Le BSP passe ensuite par `int 2` et `int 18` dans la même fenêtre : ses
+//! piles IST NMI et #MC sont exercées aussi. Un #MC matériel, de classe
+//! « abort », n'est jamais repris : seul l'`int 18` de la sonde revient.
+//!
 //! Le gestionnaire relève, sans passer par GS, le GS_BASE d'entrée et celui
 //! qu'il voit, puis l'index lu via `gs:[0]` et son RSP ; le BSP vérifie ces
 //! relevés avec `elyon_core::paranoid`. Après chaque événement, la tâche
@@ -31,6 +35,11 @@ use crate::timer;
 
 const IA32_GS_BASE: u32 = 0xC000_0101;
 const IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
+const IA32_MCG_STATUS: u32 = 0x17A;
+/// MCG_STATUS.MCIP : un #MC matériel est en cours.
+const MCG_STATUS_MCIP: u64 = 1 << 2;
+/// CPUID.01H:EDX.MCA : les MSR de machine check existent.
+const CPUID_EDX_MCA: u32 = 1 << 14;
 const PROBE_ARG_BASE: u64 = 0xE1_0503_0000_0000;
 /// Tours de `pause` au plus dans une attente (plusieurs secondes).
 const WAIT_SPINS: u64 = 500_000_000;
@@ -43,7 +52,11 @@ const MAX_PROBED_CPUS: usize = sched::MAX_SCHED_CPUS;
 const NMI_KERNEL: usize = 0;
 const NMI_WINDOW: usize = 1;
 const MC_WINDOW: usize = 2;
-const EVENTS: usize = 3;
+/// BSP : `int 2` dans la fenêtre GS utilisateur (même porte et IST qu'une NMI).
+const NMI_SOFT_WINDOW: usize = 3;
+/// Événements d'un AP ; le BSP fait `NMI_SOFT_WINDOW` puis `MC_WINDOW`.
+const AP_EVENTS: usize = 3;
+const EVENTS: usize = 4;
 const NO_EVENT: u64 = u64::MAX;
 
 global_asm!(
@@ -85,6 +98,16 @@ elyon_paranoid_int18:
 elyon_paranoid_int18_return:
     swapgs
     ret
+
+// void elyon_paranoid_int2(void) : `int 2` dans la fenêtre GS utilisateur.
+.global elyon_paranoid_int2
+elyon_paranoid_int2:
+    swapgs
+    int 2
+.global elyon_paranoid_int2_return
+elyon_paranoid_int2_return:
+    swapgs
+    ret
 "#
 );
 
@@ -93,6 +116,8 @@ unsafe extern "C" {
     fn elyon_paranoid_wait_end();
     fn elyon_paranoid_int18();
     fn elyon_paranoid_int18_return();
+    fn elyon_paranoid_int2();
+    fn elyon_paranoid_int2_return();
 }
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -100,7 +125,10 @@ static PROBE_CPU: AtomicU64 = AtomicU64::new(u64::MAX);
 /// Événement attendu par le gestionnaire, `NO_EVENT` hors attente.
 static PHASE: AtomicU64 = AtomicU64::new(NO_EVENT);
 static READY: AtomicU64 = AtomicU64::new(0);
+/// Événement réclamé par le gestionnaire (une fois par attente).
 static HANDLED: AtomicU64 = AtomicU64::new(0);
+/// Relevés de l'événement publiés : c'est ce drapeau qu'attend la tâche.
+static DISPATCHED: AtomicU64 = AtomicU64::new(0);
 /// Relevés du gestionnaire par événement : GS d'entrée, GS_BASE vu, index, RSP.
 static OBSERVED: [[AtomicU64; 4]; EVENTS] = [const { [const { AtomicU64::new(0) }; 4] }; EVENTS];
 /// GS remis correctement après l'événement, vu par la tâche.
@@ -146,7 +174,7 @@ impl From<ParanoidError> for ProbeError {
 /// Résultat de la sonde sur un AP : `Ok` ou l'erreur de chaque événement.
 #[derive(Clone, Copy)]
 pub struct CpuProbe {
-    pub events: [Result<(), ParanoidError>; EVENTS],
+    pub events: [Result<(), ParanoidError>; AP_EVENTS],
     /// Événements où le stub a dû remplacer GS_BASE.
     pub replaced: u64,
     /// Événements après lesquels la tâche a retrouvé le GS d'entrée.
@@ -157,7 +185,7 @@ pub struct CpuProbe {
 
 impl CpuProbe {
     const EMPTY: Self = Self {
-        events: [Err(ParanoidError::EntryGs); EVENTS],
+        events: [Err(ParanoidError::EntryGs); AP_EVENTS],
         replaced: 0,
         restored: 0,
         mce_ok: false,
@@ -169,6 +197,10 @@ impl CpuProbe {
 pub struct ParanoidQualification {
     pub cpus: usize,
     pub probes: [CpuProbe; MAX_PROBED_CPUS],
+    /// BSP : `int 2` puis `int 18` dans la fenêtre GS utilisateur.
+    pub bsp_events: [Result<(), ParanoidError>; 2],
+    pub bsp_replaced: u64,
+    pub bsp_restored: u64,
     /// Portes NMI, #DF et #MC relues dans l'IDT du BSP.
     pub bsp_gates_ok: bool,
     pub bsp_mce_ok: bool,
@@ -192,9 +224,19 @@ fn address(function: unsafe extern "C" fn()) -> u64 {
     function as *const () as usize as u64
 }
 
+/// Vrai si un #MC matériel est en cours : un tel #MC n'est jamais repris.
+fn hardware_machine_check() -> bool {
+    cpu::cpuid_1_edx() & CPUID_EDX_MCA != 0 && read_msr(IA32_MCG_STATUS) & MCG_STATUS_MCIP != 0
+}
+
 /// Appelé par `elyon_paranoid_dispatch` pour une NMI ou un #MC. Vrai si
-/// l'événement est celui qu'attend la sonde, à l'endroit attendu : il est
-/// alors relevé et le stub revient. Sinon, diagnostic et arrêt fail-closed.
+/// l'événement est celui qu'attend la sonde, à l'endroit attendu, sur le CPU
+/// sondé, et le premier de son attente : il est alors relevé et le stub
+/// revient. Sinon (NMI de chien de garde, #MC matériel, second événement),
+/// diagnostic et arrêt fail-closed.
+///
+/// Invariant de l'IST : ce chemin ne fait ni `sti`, ni `iretq`, ni faute
+/// rattrapable ; une NMI imbriquée réutiliserait sinon la même pile.
 pub fn on_event(vector: u64, rip: u64, entry_gs: u64) -> bool {
     if !ACTIVE.load(Ordering::Acquire) {
         return false;
@@ -210,6 +252,10 @@ pub fn on_event(vector: u64, rip: u64, entry_gs: u64) -> bool {
         MC_WINDOW => {
             vector == u64::from(paranoid::VECTOR_MACHINE_CHECK)
                 && rip == address(elyon_paranoid_int18_return)
+                && !hardware_machine_check()
+        }
+        NMI_SOFT_WINDOW => {
+            vector == u64::from(paranoid::VECTOR_NMI) && rip == address(elyon_paranoid_int2_return)
         }
         _ => false,
     };
@@ -217,10 +263,26 @@ pub fn on_event(vector: u64, rip: u64, entry_gs: u64) -> bool {
         return false;
     }
     let probe = PROBE_CPU.load(Ordering::Acquire) as usize;
+    if probe >= MAX_PROBED_CPUS {
+        return false;
+    }
     let gs_base = read_msr(IA32_GS_BASE);
+    // Sur le CPU sondé, GS_BASE est la zone de ce CPU (stub correct) ou le GS
+    // utilisateur de la sonde (stub défaillant, relevé pour échouer) ; toute
+    // autre valeur désigne un autre CPU.
+    if gs_base != cpu_local::area_address(probe) && gs_base != user_gs(probe) {
+        return false;
+    }
+    // Un seul événement par attente : un second est inattendu, donc fatal.
+    if HANDLED
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
     // L'index n'est lu via GS que si GS_BASE est la zone de ce CPU : avec le
     // GS utilisateur, la lecture fauterait au lieu d'échouer proprement.
-    let index = if probe < MAX_PROBED_CPUS && gs_base == cpu_local::area_address(probe) {
+    let index = if gs_base == cpu_local::area_address(probe) {
         cpu_local::index() as u64
     } else {
         u64::MAX
@@ -230,7 +292,7 @@ pub fn on_event(vector: u64, rip: u64, entry_gs: u64) -> bool {
     observed[1].store(gs_base, Ordering::Release);
     observed[2].store(index, Ordering::Release);
     observed[3].store(cpu::read_rsp(), Ordering::Release);
-    HANDLED.store(1, Ordering::Release);
+    DISPATCHED.store(1, Ordering::Release);
     true
 }
 
@@ -250,21 +312,45 @@ fn check_restored(event: usize, area: u64, user: u64) {
     RESTORED[event].store(ok, Ordering::Release);
 }
 
-fn wait_for(event: usize, window: bool) -> bool {
+fn arm(event: usize) {
     HANDLED.store(0, Ordering::Release);
-    READY.store(0, Ordering::Release);
+    DISPATCHED.store(0, Ordering::Release);
     PHASE.store(event as u64, Ordering::Release);
+}
+
+fn wait_for(event: usize, window: bool) -> bool {
+    // READY est remis à zéro avant la nouvelle phase : le BSP ne peut pas
+    // associer le READY de l'attente précédente à celle-ci.
+    READY.store(0, Ordering::Release);
+    arm(event);
     // SAFETY: les deux drapeaux sont des statiques ; `elyon_paranoid_wait`
     // n'utilise ni GS ni la pile entre ses deux `swapgs`.
     let remaining = unsafe {
         elyon_paranoid_wait(
             READY.as_ptr(),
-            HANDLED.as_ptr(),
+            DISPATCHED.as_ptr(),
             u64::from(window),
             WAIT_SPINS,
         )
     };
-    remaining != 0 || HANDLED.load(Ordering::Acquire) != 0
+    remaining != 0 || DISPATCHED.load(Ordering::Acquire) != 0
+}
+
+/// `int 2` ou `int 18` dans la fenêtre GS utilisateur ; vrai si le
+/// gestionnaire l'a relevé.
+fn soft_event(event: usize) -> bool {
+    arm(event);
+    // SAFETY: `int 2`/`int 18` vers une porte DPL 0 à IST dédiée, depuis le
+    // ring 0, entre deux `swapgs` ; la sonde l'attend, le stub revient et
+    // remet le GS utilisateur avant le second `swapgs`.
+    unsafe {
+        if event == MC_WINDOW {
+            elyon_paranoid_int18();
+        } else {
+            elyon_paranoid_int2();
+        }
+    }
+    DISPATCHED.load(Ordering::Acquire) != 0
 }
 
 fn gates_ok() -> bool {
@@ -313,12 +399,7 @@ extern "C" fn elyon_paranoid_probe_task_entry(arg: u64) -> ! {
         timed_out |= !wait_for(event, window);
         check_restored(event, area, user);
     }
-    HANDLED.store(0, Ordering::Release);
-    PHASE.store(MC_WINDOW as u64, Ordering::Release);
-    // SAFETY: `int 18` vers la porte #MC (DPL 0, IST dédiée) depuis le
-    // ring 0, entre deux `swapgs` ; la sonde l'attend et le stub revient.
-    unsafe { elyon_paranoid_int18() };
-    timed_out |= HANDLED.load(Ordering::Acquire) == 0;
+    timed_out |= !soft_event(MC_WINDOW);
     check_restored(MC_WINDOW, area, user);
 
     PHASE.store(NO_EVENT, Ordering::Release);
@@ -361,6 +442,66 @@ fn check_slots(cpus: usize) -> Result<usize, ParanoidError> {
     Ok(slots_ok)
 }
 
+fn reset_observations() {
+    for observed in OBSERVED.iter().flatten() {
+        observed.store(0, Ordering::Release);
+    }
+    for restored in &RESTORED {
+        restored.store(false, Ordering::Release);
+    }
+}
+
+/// Résultat d'un événement de `cpu` contre ce que la qualification attend.
+fn check_event(cpu: usize, event: usize, entry_gs: u64) -> Result<(), ParanoidError> {
+    let ist_index = if event == MC_WINDOW {
+        gdt::MACHINE_CHECK_IST_INDEX
+    } else {
+        gdt::NMI_IST_INDEX
+    };
+    paranoid::check_observation(
+        &observation(event),
+        &Expected {
+            kernel_gs: cpu_local::area_address(cpu),
+            entry_gs,
+            index: cpu as u64,
+            ist: gdt::ist_span_for(cpu, ist_index),
+        },
+    )
+}
+
+/// BSP : `int 2` puis `int 18` dans la fenêtre GS utilisateur, IRQ masquées.
+type BspProbe = ([Result<(), ParanoidError>; 2], u64, u64);
+
+fn probe_bsp() -> Result<BspProbe, ProbeError> {
+    let area = cpu_local::area_address(0);
+    let user = user_gs(0);
+    reset_observations();
+    PROBE_CPU.store(0, Ordering::Release);
+    ACTIVE.store(true, Ordering::Release);
+    // SAFETY: MSR architectural ; le GS utilisateur ne sert qu'à la fenêtre.
+    unsafe { cpu::write_msr(IA32_KERNEL_GS_BASE, user) };
+    let mut handled = true;
+    for event in [NMI_SOFT_WINDOW, MC_WINDOW] {
+        handled &= soft_event(event);
+        check_restored(event, area, user);
+    }
+    PHASE.store(NO_EVENT, Ordering::Release);
+    ACTIVE.store(false, Ordering::Release);
+    // SAFETY: MSR architectural ; GS_BASE est la zone du BSP.
+    unsafe { cpu::write_msr(IA32_KERNEL_GS_BASE, 0) };
+    if !handled {
+        return Err(ProbeError::Timeout);
+    }
+    let mut replaced = 0;
+    let mut restored = 0;
+    let events = [NMI_SOFT_WINDOW, MC_WINDOW].map(|event| {
+        replaced += u64::from(paranoid::replaced(&observation(event), area));
+        restored += u64::from(RESTORED[event].load(Ordering::Acquire));
+        check_event(0, event, user)
+    });
+    Ok((events, replaced, restored))
+}
+
 pub fn qualify(
     bsp_stack_start: u64,
     bsp_stack_end: u64,
@@ -375,6 +516,7 @@ pub fn qualify(
         return Err(ProbeError::Sched(SchedError::TraceOverflow));
     }
     let slots_ok = check_slots(cpus)?;
+    let (bsp_events, bsp_replaced, bsp_restored) = probe_bsp()?;
     let bsp = StackRegion {
         start: bsp_stack_start,
         end: bsp_stack_end,
@@ -386,12 +528,7 @@ pub fn qualify(
         let apic_id = percpu::snapshot(ap)
             .ok_or(ProbeError::Sched(SchedError::ApTimeout))?
             .apic_id;
-        for observed in OBSERVED.iter().flatten() {
-            observed.store(0, Ordering::Release);
-        }
-        for restored in &RESTORED {
-            restored.store(false, Ordering::Release);
-        }
+        reset_observations();
         for flag in [&TIMED_OUT, &MCE_OK, &GATES_OK, &DONE] {
             flag.store(false, Ordering::Release);
         }
@@ -456,22 +593,13 @@ pub fn qualify(
         let area = cpu_local::area_address(ap);
         let mut result = CpuProbe::EMPTY;
         for (event, outcome) in result.events.iter_mut().enumerate() {
-            let observation = observation(event);
-            let (entry_gs, ist_index) = match event {
-                NMI_KERNEL => (area, gdt::NMI_IST_INDEX),
-                NMI_WINDOW => (user_gs(ap), gdt::NMI_IST_INDEX),
-                _ => (user_gs(ap), gdt::MACHINE_CHECK_IST_INDEX),
+            let entry_gs = if event == NMI_KERNEL {
+                area
+            } else {
+                user_gs(ap)
             };
-            *outcome = paranoid::check_observation(
-                &observation,
-                &Expected {
-                    kernel_gs: area,
-                    entry_gs,
-                    index: ap as u64,
-                    ist: gdt::ist_span_for(ap, ist_index),
-                },
-            );
-            result.replaced += u64::from(paranoid::replaced(&observation, area));
+            *outcome = check_event(ap, event, entry_gs);
+            result.replaced += u64::from(paranoid::replaced(&observation(event), area));
             result.restored += u64::from(RESTORED[event].load(Ordering::Acquire));
         }
         result.mce_ok = MCE_OK.load(Ordering::Acquire);
@@ -483,6 +611,9 @@ pub fn qualify(
     Ok(Some(ParanoidQualification {
         cpus,
         probes,
+        bsp_events,
+        bsp_replaced,
+        bsp_restored,
         bsp_gates_ok: gates_ok(),
         bsp_mce_ok: paranoid::check_mce(cpu::read_cr4(), cpu::cpuid_1_edx()).is_ok(),
         slots_ok,

@@ -68,6 +68,10 @@ for index in "${!PROBES[@]}"; do
   [[ "$(value "$line" cr4_mce)" == 1 ]] || fail "CR4.MCE inactif sur l'AP: $line"
 done
 
+# BSP : `int 2` puis `int 18` dans la fenêtre, sur ses propres piles IST.
+grep -Fxq "[paranoid] bsp nmi_soft_window=1 mc_window=1 replaced=2 restored=2" <<<"$CLEAN" \
+  || fail "sonde du BSP absente ou refusée: $(grep -E '^\[paranoid\] bsp ' <<<"$CLEAN" || true)"
+
 slots=$((CPUS * ISTS_PER_CPU))
 expected_summary="$(printf '[paranoid] entry aps=%d cpus=%d ist_df=%d ist_nmi=%d ist_mc=%d slots_ok=%d/%d bsp_gates_ok=1 bsp_cr4_mce=1' \
   "$aps" "$CPUS" "$IST_DF" "$IST_NMI" "$IST_MC" "$slots" "$slots")"
@@ -87,4 +91,4 @@ if grep -Eq '\[sched\] FAILED|\[KERNEL PANIC\]|\[EXCEPTION\]|\[halt\]' <<<"$CLEA
   fail "erreur pendant la qualification"
 fi
 
-echo "[PASS] K005-03 paranoid: sur $aps AP, NMI en mode noyau puis NMI et #MC dans la fenêtre swapgs/iretq servis avec le GS noyau sur leur IST dédiée, GS d'entrée restauré ; $slots piles IST disjointes (#DF=$IST_DF, NMI=$IST_NMI, #MC=$IST_MC) ; CR4.MCE actif ($cr4)"
+echo "[PASS] K005-03 paranoid: sur $aps AP, NMI en mode noyau puis NMI et #MC dans la fenêtre swapgs/iretq servis avec le GS noyau sur leur IST dédiée, GS d'entrée restauré ; BSP : int 2 et int 18 dans la fenêtre ; $slots piles IST disjointes (#DF=$IST_DF, NMI=$IST_NMI, #MC=$IST_MC) ; CR4.MCE actif ($cr4)"

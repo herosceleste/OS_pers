@@ -1301,8 +1301,32 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         paging::identity_limit(),
     ) {
         Ok(Some(probe)) => {
-            let mut consistent =
-                probe.bsp_gates_ok && probe.bsp_mce_ok && probe.slots_ok == probe.slots;
+            let [bsp_nmi, bsp_mc] = probe.bsp_events;
+            kprintln!(
+                "[paranoid] bsp nmi_soft_window={} mc_window={} replaced={} restored={}",
+                u8::from(bsp_nmi.is_ok()),
+                u8::from(bsp_mc.is_ok()),
+                probe.bsp_replaced,
+                probe.bsp_restored
+            );
+            for (event, outcome) in ["nmi_soft_window", "mc_window"]
+                .iter()
+                .zip(probe.bsp_events)
+            {
+                if let Err(error) = outcome {
+                    kprintln!(
+                        "[paranoid] FAILED cpu=0 event={} reason={}",
+                        event,
+                        error.as_str()
+                    );
+                }
+            }
+            let mut consistent = probe.bsp_gates_ok
+                && probe.bsp_mce_ok
+                && probe.slots_ok == probe.slots
+                && probe.bsp_events.iter().all(Result::is_ok)
+                && probe.bsp_replaced == 2
+                && probe.bsp_restored == 2;
             for (cpu, result) in probe.probes.iter().enumerate().take(probe.cpus).skip(1) {
                 let [nmi_kernel, nmi_window, mc_window] = result.events;
                 kprintln!(
