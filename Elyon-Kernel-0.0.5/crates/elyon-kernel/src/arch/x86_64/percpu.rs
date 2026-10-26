@@ -208,15 +208,27 @@ pub fn prepare(
             .ok_or(PerCpuError::AllocationFailed)?;
         let stack_end = stack_start + AP_KERNEL_STACK_FRAMES as u64 * PAGE_SIZE;
 
-        let ist_start = memory::allocate_contiguous_frames(AP_IST_FRAMES)
-            .ok_or(PerCpuError::AllocationFailed)?;
-        let ist_end = ist_start + AP_IST_FRAMES as u64 * PAGE_SIZE;
+        let (ist_start, ist_end) = allocate_ist()?;
+        // K005-03 : piles dédiées NMI et #MC, distinctes de celle du #DF.
+        let nmi = allocate_ist()?;
+        let machine_check = allocate_ist()?;
 
-        if stack_end > identity_limit || ist_end > identity_limit {
+        if stack_end > identity_limit
+            || [ist_end, nmi.1, machine_check.1]
+                .iter()
+                .any(|&end| end > identity_limit)
+        {
             return Err(PerCpuError::ResourceOutsideIdentityMap);
         }
 
-        gdt::prepare_for_cpu(logical, ist_start, ist_end);
+        gdt::prepare_for_cpu(
+            logical,
+            gdt::IstSpans {
+                double_fault: (ist_start, ist_end),
+                nmi,
+                machine_check,
+            },
+        );
 
         configure_slot(
             logical,
@@ -250,6 +262,12 @@ pub fn prepare(
         resources_owned,
         bsp_tss_loaded,
     })
+}
+
+fn allocate_ist() -> Result<(u64, u64), PerCpuError> {
+    let start =
+        memory::allocate_contiguous_frames(AP_IST_FRAMES).ok_or(PerCpuError::AllocationFailed)?;
+    Ok((start, start + AP_IST_FRAMES as u64 * PAGE_SIZE))
 }
 
 pub fn cpu_count() -> usize {

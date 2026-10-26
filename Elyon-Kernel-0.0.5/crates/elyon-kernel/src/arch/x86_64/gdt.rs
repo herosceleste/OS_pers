@@ -1,5 +1,6 @@
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 
+use elyon_core::paranoid;
 use elyon_core::segments::{self, LAYOUT};
 use x86_64::instructions::tables::{load_tss, sgdt};
 use x86_64::registers::segmentation::{CS, DS, ES, SS, Segment};
@@ -7,10 +8,16 @@ use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector
 use x86_64::structures::tss::TaskStateSegment;
 use x86_64::{PrivilegeLevel, VirtAddr};
 
-use super::MAX_CPU_SLOTS;
+use super::{MAX_CPU_SLOTS, cpu_local};
 
-pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
+/// Index dans `interrupt_stack_table` du TSS : numéro d'IST de la porte - 1.
+pub const DOUBLE_FAULT_IST_INDEX: u16 = paranoid::IST_DOUBLE_FAULT - 1;
+pub const NMI_IST_INDEX: u16 = paranoid::IST_NMI - 1;
+pub const MACHINE_CHECK_IST_INDEX: u16 = paranoid::IST_MACHINE_CHECK - 1;
+/// Piles IST paranoïaques par CPU : #DF, NMI, #MC (K005-03).
+pub const PARANOID_ISTS: usize = 3;
 pub const DOUBLE_FAULT_STACK_SIZE: usize = 16 * 1024;
+const _: () = assert!(DOUBLE_FAULT_STACK_SIZE as u64 >= paranoid::MIN_IST_SIZE);
 /// Entrées de la GDT : null, code et données noyau, données et code
 /// utilisateur, TSS sur deux entrées (K005-01, disposition `segments::LAYOUT`).
 pub const GDT_ENTRIES: usize = 7;
@@ -19,6 +26,8 @@ pub const GDT_ENTRIES: usize = 7;
 struct ExceptionStack([u8; DOUBLE_FAULT_STACK_SIZE]);
 
 static mut BSP_DOUBLE_FAULT_STACK: ExceptionStack = ExceptionStack([0; DOUBLE_FAULT_STACK_SIZE]);
+static mut BSP_NMI_STACK: ExceptionStack = ExceptionStack([0; DOUBLE_FAULT_STACK_SIZE]);
+static mut BSP_MACHINE_CHECK_STACK: ExceptionStack = ExceptionStack([0; DOUBLE_FAULT_STACK_SIZE]);
 static mut TSS_TABLE: [TaskStateSegment; MAX_CPU_SLOTS] =
     [const { TaskStateSegment::new() }; MAX_CPU_SLOTS];
 static mut GDT_TABLE: [GlobalDescriptorTable<8>; MAX_CPU_SLOTS] =
@@ -26,27 +35,58 @@ static mut GDT_TABLE: [GlobalDescriptorTable<8>; MAX_CPU_SLOTS] =
 static mut CODE_SELECTORS: [u16; MAX_CPU_SLOTS] = [0; MAX_CPU_SLOTS];
 static mut DATA_SELECTORS: [u16; MAX_CPU_SLOTS] = [0; MAX_CPU_SLOTS];
 static mut TSS_SELECTORS: [u16; MAX_CPU_SLOTS] = [0; MAX_CPU_SLOTS];
-static mut IST_STARTS: [u64; MAX_CPU_SLOTS] = [0; MAX_CPU_SLOTS];
-static mut IST_ENDS: [u64; MAX_CPU_SLOTS] = [0; MAX_CPU_SLOTS];
+/// Piles `[start, end)` d'un CPU, rangées par index IST du TSS.
+static mut IST_SPANS: [[(u64, u64); PARANOID_ISTS]; MAX_CPU_SLOTS] =
+    [[(0, 0); PARANOID_ISTS]; MAX_CPU_SLOTS];
+
+/// Piles IST paranoïaques d'un CPU (K005-03).
+#[derive(Clone, Copy)]
+pub struct IstSpans {
+    pub double_fault: (u64, u64),
+    pub nmi: (u64, u64),
+    pub machine_check: (u64, u64),
+}
 
 pub fn init() -> u16 {
-    let (ist_start, ist_end) = bsp_double_fault_stack_span();
-    prepare_for_cpu(0, ist_start, ist_end);
+    prepare_for_cpu(
+        0,
+        IstSpans {
+            double_fault: static_span(addr_of!(BSP_DOUBLE_FAULT_STACK)),
+            nmi: static_span(addr_of!(BSP_NMI_STACK)),
+            machine_check: static_span(addr_of!(BSP_MACHINE_CHECK_STACK)),
+        },
+    );
     load_for_cpu(0)
 }
 
-pub fn prepare_for_cpu(cpu_index: usize, ist_start: u64, ist_end: u64) {
+pub fn prepare_for_cpu(cpu_index: usize, spans: IstSpans) {
     assert!(cpu_index < MAX_CPU_SLOTS);
-    assert!(ist_start != 0 && ist_end > ist_start);
+    let mut ordered = [(0, 0); PARANOID_ISTS];
+    ordered[DOUBLE_FAULT_IST_INDEX as usize] = spans.double_fault;
+    ordered[NMI_IST_INDEX as usize] = spans.nmi;
+    ordered[MACHINE_CHECK_IST_INDEX as usize] = spans.machine_check;
+    if let Err(error) = paranoid::check_spans(&ordered) {
+        panic!("invalid IST stacks: {}", error.as_str());
+    }
 
+    // SAFETY: appelé avant que ce CPU charge son TSS ; les piles IST sont des
+    // statiques du noyau (BSP) ou des cadres que `percpu::prepare` a alloués et
+    // vérifiés sous la limite du mappage identité, disjoints (`check_spans`) ;
+    // le mot GS est écrit sous leur sommet, dans la pile elle-même.
     unsafe {
-        IST_STARTS[cpu_index] = ist_start;
-        IST_ENDS[cpu_index] = ist_end;
-
         let tss_table = addr_of_mut!(TSS_TABLE);
         (*tss_table)[cpu_index] = TaskStateSegment::new();
-        (*tss_table)[cpu_index].interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
-            VirtAddr::new(ist_end);
+        for (index, &(start, end)) in ordered.iter().enumerate() {
+            let pointer = paranoid::ist_pointer(start, end)
+                .unwrap_or_else(|error| panic!("invalid IST stack: {}", error.as_str()));
+            // K005-03 : le stub paranoïaque relit ici le GS_BASE noyau de ce
+            // CPU, sans passer par GS ni se fier au CS sauvegardé.
+            let slot = pointer as *mut u64;
+            write_volatile(slot, cpu_local::area_address(cpu_index));
+            write_volatile(slot.add(1), 0);
+            (*tss_table)[cpu_index].interrupt_stack_table[index] = VirtAddr::new(pointer);
+        }
+        IST_SPANS[cpu_index] = ordered;
 
         let gdt_table = addr_of_mut!(GDT_TABLE);
         (*gdt_table)[cpu_index] = GlobalDescriptorTable::<8>::empty();
@@ -93,18 +133,41 @@ pub fn load_for_cpu(cpu_index: usize) -> u16 {
     }
 }
 
-fn bsp_double_fault_stack_span() -> (u64, u64) {
-    let start = addr_of!(BSP_DOUBLE_FAULT_STACK) as u64;
+fn static_span(stack: *const ExceptionStack) -> (u64, u64) {
+    let start = stack as u64;
     (start, start + DOUBLE_FAULT_STACK_SIZE as u64)
 }
 
-pub fn double_fault_stack_span() -> (u64, u64) {
-    double_fault_stack_span_for(0)
+pub fn double_fault_stack_span_for(cpu_index: usize) -> (u64, u64) {
+    ist_span_for(cpu_index, DOUBLE_FAULT_IST_INDEX)
 }
 
-pub fn double_fault_stack_span_for(cpu_index: usize) -> (u64, u64) {
-    assert!(cpu_index < MAX_CPU_SLOTS);
-    unsafe { (IST_STARTS[cpu_index], IST_ENDS[cpu_index]) }
+/// Pile `[start, end)` de l'IST `index` (index du TSS) de `cpu_index`.
+pub fn ist_span_for(cpu_index: usize, index: u16) -> (u64, u64) {
+    assert!(cpu_index < MAX_CPU_SLOTS && usize::from(index) < PARANOID_ISTS);
+    unsafe { IST_SPANS[cpu_index][usize::from(index)] }
+}
+
+/// Pointeur IST `index` relu dans le TSS de `cpu_index`, et le mot GS noyau
+/// qui y est rangé : ce que le processeur et le stub utiliseront vraiment.
+pub fn ist_pointer_and_slot(cpu_index: usize, index: u16) -> (u64, u64) {
+    assert!(cpu_index < MAX_CPU_SLOTS && usize::from(index) < PARANOID_ISTS);
+    // SAFETY: lecture de deux u32 alignés sur 4 du TSS statique (`packed(4)`,
+    // comme RSP0), puis du mot posé par `prepare_for_cpu` sous ce pointeur,
+    // dans une pile IST mappée en identité.
+    unsafe {
+        let table = addr_of!(TSS_TABLE);
+        let halves =
+            addr_of!((*table)[cpu_index].interrupt_stack_table[usize::from(index)]).cast::<u32>();
+        let pointer =
+            u64::from(read_volatile(halves)) | (u64::from(read_volatile(halves.add(1))) << 32);
+        let slot = if pointer == 0 {
+            0
+        } else {
+            read_volatile(pointer as *const u64)
+        };
+        (pointer, slot)
+    }
 }
 
 pub fn gdt_address(cpu_index: usize) -> u64 {

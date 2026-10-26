@@ -10,6 +10,8 @@ ESP="$ROOT/build/esp"
 command -v cargo >/dev/null || { echo "cargo introuvable" >&2; exit 1; }
 command -v rustup >/dev/null || { echo "rustup introuvable" >&2; exit 1; }
 
+# Build nominal (ISO, gate de release) : aucun mode de test hérité du shell.
+unset ELYON_TEST_UD ELYON_TEST_DF ELYON_TEST_USER_IRET
 export ELYON_BUILD_ID
 ELYON_BUILD_ID="$(git -C "$ROOT/.." rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
 

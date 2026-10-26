@@ -10,6 +10,7 @@ mod fpu;
 mod fpu_integrity;
 mod framebuffer;
 mod memory;
+mod paranoid_probe;
 mod sched;
 mod serial;
 mod sync;
@@ -32,6 +33,11 @@ const BUILD_ID: &str = match option_env!("ELYON_BUILD_ID") {
 
 const TEST_UD: bool = option_env!("ELYON_TEST_UD").is_some();
 const TEST_DF: bool = option_env!("ELYON_TEST_DF").is_some();
+const TEST_USER_IRET: bool = option_env!("ELYON_TEST_USER_IRET").is_some();
+/// GS utilisateur des modes de test #DF et `iretq` (K005-03) : adresse
+/// utilisateur jamais mappée, tout accès noyau via ce GS lèverait #PF.
+const TEST_USER_GS: u64 = elyon_core::ring3::USER_BASE + 0x30_0000;
+const IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
 
 /// Point d'entrée du noyau, atteint par saut depuis le loader UEFI.
 ///
@@ -88,6 +94,8 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         code_selector,
         idt::user_probe_exit_handler(),
     );
+    // K005-03 : la porte #MC et sa pile IST sont en place.
+    cpu::enable_machine_check();
     kprintln!("[arch] IDT=OK exceptions=diagnostic");
 
     if TEST_UD {
@@ -146,8 +154,38 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
     );
 
     if TEST_DF {
-        kprintln!("[test] injecting #DF via invalid stack + int3");
+        kprintln!(
+            "[test] injecting #DF via invalid stack + int3 user_gs={:#018x}",
+            TEST_USER_GS
+        );
+        // K005-03 : le #DF part avec le GS utilisateur ; seule l'entrée
+        // paranoïaque permet à son diagnostic de tourner.
+        // SAFETY: MSR architectural ; `trigger_double_fault_test` fait `swapgs`.
+        unsafe { cpu::write_msr(IA32_KERNEL_GS_BASE, TEST_USER_GS) };
         idt::trigger_double_fault_test();
+    }
+
+    if TEST_USER_IRET {
+        let frame = elyon_core::ring3::IretFrame {
+            rip: elyon_core::ring3::USER_CODE_VA,
+            // Sélecteur hors de la GDT : `iretq` lève #GP après `swapgs`.
+            cs: 0x3B,
+            rflags: 0x202,
+            rsp: elyon_core::ring3::USER_STACK_TOP,
+            ss: 0x1B,
+        };
+        kprintln!(
+            "[test] injecting #GP on the user iretq cs={:#x} user_gs={:#018x} iret={:#018x}",
+            frame.cs,
+            TEST_USER_GS,
+            idt::user_iret_address()
+        );
+        // SAFETY: mode de test ; le cadre est refusé par `iretq` avant tout
+        // passage en ring 3, et le #GP s'arrête fail-closed.
+        unsafe {
+            cpu::write_msr(IA32_KERNEL_GS_BASE, TEST_USER_GS);
+            idt::enter_user(&frame)
+        }
     }
 
     let topology = match acpi::parse(info.acpi_rsdp, paging::identity_limit()) {
@@ -1250,6 +1288,99 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         Err(error) => {
             kprintln!(
                 "[ring3] FAILED reason={} ticks={}",
+                error.as_str(),
+                timer::ticks()
+            );
+            fatal::halt_system();
+        }
+    }
+
+    match paranoid_probe::qualify(
+        info.kernel_stack_start,
+        info.kernel_stack_end,
+        paging::identity_limit(),
+    ) {
+        Ok(Some(probe)) => {
+            let [bsp_nmi, bsp_mc] = probe.bsp_events;
+            kprintln!(
+                "[paranoid] bsp nmi_soft_window={} mc_window={} replaced={} restored={}",
+                u8::from(bsp_nmi.is_ok()),
+                u8::from(bsp_mc.is_ok()),
+                probe.bsp_replaced,
+                probe.bsp_restored
+            );
+            for (event, outcome) in ["nmi_soft_window", "mc_window"]
+                .iter()
+                .zip(probe.bsp_events)
+            {
+                if let Err(error) = outcome {
+                    kprintln!(
+                        "[paranoid] FAILED cpu=0 event={} reason={}",
+                        event,
+                        error.as_str()
+                    );
+                }
+            }
+            let mut consistent = probe.bsp_gates_ok
+                && probe.bsp_mce_ok
+                && probe.slots_ok == probe.slots
+                && probe.bsp_events.iter().all(Result::is_ok)
+                && probe.bsp_replaced == 2
+                && probe.bsp_restored == 2;
+            for (cpu, result) in probe.probes.iter().enumerate().take(probe.cpus).skip(1) {
+                let [nmi_kernel, nmi_window, mc_window] = result.events;
+                kprintln!(
+                    "[paranoid] cpu={} nmi_kernel={} nmi_window={} mc_window={} replaced={} restored={} gates_ok={} cr4_mce={}",
+                    cpu,
+                    u8::from(nmi_kernel.is_ok()),
+                    u8::from(nmi_window.is_ok()),
+                    u8::from(mc_window.is_ok()),
+                    result.replaced,
+                    result.restored,
+                    u8::from(result.gates_ok),
+                    u8::from(result.mce_ok)
+                );
+                for (event, outcome) in ["nmi_kernel", "nmi_window", "mc_window"]
+                    .iter()
+                    .zip(result.events)
+                {
+                    if let Err(error) = outcome {
+                        kprintln!(
+                            "[paranoid] FAILED cpu={} event={} reason={}",
+                            cpu,
+                            event,
+                            error.as_str()
+                        );
+                    }
+                }
+                consistent &= result.events.iter().all(Result::is_ok)
+                    && result.replaced == 2
+                    && result.restored == 3
+                    && result.gates_ok
+                    && result.mce_ok;
+            }
+            kprintln!(
+                "[paranoid] entry aps={} cpus={} ist_df={} ist_nmi={} ist_mc={} slots_ok={}/{} bsp_gates_ok={} bsp_cr4_mce={}",
+                probe.cpus - 1,
+                probe.cpus,
+                elyon_core::paranoid::IST_DOUBLE_FAULT,
+                elyon_core::paranoid::IST_NMI,
+                elyon_core::paranoid::IST_MACHINE_CHECK,
+                probe.slots_ok,
+                probe.slots,
+                u8::from(probe.bsp_gates_ok),
+                u8::from(probe.bsp_mce_ok)
+            );
+            if !consistent {
+                kprintln!("[paranoid] FAILED reason=paranoid entry invariant violated");
+                fatal::halt_system();
+            }
+            kprintln!("ELYON_PARANOID_ENTRY_READY");
+        }
+        Ok(None) => kprintln!("[paranoid] skipped single_cpu=1"),
+        Err(error) => {
+            kprintln!(
+                "[paranoid] FAILED reason={} ticks={}",
                 error.as_str(),
                 timer::ticks()
             );
