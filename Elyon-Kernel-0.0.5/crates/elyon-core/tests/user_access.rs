@@ -83,6 +83,17 @@ fn cr4_must_carry_every_supported_protection() {
     );
 }
 
+#[test]
+fn cr0_write_protect_is_required() {
+    // Sans CR0.WP, le noyau écrit sur une page en lecture seule : une copie
+    // vers une page utilisateur non inscriptible réussirait.
+    assert_eq!(user_access::check_write_protect(0x8001_0033), Ok(()));
+    assert_eq!(
+        user_access::check_write_protect(0x8000_0011),
+        Err(UserAccessError::WriteProtectDisabled)
+    );
+}
+
 // --- Plages utilisateur ----------------------------------------------------------
 
 #[test]
@@ -354,6 +365,7 @@ fn every_error_has_a_message() {
         UserAccessError::SmepDisabled,
         UserAccessError::SmapDisabled,
         UserAccessError::UmipDisabled,
+        UserAccessError::WriteProtectDisabled,
         UserAccessError::Empty,
         UserAccessError::TooLong,
         UserAccessError::Overflow,
