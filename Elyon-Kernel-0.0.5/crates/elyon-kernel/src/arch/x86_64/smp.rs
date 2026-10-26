@@ -3,6 +3,7 @@ use core::ptr::{copy_nonoverlapping, write_bytes, write_unaligned};
 use core::sync::atomic::{AtomicU64, Ordering, fence};
 
 use elyon_abi::BootInfo;
+use elyon_core::user_access;
 
 use crate::arch::x86_64::{apic, cpu, gdt, idt, percpu};
 use crate::{kprintln, memory, timer};
@@ -393,6 +394,14 @@ extern "sysv64" fn elyon_ap_entry(cpu_index: u64, expected_apic_id: u64) -> ! {
     // K005-03 : le trampoline ne laisse que CR4.PAE ; sans MCE, un #MC
     // arrêterait cet AP au lieu d'entrer dans le gestionnaire.
     cpu::enable_machine_check();
+    // K005-04 : SMEP, SMAP et UMIP, comme sur le BSP. Les stubs d'entrée
+    // exécutent `clac` : un AP sans SMAP s'arrête ici, IRQ masquées.
+    let protection = cpu::supervisor_protection();
+    if let Err(error) = user_access::check_support(protection) {
+        kprintln!("[smp] AP FAILED cpu={} reason={}", index, error.as_str());
+        cpu::halt_forever();
+    }
+    cpu::enable_supervisor_protection(protection);
 
     let observed_apic_id = match apic::init_secondary() {
         Ok(value) => value,

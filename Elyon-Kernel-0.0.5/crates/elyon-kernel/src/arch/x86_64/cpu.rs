@@ -1,5 +1,7 @@
 use core::arch::asm;
 
+use elyon_core::user_access;
+
 // `cli`/`sti` délimitent des sections critiques : sans `nomem`, le compilateur
 // les traite comme des accès mémoire et n'y déplace pas les lectures/écritures.
 
@@ -71,6 +73,38 @@ pub fn enable_machine_check() {
     // SAFETY: CR4.MCE n'active que la livraison de #MC, dont la porte et la
     // pile IST sont en place avant l'appel.
     unsafe { asm!("mov cr4, {}", in(reg) cr4, options(nostack, preserves_flags)) }
+}
+
+/// SMEP, SMAP et UMIP annoncés par CPUID (feuille 7, sous-feuille 0).
+pub fn supervisor_protection() -> user_access::Features {
+    let max_leaf = core::arch::x86_64::__cpuid(0).eax;
+    let leaf = core::arch::x86_64::__cpuid_count(7, 0);
+    user_access::features(max_leaf, leaf.ebx, leaf.ecx)
+}
+
+/// Active SMEP, SMAP et UMIP selon `features`, et CR0.WP (K005-04). Appelé
+/// une fois les tables d'Elyon chargées : le mappage identité ne porte jamais
+/// le bit U/S, alors que celles du firmware peuvent le porter. Le trampoline
+/// des AP ne pose que PE et PG dans CR0 : sans WP, le noyau y écrirait sur
+/// toute page en lecture seule, et une copie vers une telle page réussirait.
+pub fn enable_supervisor_protection(features: user_access::Features) {
+    let cr0 = read_cr0() | user_access::CR0_WP;
+    let cr4 = read_cr4() | user_access::cr4_bits(features);
+    // SAFETY: WP fait seulement respecter le bit W des pages au noyau, qui
+    // n'écrit jamais sur ses pages en lecture seule ; SMEP et SMAP ne
+    // restreignent que les accès du noyau aux pages utilisateur, que seule la
+    // copie validée ouvre ; UMIP, que le ring 3.
+    unsafe {
+        asm!("mov cr0, {}", in(reg) cr0, options(nostack, preserves_flags));
+        asm!("mov cr4, {}", in(reg) cr4, options(nostack, preserves_flags));
+    }
+}
+
+pub fn read_rflags() -> u64 {
+    let flags: u64;
+    // SAFETY: lit RFLAGS via la pile, sans effet de bord.
+    unsafe { asm!("pushfq", "pop {}", out(reg) flags, options(preserves_flags)) }
+    flags
 }
 
 pub struct CpuVendor {

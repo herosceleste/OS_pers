@@ -19,6 +19,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use elyon_abi::PAGE_SIZE;
 use elyon_core::ring3::{self, Ring3Error};
 use elyon_core::task_stack::StackRegion;
+use elyon_core::user_access;
 
 use crate::arch::x86_64::{cpu, cpu_local, idt, paging};
 use crate::sched::{self, ReapOutcome, SchedError};
@@ -43,9 +44,14 @@ global_asm!(
 .pushsection .rodata.user_probe,"a"
 // Code ring 3 de la sonde, copié dans la page de code utilisateur : boucle
 // jusqu'à ce que le noyau lève le drapeau au bas de la page de pile, puis
-// sort par `int 0x81`. Indépendant de sa position, aucune pile utilisée.
+// sort par `int 0x81`. Indépendant de sa position. K005-04 : lève d'abord
+// RFLAGS.AC (seul usage de la pile) : chaque entrée dans le noyau doit
+// l'effacer par `clac`, sinon SMAP serait levé en ring 0.
 .global elyon_user_probe_code_start
 elyon_user_probe_code_start:
+    pushfq
+    or qword ptr [rsp], {ac}
+    popfq
     movabs rax, {flag}
 1:
     pause
@@ -61,6 +67,7 @@ elyon_user_probe_code_end:
 "#,
     flag = const ring3::USER_STACK_VA,
     exit_vector = const idt::USER_PROBE_EXIT_VECTOR,
+    ac = const user_access::RFLAGS_AC,
 );
 
 unsafe extern "C" {
@@ -80,6 +87,10 @@ static EXITS: AtomicU64 = AtomicU64::new(0);
 static EXIT_GS_OK: AtomicU64 = AtomicU64::new(0);
 static FSGSBASE_ON: AtomicU64 = AtomicU64::new(0);
 static SCE_ON: AtomicU64 = AtomicU64::new(0);
+/// K005-04 : entrées depuis le ring 3 où le noyau tournait avec RFLAGS.AC.
+static AC_LEAKS: AtomicU64 = AtomicU64::new(0);
+/// RFLAGS.AC levé dans le cadre de la sortie : le ring 3 l'avait bien levé.
+static USER_AC: AtomicU64 = AtomicU64::new(0);
 static DONE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
@@ -124,6 +135,8 @@ pub struct CpuProbe {
     pub fsgsbase_on: u64,
     /// EFER.SCE trouvé actif (et effacé) avant l'entrée en ring 3.
     pub sce_on: u64,
+    pub ac_leaks: u64,
+    pub user_ac: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -165,6 +178,9 @@ pub fn note_entry(saved_cs: u64) {
     if read_msr(IA32_KERNEL_GS_BASE) != expected_user {
         GS_FAILURES.fetch_add(1, Ordering::AcqRel);
     }
+    if cpu::read_rflags() & user_access::RFLAGS_AC != 0 {
+        AC_LEAKS.fetch_add(1, Ordering::AcqRel);
+    }
     if USER_ENTRIES.fetch_add(1, Ordering::AcqRel) + 1 >= TARGET_ENTRIES {
         // SAFETY: la page de pile de la sonde, mappée en identité, n'est lue
         // que par la boucle utilisateur de ce CPU.
@@ -173,7 +189,7 @@ pub fn note_entry(saved_cs: u64) {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn elyon_user_probe_exit_dispatch(saved_cs: u64) -> ! {
+extern "C" fn elyon_user_probe_exit_dispatch(saved_cs: u64, saved_rflags: u64) -> ! {
     // Revue ECC K005-02 : la porte DPL 3 n'est valable que pendant une sonde,
     // sur le CPU sondé. Hors de ce cadre, aucun code ring 3 n'existe encore :
     // c'est une violation d'invariant (K005-08 tuera alors le processus).
@@ -189,6 +205,12 @@ extern "C" fn elyon_user_probe_exit_dispatch(saved_cs: u64) -> ! {
         && read_msr(IA32_KERNEL_GS_BASE) == EXPECTED_USER_GS.load(Ordering::Acquire);
     if ok {
         EXIT_GS_OK.fetch_add(1, Ordering::AcqRel);
+    }
+    if saved_rflags & user_access::RFLAGS_AC != 0 {
+        USER_AC.fetch_add(1, Ordering::AcqRel);
+    }
+    if cpu::read_rflags() & user_access::RFLAGS_AC != 0 {
+        AC_LEAKS.fetch_add(1, Ordering::AcqRel);
     }
     EXITS.fetch_add(1, Ordering::AcqRel);
     // Le GS de la sonde ne lui survit pas.
@@ -285,6 +307,8 @@ pub fn qualify(
             &EXIT_GS_OK,
             &FSGSBASE_ON,
             &SCE_ON,
+            &AC_LEAKS,
+            &USER_AC,
         ] {
             counter.store(0, Ordering::Release);
         }
@@ -342,6 +366,8 @@ pub fn qualify(
             exit_gs_ok: EXIT_GS_OK.load(Ordering::Acquire),
             fsgsbase_on: FSGSBASE_ON.load(Ordering::Acquire),
             sce_on: SCE_ON.load(Ordering::Acquire),
+            ac_leaks: AC_LEAKS.load(Ordering::Acquire),
+            user_ac: USER_AC.load(Ordering::Acquire),
         };
     }
     PROBE_CPU.store(u64::MAX, Ordering::Release);

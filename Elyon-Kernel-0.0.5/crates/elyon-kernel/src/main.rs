@@ -18,6 +18,8 @@ mod task;
 mod task_frames;
 mod task_stack;
 mod timer;
+mod user_access_probe;
+mod user_copy;
 mod user_probe;
 
 use core::panic::PanicInfo;
@@ -34,6 +36,7 @@ const BUILD_ID: &str = match option_env!("ELYON_BUILD_ID") {
 const TEST_UD: bool = option_env!("ELYON_TEST_UD").is_some();
 const TEST_DF: bool = option_env!("ELYON_TEST_DF").is_some();
 const TEST_USER_IRET: bool = option_env!("ELYON_TEST_USER_IRET").is_some();
+const TEST_SMAP: bool = option_env!("ELYON_TEST_SMAP").is_some();
 /// GS utilisateur des modes de test #DF et `iretq` (K005-03) : adresse
 /// utilisateur jamais mappée, tout accès noyau via ce GS lèverait #PF.
 const TEST_USER_GS: u64 = elyon_core::ring3::USER_BASE + 0x30_0000;
@@ -80,6 +83,19 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
 
     let vendor = cpu::vendor_string();
     kprintln!("[cpu] vendor={}", vendor.as_str());
+    // K005-04 : SMEP et SMAP sont exigés avant l'IDT, dont les stubs
+    // exécutent `clac` (#UD sans SMAP).
+    let protection = cpu::supervisor_protection();
+    kprintln!(
+        "[cpu] smep={} smap={} umip={}",
+        u8::from(protection.smep),
+        u8::from(protection.smap),
+        u8::from(protection.umip)
+    );
+    if let Err(error) = elyon_core::user_access::check_support(protection) {
+        kprintln!("[cpu] FAILED reason={}", error.as_str());
+        cpu::halt_forever();
+    }
 
     let code_selector = gdt::init();
     kprintln!(
@@ -152,6 +168,10 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         new_cr3,
         paging::identity_limit() / 1024 / 1024
     );
+    // K005-04 : sur les tables d'Elyon, dont le mappage identité ne porte
+    // jamais le bit U/S.
+    cpu::enable_supervisor_protection(protection);
+    kprintln!("[uaccess] CR4={:#018x}", cpu::read_cr4());
 
     if TEST_DF {
         kprintln!(
@@ -1246,12 +1266,14 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         }
     }
 
+    let mut ring3_probe = None;
     match user_probe::qualify(
         info.kernel_stack_start,
         info.kernel_stack_end,
         paging::identity_limit(),
     ) {
         Ok(Some(probe)) => {
+            ring3_probe = Some(probe);
             let mut consistent = !probe.cr4_fsgsbase;
             for (cpu, result) in probe.probes.iter().enumerate().take(probe.cpus).skip(1) {
                 kprintln!(
@@ -1386,6 +1408,99 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
             );
             fatal::halt_system();
         }
+    }
+
+    match user_access_probe::qualify(
+        info.kernel_stack_start,
+        info.kernel_stack_end,
+        paging::identity_limit(),
+    ) {
+        Ok(Some(probe)) => {
+            let mut consistent = probe.pages_ok;
+            for (cpu, result) in probe.probes.iter().enumerate().take(probe.cpus) {
+                kprintln!(
+                    "[uaccess] cpu={} cr4_ok={} cr0_wp={} smap={} smep={} copy={} ro_refused={} unmapped_refused={} partial={} faults={} rejects={} handler_ac={} ac_clear={}",
+                    cpu,
+                    u8::from(result.cr4_ok),
+                    u8::from(result.cr0_wp),
+                    u8::from(result.smap_ok),
+                    u8::from(result.smep_ok),
+                    u8::from(result.copy_ok),
+                    u8::from(result.read_only_refused),
+                    u8::from(result.unmapped_refused),
+                    u8::from(result.partial_ok),
+                    result.faults,
+                    result.rejects,
+                    result.handler_ac,
+                    u8::from(result.ac_clear)
+                );
+                if !result.ok() {
+                    kprintln!(
+                        "[uaccess] FAILED cpu={} smap_error={:#x} smep_error={:#x}",
+                        cpu,
+                        result.smap_error,
+                        result.smep_error
+                    );
+                }
+                consistent &= result.ok();
+            }
+            // K005-04 : `clac` à chaque entrée depuis le ring 3, où la sonde
+            // K005-02 avait levé RFLAGS.AC.
+            let mut ring3_entries = 0;
+            if let Some(ring3) = ring3_probe {
+                for (cpu, result) in ring3.probes.iter().enumerate().take(ring3.cpus).skip(1) {
+                    kprintln!(
+                        "[uaccess] ring3 cpu={} user_ac={} entries={} ac_leaks={}",
+                        cpu,
+                        result.user_ac,
+                        result.user_entries,
+                        result.ac_leaks
+                    );
+                    consistent &= result.user_ac == 1 && result.ac_leaks == 0;
+                    ring3_entries += result.user_entries;
+                }
+            } else {
+                consistent = false;
+            }
+            kprintln!(
+                "[uaccess] protection cpus={} smep={} smap={} umip={} pages_ok={} ring3_entries={} max_copy={}",
+                probe.cpus,
+                u8::from(probe.features.smep),
+                u8::from(probe.features.smap),
+                u8::from(probe.features.umip),
+                u8::from(probe.pages_ok),
+                ring3_entries,
+                elyon_core::user_access::MAX_COPY_LEN
+            );
+            if !consistent {
+                kprintln!("[uaccess] FAILED reason=SMEP/SMAP or user copy invariant violated");
+                fatal::halt_system();
+            }
+            kprintln!("ELYON_USER_ACCESS_READY");
+        }
+        Ok(None) => kprintln!("[uaccess] skipped single_cpu=1"),
+        Err(error) => {
+            kprintln!(
+                "[uaccess] FAILED reason={} ticks={}",
+                error.as_str(),
+                timer::ticks()
+            );
+            fatal::halt_system();
+        }
+    }
+
+    if TEST_SMAP {
+        kprintln!(
+            "[test] injecting a direct kernel read of user page {:#018x}",
+            elyon_core::user_access::PROBE_DATA_VA
+        );
+        // SAFETY: mode de test ; la page est présente, SMAP lève une #PF hors
+        // de toute reprise, et le système s'arrête fail-closed.
+        let value = unsafe {
+            core::ptr::read_volatile(elyon_core::user_access::PROBE_DATA_VA as *const u64)
+        };
+        kprintln!("[test] SMAP bypassed value={:#018x}", value);
+        fatal::halt_system();
     }
 
     if framebuffer::draw_boot_screen(info, paging::identity_limit()) {
