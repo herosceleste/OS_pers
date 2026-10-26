@@ -224,6 +224,17 @@ fn a_copy_fault_without_ac_is_a_smap_violation_and_is_not_resumed() {
 }
 
 #[test]
+fn a_reserved_bit_protection_key_or_sgx_fault_is_not_resumed() {
+    // Bit 3 (RSVD : table de pages corrompue), bit 5 (PK), bit 15 (SGX) : un
+    // bogue du noyau, jamais une simple erreur de copie.
+    for extra in [1 << 3, 1 << 5, 1 << 15] {
+        let mut site = copy_fault();
+        site.error_code = user_access::PF_PRESENT | extra;
+        assert_eq!(user_access::copy_resume(&site, ACCESS, FIXUP), None);
+    }
+}
+
+#[test]
 fn an_instruction_fetch_fault_is_not_resumed() {
     let mut site = copy_fault();
     site.error_code = user_access::PF_PRESENT | user_access::PF_INSTRUCTION;
