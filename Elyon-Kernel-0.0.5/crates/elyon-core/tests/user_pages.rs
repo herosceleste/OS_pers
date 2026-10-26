@@ -218,6 +218,13 @@ fn a_shootdown_completes_once_every_target_acknowledged_its_generation() {
 }
 
 #[test]
+fn the_frame_mask_keeps_bits_51_to_12() {
+    assert_eq!(user_pages::PTE_FRAME, 0x000F_FFFF_FFFF_F000);
+    let leaf = user_pages::user_leaf(FRAME, PageKind::Data).unwrap();
+    assert_eq!(leaf & user_pages::PTE_FRAME, FRAME);
+}
+
+#[test]
 fn every_error_has_a_message() {
     for error in [
         UserPageError::Frame,
@@ -228,6 +235,7 @@ fn every_error_has_a_message() {
         UserPageError::AliasPresent,
         UserPageError::NxUnsupported,
         UserPageError::NxDisabled,
+        UserPageError::OutOfMemory,
     ] {
         assert!(!error.as_str().is_empty());
     }
