@@ -95,6 +95,11 @@ pub fn mark_identity_mmio_uncacheable(address: u64) -> bool {
     unsafe {
         let pds = addr_of_mut!(PDS);
         let pd = core::ptr::addr_of_mut!((*pds)[pdpt_index]);
+        // K005-05 : une grande page découpée pointe vers une table ; ses bits
+        // de cache porteraient sur la table, pas sur le MMIO.
+        if (*pd).0[pd_index] & HUGE == 0 {
+            return false;
+        }
         (*pd).0[pd_index] |= WRITE_THROUGH | CACHE_DISABLE;
         asm!(
             "invlpg [{}]",
@@ -106,105 +111,230 @@ pub fn mark_identity_mmio_uncacheable(address: u64) -> bool {
     true
 }
 
-// --- K005-02 : région utilisateur minimale -----------------------------------------
+// --- K005-02 et K005-05 : région utilisateur ------------------------------------
 //
 // Les pages utilisateur vivent dans PML4[1] (`ring3::USER_BASE`), sous des
 // tables propres : le mappage identité du noyau, dans PML4[0], ne reçoit
-// jamais le bit U/S. La sonde ring 3 y mappe une page de code, en lecture
-// seule, et une page de pile.
+// jamais le bit U/S. K005-05 : une frame mappée pour le ring 3 est retirée du
+// mappage identité ; sa grande page de 2 Mio est d'abord découpée en pages de
+// 4 Kio de mêmes attributs, dans une table allouée une fois pour toutes.
+
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use elyon_core::ring3::{self, Ring3Error};
+use elyon_core::user_pages::{self, PageKind, UserPageError};
 
 static mut USER_PDPT: PageTable = PageTable([0; ENTRIES]);
 static mut USER_PD: PageTable = PageTable([0; ENTRIES]);
 static mut USER_PT: PageTable = PageTable([0; ENTRIES]);
 
-/// Mappe la page de code et la page de pile de la sonde. Appelé par le BSP
-/// avant qu'aucun CPU n'utilise la région : aucune entrée n'était présente,
-/// donc aucun TLB ne peut en garder une ancienne.
-pub fn map_user_probe(code_frame: u64, stack_frame: u64) -> Result<(), Ring3Error> {
-    let [pml4_index, pdpt_index, pd_index, code_index] = ring3::indices(ring3::USER_CODE_VA);
-    let stack_index = ring3::indices(ring3::USER_STACK_VA)[3];
-    // SAFETY: tables statiques mappées en identité, modifiées par le seul BSP
-    // avant toute utilisation de la région utilisateur.
+/// Un seul CPU modifie les tables à la fois. Aucun détenteur n'attend un
+/// autre CPU (les shootdowns ont lieu hors de ce verrou), et aucun
+/// gestionnaire d'interruption ne le prend.
+static PAGING_BUSY: AtomicBool = AtomicBool::new(false);
+
+fn with_tables<T>(body: impl FnOnce() -> T) -> T {
+    while PAGING_BUSY
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    let result = body();
+    PAGING_BUSY.store(false, Ordering::Release);
+    result
+}
+
+/// Index de `va` dans la table utilisateur : les 2 premiers Mio de la région.
+fn user_index(va: u64) -> Result<usize, UserPageError> {
+    let [pml4_index, pdpt_index, pd_index, pt_index] = ring3::indices(va);
+    if va & 0xFFF != 0
+        || !ring3::is_user_address(va)
+        || ring3::indices(ring3::USER_BASE)[..3] != [pml4_index, pdpt_index, pd_index]
+    {
+        return Err(UserPageError::Frame);
+    }
+    Ok(pt_index)
+}
+
+/// Relie PML4[1] → PDPT → PD → PT, U/S et inscriptibles, jamais NX : les
+/// droits fins sont ceux de chaque page. Idempotent.
+fn link_user_tables() -> Result<(), Ring3Error> {
+    let [pml4_index, pdpt_index, pd_index, _] = ring3::indices(ring3::USER_BASE);
+    // SAFETY: tables statiques mappées en identité, sous PAGING_BUSY.
     unsafe {
-        let pml4 = addr_of_mut!(PML4);
-        let pdpt = addr_of_mut!(USER_PDPT);
-        let pd = addr_of_mut!(USER_PD);
-        let pt = addr_of_mut!(USER_PT);
-        (*pt).0[code_index] = ring3::table_entry(code_frame, true, false)?;
-        (*pt).0[stack_index] = ring3::table_entry(stack_frame, true, true)?;
-        (*pd).0[pd_index] = ring3::table_entry(pt as u64, true, true)?;
-        (*pdpt).0[pdpt_index] = ring3::table_entry(pd as u64, true, true)?;
-        (*pml4).0[pml4_index] = ring3::table_entry(pdpt as u64, true, true)?;
+        (*addr_of_mut!(USER_PD)).0[pd_index] =
+            ring3::table_entry(addr_of_mut!(USER_PT) as u64, true, true)?;
+        (*addr_of_mut!(USER_PDPT)).0[pdpt_index] =
+            ring3::table_entry(addr_of_mut!(USER_PD) as u64, true, true)?;
+        (*addr_of_mut!(PML4)).0[pml4_index] =
+            ring3::table_entry(addr_of_mut!(USER_PDPT) as u64, true, true)?;
     }
     Ok(())
 }
 
-/// K005-04 : mappe une page de plus dans la table de la sonde (les 2 premiers
-/// Mio de la région utilisateur), après `map_user_probe`. Le BSP l'appelle
-/// avant que les sondes ne touchent la page ; l'entrée était absente.
-pub fn map_user_page(va: u64, frame: u64, writable: bool) -> Result<(), Ring3Error> {
-    let [pml4_index, pdpt_index, pd_index, pt_index] = ring3::indices(va);
-    if ring3::indices(ring3::USER_CODE_VA)[..3] != [pml4_index, pdpt_index, pd_index] {
-        return Err(Ring3Error::NotUserAddress);
-    }
-    let entry = ring3::table_entry(frame, true, writable)?;
-    // SAFETY: table statique mappée en identité, écrite par le seul BSP ;
-    // `invlpg` écarte toute traduction de cette adresse sur ce CPU.
-    unsafe {
-        (*addr_of_mut!(USER_PT)).0[pt_index] = entry;
-        asm!("invlpg [{}]", in(reg) va, options(nostack, preserves_flags));
-    }
-    check_user_page(va, writable)
+/// Mappe la page utilisateur `va` sur `frame`, droits de `kind`. L'entrée
+/// doit être absente : aucun TLB ne peut alors en garder une traduction.
+pub fn map_user_leaf(va: u64, frame: u64, kind: PageKind) -> Result<(), UserPageError> {
+    let index = user_index(va)?;
+    let entry = user_pages::user_leaf(frame, kind)?;
+    with_tables(|| {
+        link_user_tables().map_err(|_| UserPageError::Frame)?;
+        // SAFETY: table statique, sous PAGING_BUSY.
+        unsafe {
+            let pt = addr_of_mut!(USER_PT);
+            if (*pt).0[index] != 0 {
+                return Err(UserPageError::Leaf);
+            }
+            (*pt).0[index] = entry;
+        }
+        Ok(())
+    })?;
+    check_user_page(va, frame, kind)
 }
 
-/// Chemin complet vers la page utilisateur `va` : bit U/S à chaque niveau,
-/// bit W exactement comme demandé sur la page. Une adresse jamais mappée
-/// rend `NotPresent`.
-pub fn check_user_page(va: u64, writable: bool) -> Result<(), Ring3Error> {
-    let [pml4_index, pdpt_index, pd_index, pt_index] = ring3::indices(va);
-    if ring3::indices(ring3::USER_CODE_VA)[..3] != [pml4_index, pdpt_index, pd_index] {
-        return Err(Ring3Error::NotUserAddress);
-    }
+/// Retire la page utilisateur `va` et rend sa frame. Les autres CPU peuvent
+/// en garder la traduction : l'appelant fait le shootdown avant de réutiliser
+/// la frame.
+pub fn unmap_user_leaf(va: u64) -> Result<u64, UserPageError> {
+    let index = user_index(va)?;
+    let frame = with_tables(|| {
+        // SAFETY: table statique, sous PAGING_BUSY.
+        unsafe {
+            let pt = addr_of_mut!(USER_PT);
+            let entry = (*pt).0[index];
+            if entry & user_pages::PTE_PRESENT == 0 {
+                return Err(UserPageError::NotPresent);
+            }
+            (*pt).0[index] = 0;
+            Ok(entry & 0x000F_FFFF_FFFF_F000)
+        }
+    })?;
+    crate::tlb::invalidate_local(va);
+    Ok(frame)
+}
+
+/// Chemin complet vers `va` : U/S à chaque niveau, aucun niveau NX, feuille
+/// exacte vers `frame` avec les droits de `kind`.
+pub fn check_user_page(va: u64, frame: u64, kind: PageKind) -> Result<(), UserPageError> {
+    let index = user_index(va)?;
+    let [pml4_index, pdpt_index, pd_index, _] = ring3::indices(va);
     // SAFETY: lecture des tables statiques.
     unsafe {
-        let pml4 = &*addr_of!(PML4);
-        let pdpt = &*addr_of!(USER_PDPT);
-        let pd = &*addr_of!(USER_PD);
-        let pt = &*addr_of!(USER_PT);
-        ring3::check_user_entry(pml4.0[pml4_index], true)?;
-        ring3::check_user_entry(pdpt.0[pdpt_index], true)?;
-        ring3::check_user_entry(pd.0[pd_index], true)?;
-        let entry = pt.0[pt_index];
-        ring3::check_user_entry(entry, writable)?;
-        if !writable && entry & ring3::PTE_WRITABLE != 0 {
-            return Err(Ring3Error::NotWritable);
+        let upper = [
+            (*addr_of!(PML4)).0[pml4_index],
+            (*addr_of!(USER_PDPT)).0[pdpt_index],
+            (*addr_of!(USER_PD)).0[pd_index],
+        ];
+        for entry in upper {
+            if ring3::check_user_entry(entry, true).is_err() || entry & user_pages::PTE_NX != 0 {
+                return Err(UserPageError::Leaf);
+            }
         }
+        user_pages::check_user_leaf((*addr_of!(USER_PT)).0[index], frame, kind)
     }
+}
+
+/// Entrée de la table utilisateur pour `va` (0 si absente).
+pub fn user_entry(va: u64) -> Result<u64, UserPageError> {
+    let index = user_index(va)?;
+    // SAFETY: lecture d'une table statique.
+    Ok(unsafe { (*addr_of!(USER_PT)).0[index] })
+}
+
+fn identity_pd(pdpt_index: usize) -> *mut PageTable {
+    // SAFETY: `pdpt_index` < 4, borne du mappage identité.
+    unsafe { core::ptr::addr_of_mut!((*addr_of_mut!(PDS))[pdpt_index]) }
+}
+
+/// Retire `phys` du mappage identité de ce CPU : découpe sa grande page si
+/// besoin, puis rend son entrée absente. Les autres CPU peuvent garder la
+/// traduction : l'appelant fait le shootdown avant de confier la frame au
+/// ring 3. La table de découpe vient d'une allocation permanente.
+pub fn remove_identity_alias(phys: u64) -> Result<(), UserPageError> {
+    let (pdpt_index, pd_index, pt_index) = user_pages::identity_slot(phys, IDENTITY_LIMIT)?;
+    with_tables(|| {
+        // SAFETY: tables statiques et tables de découpe, mappées en identité,
+        // sous PAGING_BUSY.
+        unsafe {
+            let pd = identity_pd(pdpt_index);
+            let pde = (*pd).0[pd_index];
+            if pde & HUGE != 0 {
+                // Seule la RAM est confiée au ring 3 : une grande page aux
+                // attributs de cache MMIO n'est jamais découpée ici.
+                if pde & (WRITE_THROUGH | CACHE_DISABLE) != 0 {
+                    return Err(UserPageError::Leaf);
+                }
+                let table = crate::memory::allocate_frame().ok_or(UserPageError::Frame)?;
+                let small = table as *mut u64;
+                for index in 0..ENTRIES {
+                    small
+                        .add(index)
+                        .write(user_pages::small_entry(pde, index as u64)?);
+                }
+                // Même traduction, en pages de 4 Kio : la grande page encore
+                // dans les TLB reste juste jusqu'au retrait ci-dessous.
+                (*pd).0[pd_index] = table | PRESENT | WRITABLE;
+            }
+            let table = ((*pd).0[pd_index] & 0x000F_FFFF_FFFF_F000) as *mut u64;
+            let entry = table.add(pt_index);
+            if entry.read() & PRESENT == 0 {
+                return Err(UserPageError::NotPresent);
+            }
+            entry.write(0);
+        }
+        Ok(())
+    })?;
+    crate::tlb::invalidate_local(phys);
     Ok(())
 }
 
-/// Relit les deux chemins : la région utilisateur porte le bit U/S à chaque
-/// niveau, le mappage identité du noyau ne le porte à aucun.
-pub fn check_user_probe() -> Result<(), Ring3Error> {
-    let [pml4_index, pdpt_index, pd_index, code_index] = ring3::indices(ring3::USER_CODE_VA);
-    let stack_index = ring3::indices(ring3::USER_STACK_VA)[3];
-    // SAFETY: lecture des tables statiques.
+/// Rend `phys` au mappage identité, avec les attributs de la RAM. Une entrée
+/// absente ne peut pas rester en TLB : aucun shootdown n'est nécessaire.
+pub fn restore_identity_alias(phys: u64) -> Result<(), UserPageError> {
+    let (pdpt_index, pd_index, pt_index) = user_pages::identity_slot(phys, IDENTITY_LIMIT)?;
+    let huge = (phys & !(HUGE_PAGE_SIZE - 1)) | PRESENT | WRITABLE | HUGE;
+    let restored = user_pages::small_entry(huge, pt_index as u64)?;
+    with_tables(|| {
+        // SAFETY: tables statiques et tables de découpe, sous PAGING_BUSY.
+        unsafe {
+            let pde = (*identity_pd(pdpt_index)).0[pd_index];
+            if pde & HUGE != 0 {
+                return Err(UserPageError::NotHuge);
+            }
+            let entry = ((pde & 0x000F_FFFF_FFFF_F000) as *mut u64).add(pt_index);
+            if entry.read() != 0 {
+                return Err(UserPageError::AliasPresent);
+            }
+            entry.write(restored);
+        }
+        Ok(())
+    })
+}
+
+/// Entrée de `phys` dans le mappage identité : grande page ou page de 4 Kio,
+/// 0 si l'alias a été retiré.
+pub fn identity_entry(phys: u64) -> Result<u64, UserPageError> {
+    let (pdpt_index, pd_index, pt_index) = user_pages::identity_slot(phys, IDENTITY_LIMIT)?;
+    // SAFETY: lecture des tables statiques et des tables de découpe.
+    unsafe {
+        let pde = (*identity_pd(pdpt_index)).0[pd_index];
+        if pde & HUGE != 0 {
+            return Ok(pde);
+        }
+        Ok(((pde & 0x000F_FFFF_FFFF_F000) as *const u64)
+            .add(pt_index)
+            .read())
+    }
+}
+
+/// Le mappage identité du noyau ne porte U/S à aucun niveau, tables de
+/// découpe comprises.
+pub fn check_kernel_identity() -> Result<usize, Ring3Error> {
+    let mut split = 0;
+    // SAFETY: lecture des tables statiques et des tables de découpe.
     unsafe {
         let pml4 = &*addr_of!(PML4);
-        let pdpt = &*addr_of!(USER_PDPT);
-        let pd = &*addr_of!(USER_PD);
-        let pt = &*addr_of!(USER_PT);
-        ring3::check_user_entry(pml4.0[pml4_index], true)?;
-        ring3::check_user_entry(pdpt.0[pdpt_index], true)?;
-        ring3::check_user_entry(pd.0[pd_index], true)?;
-        ring3::check_user_entry(pt.0[code_index], false)?;
-        if pt.0[code_index] & ring3::PTE_WRITABLE != 0 {
-            return Err(Ring3Error::NotWritable);
-        }
-        ring3::check_user_entry(pt.0[stack_index], true)?;
-
         let kernel_pdpt = &*addr_of!(PDPT);
         let kernel_pds = &*addr_of!(PDS);
         ring3::check_kernel_entry(pml4.0[0])?;
@@ -212,8 +342,17 @@ pub fn check_user_probe() -> Result<(), Ring3Error> {
             ring3::check_kernel_entry(kernel_pdpt.0[index])?;
             for &entry in &pd.0 {
                 ring3::check_kernel_entry(entry)?;
+                if entry & HUGE == 0 {
+                    split += 1;
+                    let table = (entry & 0x000F_FFFF_FFFF_F000) as *const u64;
+                    for small in 0..ENTRIES {
+                        if table.add(small).read() & ring3::PTE_USER != 0 {
+                            return Err(Ring3Error::KernelUser);
+                        }
+                    }
+                }
             }
         }
     }
-    Ok(())
+    Ok(split)
 }

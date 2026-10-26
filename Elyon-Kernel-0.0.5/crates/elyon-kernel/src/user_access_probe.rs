@@ -19,20 +19,22 @@
 //!    de copie, prises pourtant AC levé.
 
 use core::arch::{asm, global_asm};
-use core::ptr::{copy_nonoverlapping, read_volatile, write_volatile};
+use core::ptr::read_volatile;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use elyon_abi::PAGE_SIZE;
-use elyon_core::ring3::{self, Ring3Error};
+use elyon_core::ring3;
 use elyon_core::task_stack::StackRegion;
 use elyon_core::user_access::{
     self, FaultSite, Features, PROBE_CODE_VA, PROBE_DATA_VA, PROBE_UNMAPPED_VA, UserAccessError,
 };
+use elyon_core::user_pages::PageKind;
 
 use crate::arch::x86_64::{cpu, cpu_local, paging};
 use crate::sched::{self, ReapOutcome, SchedError};
 use crate::task::{self, TaskState};
-use crate::{memory, timer, user_copy};
+use crate::user_memory::{UserMemoryError, UserPage};
+use crate::{timer, user_copy};
 
 const PROBE_ARG_BASE: u64 = 0xE1_0504_0000_0000;
 /// Délais de 100 µs au plus, par AP, avant d'abandonner.
@@ -125,8 +127,7 @@ const FIELDS: usize = 14;
 #[derive(Clone, Copy)]
 pub enum ProbeError {
     Sched(SchedError),
-    Ring3(Ring3Error),
-    AllocationFailed,
+    Memory(UserMemoryError),
     Timeout,
 }
 
@@ -134,8 +135,7 @@ impl ProbeError {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Sched(error) => error.as_str(),
-            Self::Ring3(error) => error.as_str(),
-            Self::AllocationFailed => "PMM could not allocate the user access probe pages",
+            Self::Memory(error) => error.as_str(),
             Self::Timeout => "user access probe did not finish in time",
         }
     }
@@ -144,12 +144,6 @@ impl ProbeError {
 impl From<SchedError> for ProbeError {
     fn from(error: SchedError) -> Self {
         Self::Sched(error)
-    }
-}
-
-impl From<Ring3Error> for ProbeError {
-    fn from(error: Ring3Error) -> Self {
-        Self::Ring3(error)
     }
 }
 
@@ -245,7 +239,7 @@ pub struct UserAccessQualification {
     pub pages_ok: bool,
 }
 
-/// Frames des pages de la sonde, mappées aussi en identité (supervision).
+/// Frames des pages de la sonde (K005-05 : sans alias identité).
 static CODE_FRAME: AtomicU64 = AtomicU64::new(0);
 static DATA_FRAME: AtomicU64 = AtomicU64::new(0);
 
@@ -326,19 +320,8 @@ fn pattern(cpu: usize) -> [u8; PATTERN_LEN] {
     core::array::from_fn(|index| 0xA5 ^ ((cpu as u8) << 4) ^ index as u8)
 }
 
-/// Lit `len` octets d'une frame par le mappage identité du noyau.
-fn read_frame(frame: u64, offset: u64, out: &mut [u8]) {
-    // SAFETY: frame permanente de la sonde, mappée en identité (supervision) ;
-    // `offset + out.len()` reste dans la page.
-    unsafe {
-        copy_nonoverlapping((frame + offset) as *const u8, out.as_mut_ptr(), out.len());
-    }
-}
-
 fn probe_this_cpu(cpu: usize) -> CpuAccess {
     let features = cpu::supervisor_protection();
-    let code_frame = CODE_FRAME.load(Ordering::Acquire);
-    let data_frame = DATA_FRAME.load(Ordering::Acquire);
     let mut result = CpuAccess {
         cr4_ok: user_access::check_cr4(cpu::read_cr4(), features).is_ok(),
         cr0_wp: user_access::check_write_protect(cpu::read_cr0()).is_ok(),
@@ -373,18 +356,17 @@ fn probe_this_cpu(cpu: usize) -> CpuAccess {
     // Aller-retour d'un motif propre au CPU, après le premier mot.
     let offset = (cpu as u64 + 1) * PATTERN_LEN as u64;
     let sent = pattern(cpu);
-    let mut seen = [0u8; PATTERN_LEN];
     let mut back = [0u8; PATTERN_LEN];
     let written = user_copy::copy_to_user(PROBE_DATA_VA + offset, &sent).is_ok();
-    read_frame(data_frame, offset, &mut seen);
     let read = user_copy::copy_from_user(&mut back, PROBE_DATA_VA + offset).is_ok();
-    result.copy_ok = written && read && seen == sent && back == sent;
+    result.copy_ok = written && read && back == sent;
 
     // Écriture sur la page de code en lecture seule : refusée, page intacte.
     let mut code = [0u8; USER_CODE.len()];
     let refused = user_copy::copy_to_user(PROBE_CODE_VA, &[0xCC; 8]) == Err(UserAccessError::Fault);
-    read_frame(code_frame, 0, &mut code);
-    result.read_only_refused = refused && code == USER_CODE;
+    // K005-05 : la page n'a plus d'alias identité ; elle est relue par la copie.
+    let intact = user_copy::copy_from_user(&mut code, PROBE_CODE_VA).is_ok();
+    result.read_only_refused = refused && intact && code == USER_CODE;
 
     // Page jamais mappée.
     let mut buffer = [0u8; 8];
@@ -406,7 +388,7 @@ fn probe_this_cpu(cpu: usize) -> CpuAccess {
     let mut buffer = [0u8; 16];
     let rejects = [
         (
-            user_copy::copy_from_user(&mut buffer, data_frame),
+            user_copy::copy_from_user(&mut buffer, RESULTS.as_ptr() as u64),
             UserAccessError::NotUser,
         ),
         (
@@ -452,26 +434,23 @@ extern "C" fn elyon_user_access_probe_task_entry(arg: u64) -> ! {
     sched::exit_now()
 }
 
-/// Alloue et mappe les pages de la sonde, puis relit leurs entrées.
+/// Alloue et mappe les pages de la sonde (K005-05 : `UserPage`, sans alias
+/// identité), puis relit leurs entrées ; la page de faute reste absente.
 fn map_pages() -> Result<bool, ProbeError> {
-    let code = memory::allocate_frame().ok_or(ProbeError::AllocationFailed)?;
-    let data = memory::allocate_frame().ok_or(ProbeError::AllocationFailed)?;
-    // SAFETY: frames neuves (effacées), mappées en identité, encore
-    // inaccessibles au ring 3.
-    unsafe {
-        copy_nonoverlapping(USER_CODE.as_ptr(), code as *mut u8, USER_CODE.len());
-        write_volatile(data as *mut u64, DATA_WORD);
-        copy_nonoverlapping(
-            TAIL.as_ptr(),
-            (data + PAGE_SIZE - TAIL.len() as u64) as *mut u8,
-            TAIL.len(),
-        );
-    }
-    CODE_FRAME.store(code, Ordering::Release);
-    DATA_FRAME.store(data, Ordering::Release);
-    paging::map_user_page(PROBE_CODE_VA, code, false)?;
-    paging::map_user_page(PROBE_DATA_VA, data, true)?;
-    Ok(paging::check_user_page(PROBE_UNMAPPED_VA, false) == Err(Ring3Error::NotPresent))
+    let mut data = [0u8; PAGE_SIZE as usize];
+    data[..8].copy_from_slice(&DATA_WORD.to_ne_bytes());
+    data[PAGE_SIZE as usize - TAIL.len()..].copy_from_slice(&TAIL);
+    let code =
+        UserPage::new(PROBE_CODE_VA, PageKind::Code, &USER_CODE).map_err(ProbeError::Memory)?;
+    let data = UserPage::new(PROBE_DATA_VA, PageKind::Data, &data).map_err(ProbeError::Memory)?;
+    let pages_ok = code.check().is_ok()
+        && data.check().is_ok()
+        && paging::user_entry(PROBE_UNMAPPED_VA) == Ok(0);
+    CODE_FRAME.store(code.frame(), Ordering::Release);
+    DATA_FRAME.store(data.frame(), Ordering::Release);
+    code.keep();
+    data.keep();
+    Ok(pages_ok)
 }
 
 pub fn qualify(
@@ -540,4 +519,21 @@ pub fn qualify(
         features: cpu::supervisor_protection(),
         pages_ok,
     }))
+}
+
+/// K005-05 : pages permanentes de la sonde (adresse, frame, type), frame
+/// nulle tant que la sonde n'a pas tourné.
+pub fn pages() -> [(u64, u64, PageKind); 2] {
+    [
+        (
+            PROBE_CODE_VA,
+            CODE_FRAME.load(Ordering::Acquire),
+            PageKind::Code,
+        ),
+        (
+            PROBE_DATA_VA,
+            DATA_FRAME.load(Ordering::Acquire),
+            PageKind::Data,
+        ),
+    ]
 }

@@ -69,7 +69,10 @@ elyon_ap_trampoline_pm32:
 
     mov ecx, 0xc0000080
     rdmsr
-    or eax, 0x100
+    // LME et NXE (K005-05) : les tables partagées portent déjà des entrées NX,
+    // que ce CPU lira dès la pagination activée. Le BSP a vérifié NX par CPUID
+    // avant de démarrer les AP.
+    or eax, 0x900
     wrmsr
 
     mov eax, cr0
@@ -394,6 +397,10 @@ extern "sysv64" fn elyon_ap_entry(cpu_index: u64, expected_apic_id: u64) -> ! {
     // SMAP, la première exception lèverait #UD en boucle (triple faute).
     let protection = cpu::supervisor_protection();
     if let Err(error) = user_access::check_support(protection) {
+        kprintln!("[smp] AP FAILED cpu={} reason={}", index, error.as_str());
+        cpu::halt_forever();
+    }
+    if let Err(error) = elyon_core::user_pages::check_efer(cpu::read_efer()) {
         kprintln!("[smp] AP FAILED cpu={} reason={}", index, error.as_str());
         cpu::halt_forever();
     }

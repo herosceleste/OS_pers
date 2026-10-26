@@ -6,6 +6,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ELYON_TEST_DF");
     println!("cargo:rerun-if-env-changed=ELYON_TEST_USER_IRET");
     println!("cargo:rerun-if-env-changed=ELYON_TEST_SMAP");
+    println!("cargo:rerun-if-env-changed=ELYON_TEST_ALIAS");
     println!("cargo:rerun-if-env-changed=ELYON_BUILD_ID");
     println!("cargo:rustc-link-arg=-T{}", linker.display());
 }

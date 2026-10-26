@@ -1,6 +1,6 @@
 use core::arch::asm;
 
-use elyon_core::user_access;
+use elyon_core::{user_access, user_pages};
 
 // `cli`/`sti` délimitent des sections critiques : sans `nomem`, le compilateur
 // les traite comme des accès mémoire et n'y déplace pas les lectures/écritures.
@@ -98,6 +98,28 @@ pub fn enable_supervisor_protection(features: user_access::Features) {
         asm!("mov cr0, {}", in(reg) cr0, options(nostack, preserves_flags));
         asm!("mov cr4, {}", in(reg) cr4, options(nostack, preserves_flags));
     }
+}
+
+const IA32_EFER: u32 = 0xC000_0080;
+
+/// NX annoncé par CPUID.80000001H:EDX (K005-05).
+pub fn nx_supported() -> bool {
+    let max_extended = core::arch::x86_64::__cpuid(0x8000_0000).eax;
+    let leaf = core::arch::x86_64::__cpuid(0x8000_0001);
+    user_pages::nx_supported(max_extended, leaf.edx)
+}
+
+pub fn read_efer() -> u64 {
+    // SAFETY: IA32_EFER existe sur tout x86_64.
+    unsafe { read_msr(IA32_EFER) }
+}
+
+/// Active EFER.NXE (K005-05) : le bit 63 des entrées de page interdit alors
+/// l'exécution. Doit précéder toute entrée NX lue par ce CPU, sinon le bit 63
+/// serait réservé et la traduction lèverait #PF.
+pub fn enable_nx() {
+    // SAFETY: NX est pris en charge (contrôlé par l'appelant) ; seul NXE change.
+    unsafe { write_msr(IA32_EFER, read_efer() | user_pages::EFER_NXE) }
 }
 
 pub fn read_rflags() -> u64 {

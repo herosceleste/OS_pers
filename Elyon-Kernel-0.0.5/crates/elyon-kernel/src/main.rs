@@ -18,8 +18,11 @@ mod task;
 mod task_frames;
 mod task_stack;
 mod timer;
+mod tlb;
 mod user_access_probe;
 mod user_copy;
+mod user_memory;
+mod user_memory_probe;
 mod user_probe;
 
 use core::panic::PanicInfo;
@@ -37,6 +40,7 @@ const TEST_UD: bool = option_env!("ELYON_TEST_UD").is_some();
 const TEST_DF: bool = option_env!("ELYON_TEST_DF").is_some();
 const TEST_USER_IRET: bool = option_env!("ELYON_TEST_USER_IRET").is_some();
 const TEST_SMAP: bool = option_env!("ELYON_TEST_SMAP").is_some();
+const TEST_ALIAS: bool = option_env!("ELYON_TEST_ALIAS").is_some();
 /// GS utilisateur des modes de test #DF et `iretq` (K005-03) : adresse
 /// utilisateur jamais mappée, tout accès noyau via ce GS lèverait #PF.
 const TEST_USER_GS: u64 = elyon_core::ring3::USER_BASE + 0x30_0000;
@@ -101,6 +105,17 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
     // SAFETY: SMAP est pris en charge (contrôlé ci-dessus) ; `clac` n'efface
     // que RFLAGS.AC.
     unsafe { core::arch::asm!("clac", options(nomem, nostack)) };
+    // K005-05 : NX exigé ; les pages de données utilisateur le portent, et le
+    // trampoline des AP active NXE sans pouvoir le vérifier.
+    if !cpu::nx_supported() {
+        kprintln!(
+            "[cpu] FAILED reason={}",
+            elyon_core::user_pages::UserPageError::NxUnsupported.as_str()
+        );
+        cpu::halt_forever();
+    }
+    cpu::enable_nx();
+    kprintln!("[cpu] nx=1 efer={:#x}", cpu::read_efer());
 
     let code_selector = gdt::init();
     kprintln!(
@@ -427,6 +442,8 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
         code_selector,
         idt::resched_ipi_handler(),
     );
+    // K005-05 : invalidations de TLB demandées par un autre CPU.
+    idt::install_interrupt_gate(tlb::TLB_VECTOR, code_selector, idt::tlb_ipi_handler());
 
     if percpu_summary.cpu_count > 1 {
         let smp_summary = match smp::start_all_prepared(info) {
@@ -1492,6 +1509,67 @@ pub unsafe extern "sysv64" fn _start(info_ptr: *const BootInfo) -> ! {
             );
             fatal::halt_system();
         }
+    }
+
+    match user_memory_probe::qualify(
+        info.kernel_stack_start,
+        info.kernel_stack_end,
+        paging::identity_limit(),
+    ) {
+        Ok(Some(probe)) => {
+            let mut consistent = probe.user_pages == 4 && probe.owned == 4 && probe.pmm_balanced;
+            for (cpu, result) in probe.probes.iter().enumerate().take(probe.cpus) {
+                kprintln!(
+                    "[usermem] cpu={} nxe={} alias_faults={} warm={} alias_shot={} user={} user_shot={} alias_back={} ipis={}",
+                    cpu,
+                    u8::from(result.nxe),
+                    result.alias_faults,
+                    u8::from(result.warm),
+                    u8::from(result.alias_shot),
+                    u8::from(result.user),
+                    u8::from(result.user_shot),
+                    u8::from(result.alias_back),
+                    result.ipis
+                );
+                consistent &= result.ok(cpu == 0);
+            }
+            kprintln!(
+                "[usermem] pages cpus={} user_pages={}/4 owned={}/4 kernel_identity_user=0 split_tables={} pmm_balanced={}",
+                probe.cpus,
+                probe.user_pages,
+                probe.owned,
+                probe.split_tables,
+                u8::from(probe.pmm_balanced)
+            );
+            if !consistent {
+                kprintln!("[usermem] FAILED reason=user page or identity alias invariant violated");
+                fatal::halt_system();
+            }
+            kprintln!("ELYON_USER_PAGES_READY");
+        }
+        Ok(None) => kprintln!("[usermem] skipped single_cpu=1"),
+        Err(error) => {
+            kprintln!(
+                "[usermem] FAILED reason={} ticks={}",
+                error.as_str(),
+                timer::ticks()
+            );
+            fatal::halt_system();
+        }
+    }
+
+    if TEST_ALIAS {
+        let (_, frame, _) = user_probe::pages()[1];
+        kprintln!(
+            "[test] injecting a kernel read of user frame {:#018x} through the identity map",
+            frame
+        );
+        // SAFETY: mode de test ; l'alias identité de la page de pile de la
+        // sonde ring 3 a été retiré : la lecture lève une #PF hors de toute
+        // reprise, et le système s'arrête fail-closed.
+        let value = unsafe { core::ptr::read_volatile(frame as *const u64) };
+        kprintln!("[test] identity alias reachable value={:#018x}", value);
+        fatal::halt_system();
     }
 
     if TEST_SMAP {

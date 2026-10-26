@@ -227,6 +227,14 @@ fn set_freeable(frame: usize, freeable: bool) {
     }
 }
 
+/// K005-05 : vrai si `phys` appartient à une plage prise par `allocate_owned`
+/// et pas encore rendue.
+pub fn is_owned(phys: u64) -> bool {
+    let frame = (phys / PAGE_SIZE) as usize;
+    let _pmm = PMM_LOCK.lock();
+    is_freeable(frame) && !is_free(frame)
+}
+
 pub fn free_frame_count() -> usize {
     let _pmm = PMM_LOCK.lock();
     unsafe { FREE_FRAMES }
