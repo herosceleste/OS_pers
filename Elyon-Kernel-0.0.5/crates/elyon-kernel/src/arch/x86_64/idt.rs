@@ -6,6 +6,10 @@ use crate::kprintln;
 
 const IDT_LEN: usize = 256;
 const INTERRUPT_GATE_PRESENT_RING0: u16 = 0x8E00;
+/// Porte d'interruption atteignable par `int` depuis le ring 3 (DPL 3).
+const INTERRUPT_GATE_PRESENT_RING3: u16 = 0xEE00;
+/// Sortie de la sonde ring 3 (K005-02).
+pub const USER_PROBE_EXIT_VECTOR: u8 = 0x81;
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -74,6 +78,26 @@ static mut IDT: [IdtEntry; IDT_LEN] = [IdtEntry::MISSING; IDT_LEN];
 
 global_asm!(
     r#"
+// K005-02 : une entrée depuis le ring 3 (RPL 3 dans le CS sauvegardé, à
+// `cs_offset` de RSP) échange GS_BASE et KERNEL_GS_BASE avant tout accès à la
+// zone per-CPU ; la sortie vers le ring 3 les rééchange juste avant `iretq`.
+// `lfence` sur les deux chemins de l'entrée : aucune lecture spéculative via
+// GS ne part avec le mauvais GS (variante Spectre SWAPGS).
+.macro SWAPGS_ON_ENTRY cs_offset
+    test byte ptr [rsp + \cs_offset], 3
+    jz .Lentry_from_kernel_\@
+    swapgs
+.Lentry_from_kernel_\@:
+    lfence
+.endm
+
+.macro SWAPGS_ON_EXIT cs_offset
+    test byte ptr [rsp + \cs_offset], 3
+    jz .Lexit_to_kernel_\@
+    swapgs
+.Lexit_to_kernel_\@:
+.endm
+
 .macro EXC_NOERR n
 .global elyon_exc_\n
 elyon_exc_\n:
@@ -128,6 +152,7 @@ elyon_apic_spurious:
 
 .global elyon_smp_stability_ipi
 elyon_smp_stability_ipi:
+    SWAPGS_ON_ENTRY 8
     cld
     push rax
     push rbx
@@ -163,10 +188,12 @@ elyon_smp_stability_ipi:
     pop rcx
     pop rbx
     pop rax
+    SWAPGS_ON_EXIT 8
     iretq
 
 .global elyon_apic_timer_interrupt
 elyon_apic_timer_interrupt:
+    SWAPGS_ON_ENTRY 8
     cld
     push rax
     push rbx
@@ -185,6 +212,7 @@ elyon_apic_timer_interrupt:
     push r15
     mov r12, rsp
     and rsp, -16
+    mov rdi, qword ptr [r12 + 128]
     call elyon_timer_interrupt_dispatch
     mov rsp, r12
     pop r15
@@ -202,10 +230,12 @@ elyon_apic_timer_interrupt:
     pop rcx
     pop rbx
     pop rax
+    SWAPGS_ON_EXIT 8
     iretq
 
 .global elyon_resched_ipi
 elyon_resched_ipi:
+    SWAPGS_ON_ENTRY 8
     cld
     push rax
     push rbx
@@ -224,6 +254,7 @@ elyon_resched_ipi:
     push r15
     mov r12, rsp
     and rsp, -16
+    mov rdi, qword ptr [r12 + 128]
     call elyon_resched_ipi_dispatch
     mov rsp, r12
     pop r15
@@ -241,6 +272,7 @@ elyon_resched_ipi:
     pop rcx
     pop rbx
     pop rax
+    SWAPGS_ON_EXIT 8
     iretq
 
 .global elyon_test_double_fault
@@ -255,6 +287,7 @@ elyon_test_double_fault:
 .global elyon_exception_common
 elyon_exception_common:
     cli
+    SWAPGS_ON_ENTRY 24
     cld
     push rax
     push rbx
@@ -277,6 +310,53 @@ elyon_exception_common:
 1:
     hlt
     jmp 1b
+
+// K005-02 : sortie de la sonde ring 3 (`int 0x81`, porte DPL 3). Le CS
+// sauvegardé est passé au dispatcher, qui ne revient jamais : la tâche se
+// termine sur sa pile noyau, abandonnée à l'entrée en ring 3.
+.global elyon_user_probe_exit
+elyon_user_probe_exit:
+    SWAPGS_ON_ENTRY 8
+    cld
+    mov rdi, qword ptr [rsp + 8]
+    and rsp, -16
+    call elyon_user_probe_exit_dispatch
+2:
+    hlt
+    jmp 2b
+
+// Limite (revue ECC K005-02) : une NMI ou une #MC entre `swapgs` et `iretq`
+// trouve un CS noyau et ne refait pas `swapgs` ; son diagnostic tournerait
+// avec le GS utilisateur. L'entrée « paranoïaque » de K005-03 le traitera.
+// void elyon_enter_user(const IretFrame *frame) -> !
+// Entre en ring 3 : IRQ masquées jusqu'à `iretq`, `swapgs` vers le GS
+// utilisateur (préparé dans KERNEL_GS_BASE), registres généraux effacés pour
+// qu'aucune valeur du noyau ne parvienne au ring 3.
+.global elyon_enter_user
+elyon_enter_user:
+    cli
+    push qword ptr [rdi + 32]
+    push qword ptr [rdi + 24]
+    push qword ptr [rdi + 16]
+    push qword ptr [rdi + 8]
+    push qword ptr [rdi + 0]
+    xor eax, eax
+    xor ebx, ebx
+    xor ecx, ecx
+    xor edx, edx
+    xor esi, esi
+    xor edi, edi
+    xor ebp, ebp
+    xor r8d, r8d
+    xor r9d, r9d
+    xor r10d, r10d
+    xor r11d, r11d
+    xor r12d, r12d
+    xor r13d, r13d
+    xor r14d, r14d
+    xor r15d, r15d
+    swapgs
+    iretq
 "#
 );
 
@@ -318,6 +398,8 @@ unsafe extern "C" {
     fn elyon_apic_timer_interrupt();
     fn elyon_smp_stability_ipi();
     fn elyon_resched_ipi();
+    fn elyon_user_probe_exit();
+    fn elyon_enter_user(frame: *const elyon_core::ring3::IretFrame) -> !;
 }
 
 pub fn init(code_selector: u16) {
@@ -480,6 +562,33 @@ pub fn install_interrupt_gate(vector: u8, code_selector: u16, handler: u64) {
         base.add(vector as usize)
             .write(IdtEntry::new(handler, code_selector, 0));
     }
+}
+
+/// Porte DPL 3 : la seule qu'un `int` du ring 3 puisse franchir (K005-02).
+pub fn install_user_gate(vector: u8, code_selector: u16, handler: u64) {
+    let base = addr_of_mut!(IDT) as *mut IdtEntry;
+    let mut entry = IdtEntry::new(handler, code_selector, 0);
+    entry.options = INTERRUPT_GATE_PRESENT_RING3;
+    // SAFETY: entrée de l'IDT statique, déjà chargée par `lidt` ; appelé par
+    // le BSP avant le démarrage des AP, donc avant que le vecteur puisse servir.
+    unsafe { base.add(vector as usize).write(entry) };
+}
+
+pub fn user_probe_exit_handler() -> u64 {
+    elyon_user_probe_exit as *const () as usize as u64
+}
+
+/// Entre en ring 3 avec `frame`, sans retour : la pile noyau courante est
+/// abandonnée, la prochaine entrée depuis le ring 3 prendra RSP0.
+///
+/// # Safety
+///
+/// `frame` vient de `ring3::iret_frame` ; KERNEL_GS_BASE contient le GS
+/// utilisateur ; RSP0 du TSS de ce CPU est le sommet de la pile noyau de la
+/// tâche courante, et rien n'y est plus vivant.
+pub unsafe fn enter_user(frame: &elyon_core::ring3::IretFrame) -> ! {
+    // SAFETY: contrat reporté sur l'appelant.
+    unsafe { elyon_enter_user(frame) }
 }
 
 pub fn apic_spurious_handler() -> u64 {

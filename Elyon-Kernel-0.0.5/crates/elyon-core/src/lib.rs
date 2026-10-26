@@ -14,6 +14,7 @@ pub mod lock_order;
 pub mod percpu_sched;
 pub mod pit;
 pub mod preempt;
+pub mod ring3;
 pub mod run_queue;
 pub mod segments;
 pub mod stress;

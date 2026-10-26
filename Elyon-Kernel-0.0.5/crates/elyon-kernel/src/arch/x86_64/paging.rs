@@ -1,5 +1,5 @@
 use core::arch::asm;
-use core::ptr::{addr_of_mut, write_bytes};
+use core::ptr::{addr_of, addr_of_mut, write_bytes};
 
 const ENTRIES: usize = 512;
 const HUGE_PAGE_SIZE: u64 = 2 * 1024 * 1024;
@@ -104,4 +104,72 @@ pub fn mark_identity_mmio_uncacheable(address: u64) -> bool {
     }
 
     true
+}
+
+// --- K005-02 : région utilisateur minimale -----------------------------------------
+//
+// Les pages utilisateur vivent dans PML4[1] (`ring3::USER_BASE`), sous des
+// tables propres : le mappage identité du noyau, dans PML4[0], ne reçoit
+// jamais le bit U/S. La sonde ring 3 y mappe une page de code, en lecture
+// seule, et une page de pile.
+
+use elyon_core::ring3::{self, Ring3Error};
+
+static mut USER_PDPT: PageTable = PageTable([0; ENTRIES]);
+static mut USER_PD: PageTable = PageTable([0; ENTRIES]);
+static mut USER_PT: PageTable = PageTable([0; ENTRIES]);
+
+/// Mappe la page de code et la page de pile de la sonde. Appelé par le BSP
+/// avant qu'aucun CPU n'utilise la région : aucune entrée n'était présente,
+/// donc aucun TLB ne peut en garder une ancienne.
+pub fn map_user_probe(code_frame: u64, stack_frame: u64) -> Result<(), Ring3Error> {
+    let [pml4_index, pdpt_index, pd_index, code_index] = ring3::indices(ring3::USER_CODE_VA);
+    let stack_index = ring3::indices(ring3::USER_STACK_VA)[3];
+    // SAFETY: tables statiques mappées en identité, modifiées par le seul BSP
+    // avant toute utilisation de la région utilisateur.
+    unsafe {
+        let pml4 = addr_of_mut!(PML4);
+        let pdpt = addr_of_mut!(USER_PDPT);
+        let pd = addr_of_mut!(USER_PD);
+        let pt = addr_of_mut!(USER_PT);
+        (*pt).0[code_index] = ring3::table_entry(code_frame, true, false)?;
+        (*pt).0[stack_index] = ring3::table_entry(stack_frame, true, true)?;
+        (*pd).0[pd_index] = ring3::table_entry(pt as u64, true, true)?;
+        (*pdpt).0[pdpt_index] = ring3::table_entry(pd as u64, true, true)?;
+        (*pml4).0[pml4_index] = ring3::table_entry(pdpt as u64, true, true)?;
+    }
+    Ok(())
+}
+
+/// Relit les deux chemins : la région utilisateur porte le bit U/S à chaque
+/// niveau, le mappage identité du noyau ne le porte à aucun.
+pub fn check_user_probe() -> Result<(), Ring3Error> {
+    let [pml4_index, pdpt_index, pd_index, code_index] = ring3::indices(ring3::USER_CODE_VA);
+    let stack_index = ring3::indices(ring3::USER_STACK_VA)[3];
+    // SAFETY: lecture des tables statiques.
+    unsafe {
+        let pml4 = &*addr_of!(PML4);
+        let pdpt = &*addr_of!(USER_PDPT);
+        let pd = &*addr_of!(USER_PD);
+        let pt = &*addr_of!(USER_PT);
+        ring3::check_user_entry(pml4.0[pml4_index], true)?;
+        ring3::check_user_entry(pdpt.0[pdpt_index], true)?;
+        ring3::check_user_entry(pd.0[pd_index], true)?;
+        ring3::check_user_entry(pt.0[code_index], false)?;
+        if pt.0[code_index] & ring3::PTE_WRITABLE != 0 {
+            return Err(Ring3Error::NotWritable);
+        }
+        ring3::check_user_entry(pt.0[stack_index], true)?;
+
+        let kernel_pdpt = &*addr_of!(PDPT);
+        let kernel_pds = &*addr_of!(PDS);
+        ring3::check_kernel_entry(pml4.0[0])?;
+        for (index, pd) in kernel_pds.iter().enumerate() {
+            ring3::check_kernel_entry(kernel_pdpt.0[index])?;
+            for &entry in &pd.0 {
+                ring3::check_kernel_entry(entry)?;
+            }
+        }
+    }
+    Ok(())
 }

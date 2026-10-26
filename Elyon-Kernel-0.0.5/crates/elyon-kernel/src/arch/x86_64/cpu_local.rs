@@ -102,3 +102,9 @@ pub fn sum(counter: impl Fn(&CpuLocal) -> &AtomicU64) -> u64 {
         .map(|area| counter(area).load(Ordering::Relaxed))
         .sum()
 }
+
+/// Adresse de la zone du CPU `index`, la valeur que GS_BASE doit avoir en
+/// mode noyau sur ce CPU (K005-02 : contrôle de `swapgs` sans passer par GS).
+pub fn area_address(index: usize) -> u64 {
+    &AREAS[index] as *const CpuLocal as u64
+}

@@ -287,6 +287,8 @@ pub fn pit_delay_us(microseconds: u32) -> Result<(), TimerError> {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn elyon_timer_interrupt_dispatch() {
+extern "C" fn elyon_timer_interrupt_dispatch(saved_cs: u64) {
+    // K005-02 : une IRQ peut interrompre le ring 3 ; le stub a déjà fait `swapgs`.
+    crate::user_probe::note_entry(saved_cs);
     on_interrupt();
 }
